@@ -1,0 +1,12 @@
+{
+  "name": "nabu-workspace",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Pi's built-in file and shell tools executed in a Nabu workspace through the relay (FTR.NAB.CMN-0001).",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

@@ -1,0 +1,15 @@
+# golangci-lint v2 (FTR.HMR.INFRA-0002: линтер в пайплайне релиза и на каждый PR).
+version: "2"
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  exclusions:
+    rules:
+      # Идиоматично не проверяемые ошибки: закрытие ресурсов, запись в ответ
+      # HTTP и буфер, форматированный вывод, очистка временных каталогов;
+      # apperr.Error.With меняет ошибку на месте и возвращает её же.
+      - linters: [errcheck]
+        text: "Error return value of `(\\(.*\\)\\.)?([A-Za-z_][A-Za-z0-9_]*\\.)*(Close|Write|WriteByte|Flush|Fprint|Fprintf|Copy|RemoveAll|With)` is not checked"
+
+formatters:
+  enable: [gofmt]

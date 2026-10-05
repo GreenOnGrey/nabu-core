@@ -1,0 +1,62 @@
+# Проверки на каждый PR: линтер, тесты, синхронизация DEPLOY_WORKFLOW_REF, actionlint.
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions: { contents: read }
+concurrency: { group: "ci-${{ github.ref }}", cancel-in-progress: true }
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version-file: go.mod }
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with: { version: v2.14.0 }
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version-file: go.mod }
+      - name: Юнит-тесты
+        run: go test ./...
+      - name: Интеграционные тесты (Postgres через dockertest)
+        run: go test -tags integration -count=1 ./internal/itest/...
+
+  # Contract tests against a real Pi of PI_VERSION (FTR.NAB.CMN-0001 qa §1, level K):
+  # the RPC client of Pi, the nabu-workspace extension through the relay and the
+  # whole engine path (personal turn, task run, service run) with a fake model.
+  pi-contract:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version-file: go.mod }
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with: { node-version: "24" }
+      - name: Pi из deploy/versions.env
+        run: |
+          v=$(sed -n 's/^PI_VERSION=//p' deploy/versions.env)
+          npm install -g --no-audit --no-fund "@earendil-works/pi-coding-agent@$v"
+          pi --version
+      - name: Контрактные тесты
+        env: { PIRPC_PI_CMD: pi, NABU_PI_CMD: pi }
+        run: |
+          go test -count=1 ./pkg/pirpc/ ./internal/platform/agent/... ./internal/relay/ ./internal/workspace/
+          go test -tags integration -count=1 -run TestEngineWithPi ./internal/itest/
+
+  workflows:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: DEPLOY_WORKFLOW_REF совпадает с uses в release.yml
+        run: bash deploy/sync-ref.sh --check
+      - name: actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/914e7df21a07ef503a81201c76d2b11c789d3fca/scripts/download-actionlint.bash) 1.7.12
+          ./actionlint -color

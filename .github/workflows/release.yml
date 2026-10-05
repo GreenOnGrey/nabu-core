@@ -1,0 +1,169 @@
+# Релиз nabu-core (FTR.NAB.CMN-0001 arch §11, по образцу FTR.HMR.INFRA-0002):
+#   push тега vX.Y.Z  →  lint ∥ test → build → scan → deploy (+ проверки после выкатки)
+#   ручной запуск     →  выкатка уже собранного и подписанного образа тега, без
+#                        пересборки; с run_id и callback_url — запуск по
+#                        контракту выкатки FTR.HMR.CMN-0002.
+# Переменная репозитория или организации AUTO_DEPLOY=false выключает выкатку по
+# тегу (сборка, сканирование и публикация продолжаются).
+name: release
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      ref: { description: "Тег (vX.Y.Z)", required: true, type: string }
+      service: { description: "Контракт: nabu-core", required: false, type: string }
+      environment: { description: "Контракт: окружение", required: false, default: production, type: string }
+      run_id: { description: "Контракт: run_id Hammurapi", required: false, type: string }
+      callback_url: { description: "Контракт: адрес вебхука результата", required: false, type: string }
+permissions: { contents: read }
+
+jobs:
+  meta:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.m.outputs.tag }}
+      image: ${{ steps.m.outputs.image }}
+      rebuild: ${{ steps.m.outputs.rebuild }}
+      pi_version: ${{ steps.m.outputs.pi_version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: m
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_SERVICE: ${{ inputs.service }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          tag=${INPUT_REF:-$GITHUB_REF_NAME}
+          [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::тег «$tag» не в формате vX.Y.Z"; exit 1; }
+          if [[ -n $INPUT_SERVICE && $INPUT_SERVICE != "${GITHUB_REPOSITORY#*/}" ]]; then
+            echo "::error::service=$INPUT_SERVICE, а это ${GITHUB_REPOSITORY#*/}"; exit 1
+          fi
+          {
+            echo "tag=$tag"
+            echo "image=ghcr.io/${GITHUB_REPOSITORY,,}"
+            # Образ собирается только по push тега; ручной запуск выкатывает готовый.
+            echo "rebuild=$([[ $EVENT == push ]] && echo true || echo false)"
+            echo "pi_version=$(sed -n 's/^PI_VERSION=//p' deploy/versions.env)"
+          } >>"$GITHUB_OUTPUT"
+
+  lint:
+    needs: meta
+    if: needs.meta.outputs.rebuild == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version-file: go.mod }
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with: { version: v2.14.0 }
+
+  test:
+    needs: meta
+    if: needs.meta.outputs.rebuild == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version-file: go.mod }
+      - run: go test ./...
+      - run: go test -tags integration -count=1 ./internal/itest/...
+
+  build:
+    needs: [meta, lint, test]
+    runs-on: ubuntu-24.04
+    permissions: { contents: read, packages: write, id-token: write, attestations: write }
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      - id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: release
+          push: true
+          sbom: true
+          provenance: mode=max
+          tags: |
+            ${{ needs.meta.outputs.image }}:${{ needs.meta.outputs.tag }}
+            ${{ needs.meta.outputs.image }}:sha-${{ github.sha }}
+          build-args: |
+            VERSION=${{ needs.meta.outputs.tag }}
+            PI_VERSION=${{ needs.meta.outputs.pi_version }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Подпись образа (cosign, без ключа, OIDC GitHub)
+        env: { REF: "${{ needs.meta.outputs.image }}@${{ steps.push.outputs.digest }}" }
+        run: cosign sign --yes "$REF"
+
+  scan:
+    needs: [meta, build]
+    runs-on: ubuntu-24.04
+    permissions: { contents: read, packages: read, security-events: write }
+    env:
+      REF: ${{ needs.meta.outputs.image }}@${{ needs.build.outputs.digest }}
+      TRIVY_USERNAME: ${{ github.actor }}
+      TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Отчёт в Code scanning (все уязвимости)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with: { image-ref: "${{ env.REF }}", format: sarif, output: trivy.sarif, version: v0.74.0, exit-code: "0" }
+      - uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        if: always()
+        with: { sarif_file: trivy.sarif, category: trivy-image }
+      # Принятые находки с причиной и сроком — .trivyignore.yaml (только для блокирующей проверки).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false, sparse-checkout: .trivyignore.yaml, sparse-checkout-cone-mode: false }
+      - name: CRITICAL и HIGH с исправлением блокируют выкатку
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: "${{ env.REF }}"
+          version: v0.74.0
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          skip-setup-trivy: true
+          trivyignores: .trivyignore.yaml
+
+  release-notes:
+    needs: [meta, build, scan]
+    runs-on: ubuntu-24.04
+    permissions: { contents: write }
+    steps:
+      - name: Версии nabu-core и агента в описании релиза
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          NOTES: |
+            Образ: `${{ needs.meta.outputs.image }}:${{ needs.meta.outputs.tag }}` (`${{ needs.build.outputs.digest }}`), подписан cosign.
+            nabu-core: ${{ needs.meta.outputs.tag }}
+            Агент: Pi (@earendil-works/pi-coding-agent) ${{ needs.meta.outputs.pi_version }}
+        run: |
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --notes "$NOTES"
+          else
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes "$NOTES"
+          fi
+
+  deploy:
+    needs: [meta, scan]
+    if: >-
+      always() && needs.meta.result == 'success' &&
+      ((needs.scan.result == 'success' && vars.AUTO_DEPLOY != 'false') ||
+       needs.meta.outputs.rebuild == 'false')
+    permissions: { contents: read, packages: read, id-token: write }
+    uses: GreenOnGrey/nabu/.github/workflows/deploy-component.yml@v0.2.0
+    with:
+      component: nabu-core
+      tag: ${{ needs.meta.outputs.tag }}
+      run_id: ${{ inputs.run_id }}
+      callback_url: ${{ inputs.callback_url }}
+      environment: ${{ inputs.environment || 'production' }}
+      verify_signature: ${{ needs.meta.outputs.rebuild == 'false' }}
+    secrets: inherit
