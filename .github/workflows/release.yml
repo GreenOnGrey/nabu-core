@@ -158,7 +158,7 @@ jobs:
       ((needs.scan.result == 'success' && vars.AUTO_DEPLOY != 'false') ||
        needs.meta.outputs.rebuild == 'false')
     permissions: { contents: read, packages: read, id-token: write }
-    uses: GreenOnGrey/nabu/.github/workflows/deploy-component.yml@v0.2.0
+    uses: GreenOnGrey/nabu/.github/workflows/deploy-component.yml@v0.1.1
     with:
       component: nabu-core
       tag: ${{ needs.meta.outputs.tag }}
