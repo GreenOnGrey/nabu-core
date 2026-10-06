@@ -27,6 +27,7 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/ledger"
 	"github.com/GreenOnGrey/nabu-core/internal/memory"
 	"github.com/GreenOnGrey/nabu-core/internal/models"
+	"github.com/GreenOnGrey/nabu-core/internal/platform/agent"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/crypto"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/httpx"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/jwt"
@@ -406,6 +407,24 @@ func TestClientsAndRuns(t *testing.T) {
 		if strings.Contains(strings.ToLower(i.Name+i.Title), "hammurapi") {
 			t.Fatal("HMR-09: Hammurapi appears in the catalog")
 		}
+	}
+	// a delegation item is checked with a Nabu JWT for the administrator
+	var sent map[string]string
+	cat.CheckMCP = func(_ context.Context, req agent.MCPCheckRequest) (*agent.MCPCheckResponse, error) {
+		sent = req.Headers
+		return &agent.MCPCheckResponse{OK: true}, nil
+	}
+	pmode := "personal"
+	di, err := cat.Save(ctx, nil, catalog.Input{Type: "mcp", Name: "product", Source: &catalog.Source{Kind: "url", URL: "https://p/mcp"},
+		Mode: &pmode, PersonalAuth: &catalog.PersonalAuth{Kind: "delegation", Audience: "hammurapi"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if di, err = cat.Check(ctx, di.ID, "admin@x.org"); err != nil || di.Status == nil || *di.Status != "ok" {
+		t.Fatalf("%+v %v", di, err)
+	}
+	if c, err := signer.Verify(strings.TrimPrefix(sent["Authorization"], "Bearer "), "hammurapi"); err != nil || c.Email != "admin@x.org" || sent[catalog.DelegationHeader] != "admin@x.org" {
+		t.Fatalf("delegation check headers %v: %+v %v", sent, c, err)
 	}
 	// ledger
 	l := &ledger.Ledger{Pool: pool}

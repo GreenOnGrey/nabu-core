@@ -396,8 +396,10 @@ func (s *Service) changed(ctx context.Context) {
 }
 
 // Check lists the tools of an MCP item through the operator with platform
-// credentials (or none) and stores them.
-func (s *Service) Check(ctx context.Context, id uuid.UUID) (*Item, error) {
+// credentials (or none) and stores them. A delegation item is checked on
+// behalf of the administrator (email): the product refuses calls without a
+// Nabu JWT.
+func (s *Service) Check(ctx context.Context, id uuid.UUID, email string) (*Item, error) {
 	it, err := s.Get(ctx, id)
 	if err != nil {
 		return nil, err
@@ -413,6 +415,9 @@ func (s *Service) Check(ctx context.Context, id uuid.UUID) (*Item, error) {
 	headers, err := s.platformHeaders(platEnc)
 	if err != nil {
 		return nil, err
+	}
+	if (it.Mode == nil || *it.Mode != "platform") && it.PersonalAuth != nil && it.PersonalAuth.Kind == "delegation" && email != "" {
+		headers = s.delegationHeaders(it, email)
 	}
 	names := make([]string, 0, len(headers))
 	for k := range headers {

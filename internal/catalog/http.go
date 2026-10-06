@@ -155,7 +155,11 @@ func (s *Service) AdminRoutes(r chi.Router, hookKey []byte) {
 		if err != nil {
 			return err
 		}
-		it, err := s.Check(r.Context(), id)
+		email := ""
+		if p := httpx.PrincipalFrom(r.Context()); p != nil {
+			email = p.Email
+		}
+		it, err := s.Check(r.Context(), id, email)
 		if err != nil {
 			return err
 		}

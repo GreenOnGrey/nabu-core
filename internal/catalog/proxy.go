@@ -32,6 +32,19 @@ func (s *Service) ProxyRoutes(r chi.Router, userEmail UserEmail) {
 	})
 }
 
+// delegationHeaders sign a Nabu JWT for the product of a delegation item and
+// name the user (R23: the product checks the signature by Nabu's JWKS).
+func (s *Service) delegationHeaders(it *Item, email string) map[string]string {
+	aud := it.PersonalAuth.Audience
+	if aud == "" {
+		aud = it.Name
+	}
+	return map[string]string{
+		"Authorization":  "Bearer " + s.Signer.Issue(jwt.Claims{Audience: aud, Subject: "nabu", Email: email}, 10*time.Minute),
+		DelegationHeader: email,
+	}
+}
+
 func rpcError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -92,13 +105,7 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, userEmail UserEm
 		pa := it.PersonalAuth
 		switch pa.Kind {
 		case "delegation":
-			aud := pa.Audience
-			if aud == "" {
-				aud = it.Name
-			}
-			// R23: a product checks the signature by Nabu's JWKS and acts for the email.
-			headers["Authorization"] = "Bearer " + s.Signer.Issue(jwt.Claims{Audience: aud, Subject: "nabu", Email: email}, 10*time.Minute)
-			headers[DelegationHeader] = email
+			headers = s.delegationHeaders(it, email)
 		default:
 			tok, err := s.userToken(r.Context(), uid, it)
 			if err != nil {
