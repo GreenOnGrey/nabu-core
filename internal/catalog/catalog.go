@@ -97,6 +97,8 @@ type Service struct {
 	CheckMCP func(ctx context.Context, req agent.MCPCheckRequest) (*agent.MCPCheckResponse, error)
 	// GitToken reads private skill repositories (optional).
 	GitToken string
+
+	userEmail UserEmail
 }
 
 var nameRe = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
@@ -310,6 +312,10 @@ func (s *Service) Save(ctx context.Context, id *uuid.UUID, in Input) (*Item, err
 	}
 	if in.ReadOnly != nil {
 		it.ReadOnly = *in.ReadOnly
+	} else if id == nil && it.PersonalAuth != nil && it.PersonalAuth.Kind == "delegation" {
+		// A product reached by delegation applies the rights of the user itself
+		// (R23): by default the agent may use its tools that change data.
+		it.ReadOnly = false
 	}
 	if in.Exposure != nil {
 		it.Exposure = *in.Exposure
@@ -567,6 +573,54 @@ type SessionMCP struct {
 	Skills  []string
 	// SkillSnapshots maps a skill to its snapshot hash.
 	SkillSnapshots map[string]string
+}
+
+// ForGroup lists the MCP servers and skills of a group agent session
+// (FTR.NAB.CMN-0002 R16, GR-07): only published platform items, no personal
+// access of the members; skills — those chosen by the owner. The proxy
+// tokens carry no user: platform credentials only.
+func (s *Service) ForGroup(ctx context.Context, groupID uuid.UUID, skills []string, conv string, ttl time.Duration) (*SessionMCP, error) {
+	rows, err := s.Pool.Query(ctx, `SELECT c.id, c.type, c.name, COALESCE(c.title,''), COALESCE(c.description,''), c.exposure, c.skills, c.skills_snapshot
+		FROM catalog_items c WHERE c.published AND NOT c.in_development AND (c.type = 'skill' OR c.mode = 'platform') ORDER BY c.name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	want := map[string]bool{}
+	for _, n := range skills {
+		want[n] = true
+	}
+	out := &SessionMCP{Headers: map[string]map[string]string{}, SkillSnapshots: map[string]string{}}
+	for rows.Next() {
+		var id uuid.UUID
+		var typ, name, title, desc, exposure string
+		var raw []byte
+		var snap *string
+		if err := rows.Scan(&id, &typ, &name, &title, &desc, &exposure, &raw, &snap); err != nil {
+			return nil, err
+		}
+		if typ == "mcp" {
+			d := title
+			if desc != "" {
+				d = strings.TrimSpace(title + ": " + desc)
+			}
+			out.Servers = append(out.Servers, agent.MCPServer{Name: name, URL: s.InternalURL + "/internal/v1/mcp-proxy/" + id.String(),
+				HeaderNames: []string{"Authorization"}, Exposure: exposure, Description: d})
+			out.Headers[name] = map[string]string{"Authorization": "Bearer " + s.ProxyToken(uuid.Nil, id, "group:"+groupID.String(), conv, ttl)}
+			continue
+		}
+		var names []string
+		_ = json.Unmarshal(raw, &names)
+		for _, n := range names {
+			if want[n] {
+				out.Skills = append(out.Skills, n)
+				if snap != nil {
+					out.SkillSnapshots[n] = *snap
+				}
+			}
+		}
+	}
+	return out, rows.Err()
 }
 
 // ProxyToken is the token a session presents to the MCP proxy for one item.

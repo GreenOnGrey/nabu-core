@@ -30,6 +30,12 @@ type User struct {
 	CreatedVia string     `json:"createdVia"`
 	LastSeenAt *time.Time `json:"lastSeenAt"`
 	CreatedAt  time.Time  `json:"createdAt"`
+	// FTR.NAB.CMN-0002 R18–R20: the archive.
+	ArchivedAt *time.Time `json:"archivedAt,omitempty"`
+	ArchivedBy *string    `json:"archivedBy,omitempty"`
+	PurgeAfter *time.Time `json:"purgeAfter,omitempty"`
+	// NewIdentity: an archived user signed in with an identity unknown to the account.
+	NewIdentity bool `json:"-"`
 }
 
 // Identity is a user as the sign-in provider sees them.
@@ -46,11 +52,13 @@ type Repo struct {
 	SpaceQuota      int64
 }
 
-const userCols = `id, email, COALESCE(name,''), COALESCE(avatar_url,''), is_admin, status, language, theme, timezone, created_via, last_seen_at, created_at`
+const userCols = `id, email, COALESCE(name,''), COALESCE(avatar_url,''), is_admin, status, language, theme, timezone, created_via, last_seen_at, created_at,
+	archived_at, archived_by, purge_after`
 
 func scanUser(row pgx.Row) (*User, error) {
 	var u User
-	err := row.Scan(&u.ID, &u.Email, &u.Name, &u.AvatarURL, &u.IsAdmin, &u.Status, &u.Language, &u.Theme, &u.Timezone, &u.CreatedVia, &u.LastSeenAt, &u.CreatedAt)
+	err := row.Scan(&u.ID, &u.Email, &u.Name, &u.AvatarURL, &u.IsAdmin, &u.Status, &u.Language, &u.Theme, &u.Timezone, &u.CreatedVia, &u.LastSeenAt, &u.CreatedAt,
+		&u.ArchivedAt, &u.ArchivedBy, &u.PurgeAfter)
 	if postgres.IsNoRows(err) {
 		return nil, nil
 	}
@@ -62,9 +70,9 @@ func (r *Repo) Get(ctx context.Context, id uuid.UUID) (*User, error) {
 	return scanUser(r.Pool.QueryRow(ctx, `SELECT `+userCols+` FROM users WHERE id = $1`, id))
 }
 
-// ByEmail loads a user by email or nil.
+// ByEmail loads a user (not a technical user of a group agent) by email or nil.
 func (r *Repo) ByEmail(ctx context.Context, email string) (*User, error) {
-	return scanUser(r.Pool.QueryRow(ctx, `SELECT `+userCols+` FROM users WHERE email = $1`, domain.NormalizeEmail(email)))
+	return scanUser(r.Pool.QueryRow(ctx, `SELECT `+userCols+` FROM users WHERE email = $1 AND created_via <> 'group'`, domain.NormalizeEmail(email)))
 }
 
 // Principal loads the principal of a user (roles are read on every request).
@@ -73,16 +81,24 @@ func (r *Repo) Principal(ctx context.Context, id uuid.UUID) (*domain.Principal, 
 	if err != nil || u == nil {
 		return nil, err
 	}
-	return &domain.Principal{UserID: u.ID, Email: u.Email, Name: u.Name, IsAdmin: u.IsAdmin, Blocked: u.Status == "blocked"}, nil
+	return &domain.Principal{UserID: u.ID, Email: u.Email, Name: u.Name, IsAdmin: u.IsAdmin, Blocked: u.Status == "blocked",
+		Archived: u.Status == "archived"}, nil
 }
 
 // ErrBlocked is the answer to a blocked user (R34, AUTH-11).
 var ErrBlocked = apperr.Forbidden("user_blocked", "access to the agent is closed for this user")
 
+// ErrArchived is the answer to an archived user (FTR.NAB.CMN-0002 tech §1).
+var ErrArchived = apperr.Forbidden("user_archived", "the account is archived")
+
 // SignIn finds or creates the user of an identity (tech §2): by (issuer,
 // subject), then by email among users without an identity of this provider
 // (invited in advance or created by delegation), otherwise a new user. The
 // email is refreshed on every sign-in; bootstrap administrators get the role.
+// An archived account is returned as it is (FTR.NAB.CMN-0002 R19): a new
+// identity is not linked, the caller records a restore request. After a
+// restore through the API the identity of the next sign-in with the email is
+// linked (link_identity_on_next_login, AR-07).
 func (r *Repo) SignIn(ctx context.Context, id Identity, bootstrapAdmin bool) (*User, bool, error) {
 	email := domain.NormalizeEmail(id.Email)
 	if email == "" {
@@ -100,8 +116,25 @@ func (r *Repo) SignIn(ctx context.Context, id Identity, bootstrapAdmin bool) (*U
 				return err
 			}
 		case postgres.IsNoRows(err):
-			err = tx.QueryRow(ctx, `SELECT u.id FROM users u WHERE u.email = $1
-				AND NOT EXISTS (SELECT 1 FROM user_identities i WHERE i.user_id = u.id AND i.issuer = $2)`, email, id.Issuer).Scan(&uid)
+			var status string
+			var link bool
+			err = tx.QueryRow(ctx, `SELECT id, status, link_identity_on_next_login FROM users WHERE email = $1 AND created_via <> 'group'`, email).
+				Scan(&uid, &status, &link)
+			if err == nil && status == "archived" {
+				u, err := scanUser(tx.QueryRow(ctx, `SELECT `+userCols+` FROM users WHERE id = $1`, uid))
+				if u != nil {
+					u.NewIdentity = true
+				}
+				out = u
+				return err
+			}
+			if err == nil && !link {
+				var other bool
+				_ = tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM user_identities WHERE user_id = $1 AND issuer = $2)`, uid, id.Issuer).Scan(&other)
+				if other {
+					return apperr.Conflict("identity_conflict", "another identity of this provider is linked to the account")
+				}
+			}
 			if postgres.IsNoRows(err) {
 				err = tx.QueryRow(ctx, `INSERT INTO users (email, name, avatar_url, language, timezone) VALUES ($1,$2,$3,$4,$5) RETURNING id`,
 					email, nilIfEmpty(id.Name), nilIfEmpty(id.Avatar), r.DefaultLanguage, r.DefaultTimezone).Scan(&uid)
@@ -113,7 +146,19 @@ func (r *Repo) SignIn(ctx context.Context, id Identity, bootstrapAdmin bool) (*U
 			if _, err := tx.Exec(ctx, `INSERT INTO user_identities (issuer, subject, user_id) VALUES ($1,$2,$3)`, id.Issuer, id.Subject, uid); err != nil {
 				return err
 			}
+			if _, err := tx.Exec(ctx, `UPDATE users SET link_identity_on_next_login = false WHERE id = $1`, uid); err != nil {
+				return err
+			}
 		default:
+			return err
+		}
+		var status string
+		if err := tx.QueryRow(ctx, `SELECT status FROM users WHERE id = $1`, uid).Scan(&status); err != nil {
+			return err
+		}
+		if status == "archived" {
+			u, err := scanUser(tx.QueryRow(ctx, `SELECT `+userCols+` FROM users WHERE id = $1`, uid))
+			out = u
 			return err
 		}
 		// AUTH-06: an invitation becomes active on the first sign-in, with its role.
@@ -144,6 +189,17 @@ func (r *Repo) EnsureByEmail(ctx context.Context, email string) (*User, error) {
 		var uid uuid.UUID
 		err := tx.QueryRow(ctx, `INSERT INTO users (email, language, timezone, created_via) VALUES ($1,$2,$3,'delegation')
 			ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email RETURNING id`, email, r.DefaultLanguage, r.DefaultTimezone).Scan(&uid)
+		if err != nil {
+			return err
+		}
+		var status string
+		if err := tx.QueryRow(ctx, `SELECT status FROM users WHERE id = $1`, uid).Scan(&status); err != nil {
+			return err
+		}
+		if status == "archived" {
+			out, err = scanUser(tx.QueryRow(ctx, `SELECT `+userCols+` FROM users WHERE id = $1`, uid))
+			return err
+		}
 		if err != nil {
 			return err
 		}
@@ -326,12 +382,16 @@ type AdminUser struct {
 	Channels []string `json:"channels"`
 }
 
-// List lists users with search and status filter.
-func (r *Repo) List(ctx context.Context, q, status string, limit int) ([]AdminUser, error) {
-	rows, err := r.Pool.Query(ctx, `SELECT `+prefixed("u.")+`, COALESCE(array_agg(c.channel ORDER BY c.channel) FILTER (WHERE c.channel IS NOT NULL), '{}')
-		FROM users u LEFT JOIN channel_links c ON c.user_id = u.id
-		WHERE ($1 = '' OR u.email ILIKE '%' || $1 || '%' OR u.name ILIKE '%' || $1 || '%') AND ($2 = '' OR u.status = $2)
-		GROUP BY u.id ORDER BY u.last_seen_at DESC NULLS LAST, u.created_at DESC LIMIT $3`, q, status, limit)
+// List lists users with search and status filter; purgeWithinDays > 0
+// keeps archived accounts deleted within that many days (R20, AR-10).
+func (r *Repo) List(ctx context.Context, q, status string, purgeWithinDays, limit int) ([]AdminUser, error) {
+	rows, err := r.Pool.Query(ctx, `SELECT `+prefixed("u.")+`, CASE WHEN EXISTS (SELECT 1 FROM telegram_bindings t WHERE t.user_id = u.id)
+		THEN '{telegram}'::text[] ELSE '{}'::text[] END
+		FROM users u
+		WHERE u.created_via <> 'group' AND ($1 = '' OR u.email ILIKE '%' || $1 || '%' OR u.name ILIKE '%' || $1 || '%') AND ($2 = '' OR u.status = $2)
+		AND ($4 <= 0 OR (u.status = 'archived' AND u.purge_after < now() + make_interval(days => $4::int)))
+		ORDER BY CASE WHEN $2 = 'archived' THEN u.purge_after END ASC NULLS LAST, u.last_seen_at DESC NULLS LAST, u.created_at DESC LIMIT $3`,
+		q, status, limit, purgeWithinDays)
 	if err != nil {
 		return nil, err
 	}
@@ -340,7 +400,7 @@ func (r *Repo) List(ctx context.Context, q, status string, limit int) ([]AdminUs
 	for rows.Next() {
 		var a AdminUser
 		if err := rows.Scan(&a.ID, &a.Email, &a.Name, &a.AvatarURL, &a.IsAdmin, &a.Status, &a.Language, &a.Theme, &a.Timezone,
-			&a.CreatedVia, &a.LastSeenAt, &a.CreatedAt, &a.Channels); err != nil {
+			&a.CreatedVia, &a.LastSeenAt, &a.CreatedAt, &a.ArchivedAt, &a.ArchivedBy, &a.PurgeAfter, &a.Channels); err != nil {
 			return nil, err
 		}
 		out = append(out, a)
@@ -350,7 +410,8 @@ func (r *Repo) List(ctx context.Context, q, status string, limit int) ([]AdminUs
 
 func prefixed(p string) string {
 	return p + `id, ` + p + `email, COALESCE(` + p + `name,''), COALESCE(` + p + `avatar_url,''), ` + p + `is_admin, ` + p + `status, ` +
-		p + `language, ` + p + `theme, ` + p + `timezone, ` + p + `created_via, ` + p + `last_seen_at, ` + p + `created_at`
+		p + `language, ` + p + `theme, ` + p + `timezone, ` + p + `created_via, ` + p + `last_seen_at, ` + p + `created_at, ` +
+		p + `archived_at, ` + p + `archived_by, ` + p + `purge_after`
 }
 
 // AdminPatch changes role and blocking.
@@ -361,6 +422,9 @@ func (r *Repo) AdminPatch(ctx context.Context, actor, id uuid.UUID, isAdmin, blo
 	}
 	if u == nil {
 		return nil, apperr.NotFound("not_found", "user not found")
+	}
+	if u.Status == "archived" && blocked != nil {
+		return nil, apperr.Conflict("user_archived", "the account is archived; restore it first")
 	}
 	if actor == id && ((isAdmin != nil && !*isAdmin) || (blocked != nil && *blocked)) {
 		return nil, apperr.Conflict("cannot_demote_self", "you cannot remove your own role or block yourself")
@@ -390,11 +454,25 @@ func (r *Repo) AdminPatch(ctx context.Context, actor, id uuid.UUID, isAdmin, blo
 	return r.Get(ctx, id)
 }
 
-// Allowed reports whether the user exists and is not blocked.
+// Allowed reports whether the user exists and is neither blocked nor archived.
 func (r *Repo) Allowed(ctx context.Context, id uuid.UUID) bool {
 	var st string
 	err := r.Pool.QueryRow(ctx, `SELECT status FROM users WHERE id = $1`, id).Scan(&st)
-	return err == nil && st != "blocked"
+	return err == nil && st != "blocked" && st != "archived"
+}
+
+// Language is the language of a user (channels.Users).
+func (r *Repo) Language(ctx context.Context, id uuid.UUID) string {
+	var l string
+	_ = r.Pool.QueryRow(ctx, `SELECT language FROM users WHERE id = $1`, id).Scan(&l)
+	return l
+}
+
+// Status is the status of a user (channels.Users).
+func (r *Repo) Status(ctx context.Context, id uuid.UUID) string {
+	var st string
+	_ = r.Pool.QueryRow(ctx, `SELECT status FROM users WHERE id = $1`, id).Scan(&st)
+	return st
 }
 
 // ErrNotFound is a missing user.
@@ -405,4 +483,20 @@ func nilIfEmpty(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+// CreateGroupUser creates the technical user that owns the conversation,
+// memory and space of a group agent (FTR.NAB.CMN-0002 R16; the deviation in
+// tech §13: one owner column for personal and group data).
+func (r *Repo) CreateGroupUser(ctx context.Context, q postgres.Querier, groupID uuid.UUID, title, language string) (uuid.UUID, error) {
+	if language == "" {
+		language = r.DefaultLanguage
+	}
+	var uid uuid.UUID
+	err := q.QueryRow(ctx, `INSERT INTO users (email, name, language, timezone, created_via, status) VALUES ($1,$2,$3,$4,'group','active') RETURNING id`,
+		"group-"+groupID.String()+"@groups.nabu.invalid", nilIfEmpty(title), language, r.DefaultTimezone).Scan(&uid)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return uid, ensureAgent(ctx, q, uid, r.SpaceQuota)
 }

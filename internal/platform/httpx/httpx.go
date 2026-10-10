@@ -190,6 +190,9 @@ type Client struct {
 	Agents      []string
 	CanDelegate bool
 	CanImport   bool
+	// FTR.NAB.CMN-0002 R22: rights users:archive and users:restore.
+	CanArchive bool
+	CanRestore bool
 }
 
 // WithPrincipal stores the principal.

@@ -43,6 +43,9 @@ type Handlers struct {
 	BootstrapAdmins map[string]bool
 	// OnSignIn runs after a successful sign-in (statistics, logs).
 	OnSignIn func(ctx context.Context, u *users.User, created bool)
+	// OnArchived records the sign-in of an archived user as a restore request
+	// (FTR.NAB.CMN-0002 R19, AR-05); id is set when the identity is new.
+	OnArchived func(ctx context.Context, u *users.User, id *users.Identity)
 }
 
 // RedirectURL is the callback registered at the provider.
@@ -114,6 +117,18 @@ func (h *Handlers) callback(w http.ResponseWriter, r *http.Request) {
 	}
 	if u.Status == "blocked" {
 		http.Redirect(w, r, h.web("/login?error=blocked"), http.StatusFound)
+		return
+	}
+	if u.Status == "archived" { // the sign-in stays closed until an administrator restores the account
+		if h.OnArchived != nil {
+			var ni *users.Identity
+			if u.NewIdentity {
+				ni = &id
+			}
+			h.OnArchived(r.Context(), u, ni)
+		}
+		slog.InfoContext(r.Context(), "sign-in of an archived account", "user_id", u.ID, "new_identity", u.NewIdentity)
+		http.Redirect(w, r, h.web("/login?error=restore_pending"), http.StatusFound)
 		return
 	}
 	if created {
@@ -227,6 +242,9 @@ func RequireActive(next http.Handler) http.Handler {
 		if p := httpx.PrincipalFrom(r.Context()); p != nil && p.Blocked {
 			httpx.Error(w, r, users.ErrBlocked)
 			return
+		} else if p != nil && p.Archived {
+			httpx.Error(w, r, users.ErrArchived)
+			return
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -236,7 +254,7 @@ func RequireActive(next http.Handler) http.Handler {
 func RequireAdmin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := httpx.PrincipalFrom(r.Context())
-		if p == nil || !p.IsAdmin || p.Blocked {
+		if p == nil || !p.IsAdmin || p.Blocked || p.Archived {
 			httpx.Error(w, r, apperr.Forbidden("forbidden", "the platform administrator role is required"))
 			return
 		}
@@ -286,8 +304,10 @@ func ClientAuth(signer *jwt.Signer, load ClientLoader) func(http.Handler) http.H
 
 // Delegation turns Nabu-On-Behalf-Of into the principal of the user: only for
 // clients with the delegation right (HMR-02); a user without an account is
-// created (HMR-03); blocked users are refused.
-func Delegation(repo *users.Repo) func(http.Handler) http.Handler {
+// created (HMR-03); blocked users are refused. An archived user gets
+// user_archived and a user whose channel of the client is closed —
+// channel_unavailable (FTR.NAB.CMN-0002 tech §4, CH-08).
+func Delegation(repo *users.Repo, open func(ctx context.Context, uid uuid.UUID, channel string) bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			cl := httpx.ClientFrom(r.Context())
@@ -311,6 +331,14 @@ func Delegation(repo *users.Repo) func(http.Handler) http.Handler {
 			}
 			if u.Status == "blocked" {
 				httpx.Error(w, r, users.ErrBlocked)
+				return
+			}
+			if u.Status == "archived" {
+				httpx.Error(w, r, users.ErrArchived)
+				return
+			}
+			if ch := domain.ChannelOf("client:" + cl.Name); ch != "" && open != nil && !open(r.Context(), u.ID, ch) {
+				httpx.Error(w, r, apperr.Forbidden("channel_unavailable", "the channel is not available for this account"))
 				return
 			}
 			id := cl.ID

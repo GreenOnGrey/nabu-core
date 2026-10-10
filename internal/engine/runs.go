@@ -48,7 +48,7 @@ func (e *Engine) HandleTaskRun(ctx context.Context, _, value []byte) error {
 	if err != nil || u == nil {
 		return err
 	}
-	if u.Status == "blocked" { // TSK-10
+	if u.Status == "blocked" || u.Status == "archived" { // TSK-10
 		return e.Tasks.Finish(ctx, ri.RunID, false, "", "user_blocked", "the user is blocked", nil)
 	}
 	ctx, cancel := context.WithTimeout(ctx, e.Cfg.TaskRunTimeout)
@@ -91,9 +91,31 @@ func (e *Engine) postTaskMessage(ctx context.Context, uid, conv uuid.UUID, ri *t
 	}
 	e.publish(ctx, events.MessageCreated, uid, final)
 	e.publish(ctx, events.MessageDone, uid, final)
-	if domain.Messenger(ri.Channel) {
-		e.deliver(ctx, uid, ri.Channel, "⏰ "+ri.Title+"\n\n"+text)
+	if ri.Channel == domain.ChannelWeb || ri.Channel == "" {
+		return final
 	}
+	// R5, CH-07: an unavailable channel — the result stays in the web, the
+	// run is marked and stays successful.
+	if ok, why := e.Deliverable(ctx, uid, ri.Channel); !ok {
+		slog.InfoContext(ctx, "task channel unavailable, delivered to the web", "task", ri.TaskID, "channel", ri.Channel, "reason", why)
+		e.Tasks.NoteDelivery(ctx, ri.RunID, "channel_unavailable")
+		return final
+	}
+	if ri.Channel == domain.ChannelEmail {
+		u, err := e.Users.Get(ctx, uid)
+		if err != nil || u == nil || e.Mail == nil {
+			e.Tasks.NoteDelivery(ctx, ri.RunID, "channel_unavailable")
+			return final
+		}
+		if sent, err := e.Mail.SendTask(context.WithoutCancel(ctx), u.Email, ri.Title, text, u.Language); err != nil || !sent {
+			if err != nil {
+				slog.WarnContext(ctx, "task mail", "task", ri.TaskID, "err", err)
+			}
+			e.Tasks.NoteDelivery(ctx, ri.RunID, "channel_unavailable")
+		}
+		return final
+	}
+	e.deliver(ctx, uid, ri.Channel, "⏰ "+ri.Title+"\n\n"+text)
 	return final
 }
 
@@ -146,8 +168,10 @@ func deliveryNote(ch string) string {
 	switch ch {
 	case domain.ChannelTelegram:
 		return " and to Telegram"
-	case domain.ChannelVKWS:
-		return " and to VK WorkSpace"
+	case domain.ChannelVKTeams:
+		return " and to VK Teams"
+	case domain.ChannelEmail:
+		return " and by mail"
 	}
 	return ""
 }

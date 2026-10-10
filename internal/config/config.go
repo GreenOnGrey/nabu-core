@@ -60,7 +60,15 @@ type Config struct {
 	TelegramBotToken      string
 	TelegramWebhookSecret string
 	TelegramAPIURL        string
-	VKWSEnabled           bool
+
+	// FTR.NAB.CMN-0002 tech §12.
+	KeyPepper       []byte // KEY_PEPPER: HMAC key of Telegram keys; derived from SECRETS_KEY when empty
+	EmailReplyLimit int
+	EmailAttachMax  int64
+	EmailInboundMax int64
+	ConfirmationTTL time.Duration
+	PurgeSchedule   string // cron, the time zone of DEFAULT_TIMEZONE
+	TGTableMaxCols  int
 
 	AgentAddr         string // http://agent.<ns>.svc:8090
 	AgentServiceToken string
@@ -220,8 +228,11 @@ func Load() (*Config, error) {
 		S3Bucket: env("S3_BUCKET", "nabu"), S3UseSSL: p.bool("S3_USE_SSL", false),
 
 		TelegramBotToken: os.Getenv("TELEGRAM_BOT_TOKEN"), TelegramWebhookSecret: os.Getenv("TELEGRAM_WEBHOOK_SECRET"),
-		TelegramAPIURL: strings.TrimRight(env("TELEGRAM_API_URL", "https://api.telegram.org"), "/"),
-		VKWSEnabled:    p.bool("VKWS_ENABLED", false),
+		TelegramAPIURL:  strings.TrimRight(env("TELEGRAM_API_URL", "https://api.telegram.org"), "/"),
+		KeyPepper:       []byte(os.Getenv("KEY_PEPPER")),
+		EmailReplyLimit: p.int("EMAIL_REPLY_LIMIT_PER_HOUR", 20), EmailAttachMax: p.bytes("EMAIL_ATTACH_MAX", "10MB"),
+		EmailInboundMax: p.bytes("EMAIL_INBOUND_MAX", "25MB"), ConfirmationTTL: p.dur("CONFIRMATION_TTL", "24h"),
+		PurgeSchedule: env("PURGE_SCHEDULE", "30 3 * * *"), TGTableMaxCols: p.int("TG_TABLE_MAX_COLS", 8),
 
 		AgentAddr: strings.TrimRight(env("AGENT_ADDR", "http://localhost:8090"), "/"), AgentServiceToken: os.Getenv("AGENT_SERVICE_TOKEN"),
 		AgentIdleTimeout: p.dur("AGENT_IDLE_TIMEOUT", "15m"), TurnTimeout: p.dur("TURN_TIMEOUT", "30m"),

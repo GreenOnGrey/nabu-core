@@ -53,6 +53,23 @@ type Server struct {
 	// ChannelOf is the channel of the conversation's latest user message: the
 	// default delivery channel of tasks created there.
 	ChannelOf func(ctx context.Context, conv uuid.UUID) string
+	// Hold keeps a call of a tool that changes data until the user confirms
+	// it (FTR.NAB.CMN-0002 R9: mail topics); held — the answer to the agent.
+	Hold func(ctx context.Context, g Grant, tool string, args json.RawMessage) (answer string, held bool)
+}
+
+// Execute runs a tool for a grant (a confirmed call, tech §6).
+func (s *Server) Execute(ctx context.Context, g Grant, name string, args json.RawMessage) (string, bool, error) {
+	for _, t := range s.tools {
+		if t.Name == name {
+			out, err := t.Handler(ctx, g, args)
+			if err != nil {
+				return err.Error(), true, nil
+			}
+			return out, false, nil
+		}
+	}
+	return "", true, &ToolError{Msg: "unknown tool " + name}
 }
 
 // NewServer creates a server that accepts tokens of the signer.
@@ -172,6 +189,11 @@ func (s *Server) dispatch(ctx context.Context, g Grant, req request) (any, *rpcE
 		for _, t := range s.tools {
 			if t.Name != p.Name {
 				continue
+			}
+			if !t.ReadOnly && s.Hold != nil {
+				if answer, held := s.Hold(ctx, g, t.Name, p.Arguments); held {
+					return toolResult(answer, false), nil
+				}
 			}
 			out, err := t.Handler(ctx, g, p.Arguments)
 			if err != nil {

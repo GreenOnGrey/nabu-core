@@ -213,6 +213,20 @@ func (m *Sandboxes) Reap(ctx context.Context) {
 	metrics.Sandboxes.Set(float64(n))
 }
 
+// Stop deletes the sandbox of a user (archiving, FTR.NAB.CMN-0002 R18); the
+// pod syncs the files to S3 within the grace period like an idle stop.
+func (m *Sandboxes) Stop(ctx context.Context, uid uuid.UUID) error {
+	if m == nil || m.K8s == nil {
+		return nil
+	}
+	_, _ = m.Pool.Exec(ctx, `UPDATE spaces SET state = 'stopping', state_changed_at = now() WHERE user_id = $1 AND state <> 'sleeping'`, uid)
+	if err := m.K8s.DeletePod(ctx, m.Cfg.Namespace, PodName(uid), 90); err != nil {
+		return err
+	}
+	m.publish(ctx, uid)
+	return nil
+}
+
 // Run reaps until ctx ends.
 func (m *Sandboxes) Run(ctx context.Context) {
 	t := time.NewTicker(time.Minute)

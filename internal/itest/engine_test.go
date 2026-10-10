@@ -145,7 +145,8 @@ func TestEngineWithPi(t *testing.T) {
 		Pool: pool, Op: &agent.Client{BaseURL: osrv.URL, Token: "svc"}, Users: repo(), Chat: store, Models: ms,
 		Catalog: &catalog.Service{Pool: pool, Box: box, Signer: signer, InternalURL: isrv.URL, S3: s3},
 		Memory:  memSvc, Tasks: taskSvc, Space: spaceSvc, Services: svcSvc, Ledger: &ledger.Ledger{Pool: pool},
-		Signer: signer, S3: s3, Events: hub, Bus: b, Links: &channels.Links{Pool: pool}, Adapters: map[string]channels.Adapter{},
+		Signer: signer, S3: s3, Events: hub, Bus: b, Adapters: map[string]channels.Adapter{},
+		Registry: &channels.Registry{Pool: pool, Box: box}, Keys: &channels.Keys{Pool: pool, Pepper: key},
 	}
 	uid := newUser(t, "pi@x.org")
 	main, err := store.Main(ctx, uid)

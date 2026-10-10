@@ -58,10 +58,37 @@ var (
 	ChannelMessages = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nabu_channel_messages_total", Help: "Messenger messages by channel and direction.",
 	}, []string{"channel", "direction"})
+
+	// FTR.NAB.CMN-0002 arch §10.
+	ChannelInbound = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_channel_inbound_total", Help: "Incoming channel messages by channel and result (accepted, rejected, unavailable, automatic).",
+	}, []string{"channel", "result"})
+	ChannelOutbound = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_channel_outbound_total", Help: "Outgoing channel messages by channel and result.",
+	}, []string{"channel", "result"})
+	EmailAuthRejected = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_email_auth_rejected_total", Help: "Letters rejected by the authenticity check, by reason.",
+	}, []string{"reason"})
+	IMAPConnected = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "nabu_imap_connected", Help: "1 while the mail receiver holds the IMAP connection.",
+	})
+	VKTeamsPollLag = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "nabu_vkteams_poll_lag_seconds", Help: "Seconds since the last successful VK Teams poll.",
+	})
+	PendingConfirmations = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "nabu_pending_confirmations", Help: "Tool calls waiting for the confirmation of users.",
+	})
+	Users = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "nabu_users", Help: "Users by status.",
+	}, []string{"status"})
+	PurgeDeleted = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_purge_deleted_total", Help: "Accounts and group agents deleted by the purge.",
+	}, []string{"kind"})
 )
 
 func init() {
 	Registry.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		HTTPRequests, HTTPDuration, KafkaLag, AgentSessions, AgentProcessStarts, LLMRequests, LLMErrors, LLMTokens, LLMCost,
-		Turns, WorkspaceConnections, WorkspaceCalls, Sandboxes, TaskRuns, ServiceRuns, ChannelMessages)
+		Turns, WorkspaceConnections, WorkspaceCalls, Sandboxes, TaskRuns, ServiceRuns, ChannelMessages,
+		ChannelInbound, ChannelOutbound, EmailAuthRejected, IMAPConnected, VKTeamsPollLag, PendingConfirmations, Users, PurgeDeleted)
 }

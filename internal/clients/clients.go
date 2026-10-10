@@ -42,6 +42,8 @@ type Client struct {
 	Agents               []string       `json:"agents"`
 	CanDelegate          bool           `json:"canDelegate"`
 	CanImport            bool           `json:"canImport"`
+	CanArchive           bool           `json:"canArchive"`
+	CanRestore           bool           `json:"canRestore"`
 	Limits               map[string]any `json:"limits"`
 	Enabled              bool           `json:"enabled"`
 	PrevSecretExpiresAt  *time.Time     `json:"prevSecretExpiresAt"`
@@ -63,12 +65,12 @@ func (s *Service) clock() time.Time {
 	return time.Now()
 }
 
-const cols = `id, name, COALESCE(url,''), client_id, agents, can_delegate, can_import, limits, enabled, prev_secret_expires_at, created_at, secret_hash, prev_secret_hash`
+const cols = `id, name, COALESCE(url,''), client_id, agents, can_delegate, can_import, can_archive, can_restore, limits, enabled, prev_secret_expires_at, created_at, secret_hash, prev_secret_hash`
 
 func scan(row pgx.Row) (*Client, error) {
 	var c Client
 	var limits []byte
-	if err := row.Scan(&c.ID, &c.Name, &c.URL, &c.ClientID, &c.Agents, &c.CanDelegate, &c.CanImport, &limits, &c.Enabled,
+	if err := row.Scan(&c.ID, &c.Name, &c.URL, &c.ClientID, &c.Agents, &c.CanDelegate, &c.CanImport, &c.CanArchive, &c.CanRestore, &limits, &c.Enabled,
 		&c.PrevSecretExpiresAt, &c.CreatedAt, &c.secretHash, &c.prevHash); err != nil {
 		return nil, err
 	}
@@ -129,7 +131,8 @@ func (s *Service) Load(ctx context.Context, id uuid.UUID) (*httpx.Client, error)
 	if err != nil {
 		return nil, err
 	}
-	return &httpx.Client{ID: c.ID, Name: c.Name, Agents: c.Agents, CanDelegate: c.CanDelegate, CanImport: c.CanImport}, nil
+	return &httpx.Client{ID: c.ID, Name: c.Name, Agents: c.Agents, CanDelegate: c.CanDelegate, CanImport: c.CanImport,
+		CanArchive: c.CanArchive, CanRestore: c.CanRestore}, nil
 }
 
 var nameRe = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
@@ -141,6 +144,8 @@ type Input struct {
 	Agents      *[]string       `json:"agents"`
 	CanDelegate *bool           `json:"canDelegate"`
 	CanImport   *bool           `json:"canImport"`
+	CanArchive  *bool           `json:"canArchive"`
+	CanRestore  *bool           `json:"canRestore"`
 	Limits      *map[string]any `json:"limits"`
 	Enabled     *bool           `json:"enabled"`
 }
@@ -168,9 +173,10 @@ func (s *Service) Create(ctx context.Context, in Input) (*Created, error) {
 	}
 	lb, _ := json.Marshal(limits)
 	var id uuid.UUID
-	err := s.Pool.QueryRow(ctx, `INSERT INTO service_clients (name, url, client_id, secret_hash, agents, can_delegate, can_import, limits)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`, in.Name, deref(in.URL), in.Name, hash(secret), agents,
-		in.CanDelegate != nil && *in.CanDelegate, in.CanImport != nil && *in.CanImport, lb).Scan(&id)
+	err := s.Pool.QueryRow(ctx, `INSERT INTO service_clients (name, url, client_id, secret_hash, agents, can_delegate, can_import, limits, can_archive, can_restore)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`, in.Name, deref(in.URL), in.Name, hash(secret), agents,
+		in.CanDelegate != nil && *in.CanDelegate, in.CanImport != nil && *in.CanImport, lb,
+		in.CanArchive != nil && *in.CanArchive, in.CanRestore != nil && *in.CanRestore).Scan(&id)
 	if postgres.IsUniqueViolation(err) {
 		return nil, apperr.Conflict("name_taken", "a client with this name exists").With("field", "name")
 	}
@@ -199,7 +205,8 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, in Input) (*Client, 
 	}
 	tag, err := s.Pool.Exec(ctx, `UPDATE service_clients SET url = COALESCE($2, url), agents = COALESCE($3, agents),
 		can_delegate = COALESCE($4, can_delegate), can_import = COALESCE($5, can_import), limits = COALESCE($6, limits),
-		enabled = COALESCE($7, enabled) WHERE id = $1`, id, in.URL, in.Agents, in.CanDelegate, in.CanImport, lb, in.Enabled)
+		enabled = COALESCE($7, enabled), can_archive = COALESCE($8, can_archive), can_restore = COALESCE($9, can_restore)
+		WHERE id = $1`, id, in.URL, in.Agents, in.CanDelegate, in.CanImport, lb, in.Enabled, in.CanArchive, in.CanRestore)
 	if err != nil {
 		return nil, err
 	}
@@ -252,6 +259,12 @@ func (s *Service) Token(c *Client) (string, []string) {
 	}
 	if c.CanImport {
 		scope = append(scope, "import")
+	}
+	if c.CanArchive {
+		scope = append(scope, "users:archive")
+	}
+	if c.CanRestore {
+		scope = append(scope, "users:restore")
 	}
 	return s.Signer.Issue(jwt.Claims{Audience: jwt.AudClient, Subject: "client:" + c.ID.String(), Scope: scope}, TokenTTL), scope
 }

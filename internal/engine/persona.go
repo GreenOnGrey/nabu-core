@@ -33,6 +33,13 @@ type Persona struct {
 	Spaces  bool
 	Now     time.Time
 	Catalog []string // titles of the connected tools
+	// Group is set for a group agent (FTR.NAB.CMN-0002 R16).
+	Group *GroupInfo
+}
+
+// GroupInfo describes the chat of a group agent.
+type GroupInfo struct {
+	Title, Channel, Owner string
 }
 
 // Hash changes when the instructions must change: the profile or the memory.
@@ -44,6 +51,9 @@ func (p Persona) Hash() string {
 
 // Instructions are APPEND_SYSTEM.md of the session.
 func (p Persona) Instructions() string {
+	if p.Group != nil {
+		return p.groupInstructions()
+	}
 	var b strings.Builder
 	name := p.User.Name
 	if name == "" {
@@ -65,6 +75,28 @@ func (p Persona) Instructions() string {
 		b.WriteString("Tools the user connected: " + strings.Join(p.Catalog, "; ") + ". You act in these systems on behalf of the user, with the user's rights.\n")
 	}
 	b.WriteString(profileBlock(p))
+	return b.String()
+}
+
+// groupInstructions are the instructions of a group agent (arch §6).
+func (p Persona) groupInstructions() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "You are %s, the group AI agent of the %s chat «%s» on Nabu, the corporate agent platform of the company. "+
+		"You are an agent of the chat, not a personal agent of any member; the owner of the agent is %s.\n", p.Agent.Name, p.Group.Channel, p.Group.Title, p.Group.Owner)
+	fmt.Fprintf(&b, "Your tone is %s.\n", tones[p.Agent.Tone])
+	b.WriteString("Answer in the language of the message. You see only messages addressed to you (a mention or a reply) and their quotes; " +
+		"every message names its author. Keep answers compact: one message for the whole chat.\n")
+	b.WriteString("You have no access to the personal data, memory, space, mail or personal tools of the members. " +
+		"When a member asks for something personal (their mail, their tasks, their files), suggest writing to you in a private chat with the bot.\n")
+	b.WriteString("\nYour platform tools (mcp__nabu__*): memory_save, memory_search and memory_delete keep the memory of the GROUP — save facts useful to the whole chat only; " +
+		"space_info shows the space of the group. Do not create scheduled tasks.\n")
+	if p.Spaces {
+		b.WriteString("Your file and shell tools work in the space of the group: files persist between conversations of the chat.\n")
+	}
+	if len(p.Catalog) > 0 {
+		b.WriteString("Platform tools: " + strings.Join(p.Catalog, "; ") + ". They work with platform credentials, the same for every member.\n")
+	}
+	b.WriteString(strings.Replace(profileBlock(p), "The user's memory", "The memory of the group", 2))
 	return b.String()
 }
 
@@ -104,9 +136,11 @@ func channelRules(ch string, now time.Time, tz string) string {
 	t := now.In(loc).Format("Monday 2006-01-02 15:04")
 	switch {
 	case ch == domain.ChannelTelegram:
-		return "[Channel: Telegram, " + t + ". Keep answers compact; use simple Markdown (bold, lists, code); no tables or HTML.]"
-	case ch == domain.ChannelVKWS:
-		return "[Channel: VK WorkSpace, " + t + ". Keep answers compact; simple Markdown only.]"
+		return "[Channel: Telegram, " + t + ". Keep answers compact; Markdown with headings, lists, code and tables is rendered; no HTML.]"
+	case ch == domain.ChannelVKTeams || ch == "vkws":
+		return "[Channel: VK Teams, " + t + ". Keep answers compact; Markdown is rendered, tables are shown as monospace text.]"
+	case ch == domain.ChannelEmail:
+		return "[Channel: mail, " + t + ". Markdown with headings, lists, code and tables is rendered in the letter.]"
 	case strings.HasPrefix(ch, "client:"):
 		return "[Channel: " + strings.TrimPrefix(ch, "client:") + " (embedded), " + t + ".]"
 	default:

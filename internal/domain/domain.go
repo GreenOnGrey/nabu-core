@@ -17,12 +17,15 @@ type Principal struct {
 	Name    string
 	IsAdmin bool
 	Blocked bool
+	// Archived: the account waits for restoring (FTR.NAB.CMN-0002 R18).
+	Archived bool
 	// ClientID is set when a service client acts on behalf of the user.
 	ClientID   *uuid.UUID
 	ClientName string
 }
 
-// Channel is where a message came from: web, telegram, vkws, client:<id> or task:<id>.
+// Channel is where a message came from: web, telegram, vkteams, email,
+// client:<name> or task:<id>.
 func (p *Principal) Channel() string {
 	if p.ClientID != nil {
 		return "client:" + p.ClientName
@@ -30,15 +33,34 @@ func (p *Principal) Channel() string {
 	return ChannelWeb
 }
 
-// Channels.
+// Channels (FTR.NAB.CMN-0002 §3). Messages of FTR.NAB.CMN-0001 may still carry "vkws".
 const (
-	ChannelWeb      = "web"
-	ChannelTelegram = "telegram"
-	ChannelVKWS     = "vkws"
+	ChannelWeb       = "web"
+	ChannelTelegram  = "telegram"
+	ChannelVKTeams   = "vkteams"
+	ChannelEmail     = "email"
+	ChannelHammurapi = "hammurapi"
 )
 
-// Messenger reports whether the channel is a linked messenger.
-func Messenger(ch string) bool { return ch == ChannelTelegram || ch == ChannelVKWS }
+// ChannelKinds are the channels of an instance in the order of the administration.
+var ChannelKinds = []string{ChannelWeb, ChannelHammurapi, ChannelEmail, ChannelVKTeams, ChannelTelegram}
+
+// Messenger reports whether the channel is a messenger with a chat bot.
+func Messenger(ch string) bool { return ch == ChannelTelegram || ch == ChannelVKTeams }
+
+// ChannelOf is the channel kind of a message channel: client:hammurapi is the
+// Hammurapi channel; other clients have no channel of their own ("").
+func ChannelOf(ch string) string {
+	switch {
+	case ch == "client:"+ChannelHammurapi:
+		return ChannelHammurapi
+	case strings.HasPrefix(ch, "client:"), strings.HasPrefix(ch, "task:"):
+		return ""
+	case ch == "vkws":
+		return ChannelVKTeams
+	}
+	return ch
+}
 
 // Tones of the personal agent (tech spec §3.1).
 var Tones = []string{"business", "friendly", "brief", "mentor"}

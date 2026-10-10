@@ -4,21 +4,27 @@ go 1.27
 
 require (
 	github.com/coder/websocket v1.8.15
+	github.com/emersion/go-imap/v2 v2.0.0-beta.8
+	github.com/emersion/go-message v0.18.2
 	github.com/exaring/otelpgx v0.12.0
 	github.com/go-chi/chi/v5 v5.3.2
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.11.0
+	github.com/mail-ru-im/bot-golang v0.0.0-20250904145337-343461642fb9
 	github.com/minio/minio-go/v7 v7.3.0
 	github.com/ory/dockertest/v4 v4.0.0
 	github.com/pressly/goose/v3 v3.28.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/segmentio/kafka-go v0.4.51
+	github.com/sirupsen/logrus v1.9.4
+	github.com/yuin/goldmark v1.8.6
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.71.0
 	go.opentelemetry.io/otel v1.46.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.46.0
 	go.opentelemetry.io/otel/sdk v1.46.0
 	go.opentelemetry.io/otel/trace v1.46.0
+	golang.org/x/net v0.58.0
 	golang.org/x/sync v0.23.0
 )
 
@@ -33,16 +39,20 @@ require (
 	github.com/docker/go-connections v0.8.1 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6 // indirect
 	github.com/felixge/httpsnoop v1.1.0 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.30.0 // indirect
+	github.com/hako/durafmt v0.0.0-20210608085754-5c1018a4e16b // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
+	github.com/josharian/intern v1.0.0 // indirect
 	github.com/klauspost/compress v1.19.2 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/klauspost/crc32 v1.3.0 // indirect
+	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/mfridman/interpolate v0.0.2 // indirect
 	github.com/minio/crc64nvme v1.1.1 // indirect
 	github.com/minio/md5-simd v1.1.2 // indirect
@@ -68,7 +78,6 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/crypto v0.55.0 // indirect
-	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260819154853-08b0e4226688 // indirect

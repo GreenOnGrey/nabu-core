@@ -45,6 +45,9 @@ type Entry struct {
 	ArgsSummary    *string    `json:"argsSummary"`
 	Result         string     `json:"result"` // ok | error
 	Error          *string    `json:"error"`
+	// GroupAgentID: the call of a group agent; UserID is the author of the
+	// message (FTR.NAB.CMN-0002 R16).
+	GroupAgentID *uuid.UUID `json:"groupAgentId,omitempty"`
 }
 
 // Ledger writes and reads usage and audit.
@@ -92,8 +95,8 @@ func (l *Ledger) Audit(ctx context.Context, e Entry, args string, secrets []stri
 		m := Mask(*e.Error, secrets, 1000)
 		e.Error = &m
 	}
-	if _, err := l.Pool.Exec(context.WithoutCancel(ctx), `INSERT INTO audit (agent_kind, agent, user_id, client_id, initiator_email, channel, server, tool, args_summary, result, error)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, e.AgentKind, e.Agent, e.UserID, e.ClientID, e.InitiatorEmail, e.Channel, e.Server, e.Tool, a, e.Result, e.Error); err != nil {
+	if _, err := l.Pool.Exec(context.WithoutCancel(ctx), `INSERT INTO audit (agent_kind, agent, user_id, client_id, initiator_email, channel, server, tool, args_summary, result, error, group_agent_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, e.AgentKind, e.Agent, e.UserID, e.ClientID, e.InitiatorEmail, e.Channel, e.Server, e.Tool, a, e.Result, e.Error, e.GroupAgentID); err != nil {
 		slog.ErrorContext(ctx, "audit write failed", "err", err, "tool", e.Tool)
 	}
 }
@@ -103,6 +106,8 @@ type UsageRow struct {
 	UserID, RunID, ClientID *uuid.UUID
 	Agent, Model            string
 	ConnectionID            *uuid.UUID
+	// GroupAgentID: the cost of a group agent, not of its owner (GR-08).
+	GroupAgentID *uuid.UUID
 	agent.Usage
 }
 
@@ -111,9 +116,9 @@ func (l *Ledger) Usage(ctx context.Context, u UsageRow) {
 	if u.IsZero() {
 		return
 	}
-	if _, err := l.Pool.Exec(context.WithoutCancel(ctx), `INSERT INTO usage (user_id, run_id, client_id, agent, connection_id, model, tokens_in, tokens_out, cache_read, cache_write, cost_usd)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, u.UserID, u.RunID, u.ClientID, nilIfEmpty(u.Agent), u.ConnectionID, nilIfEmpty(u.Model),
-		u.TokensIn, u.TokensOut, u.CacheRead, u.CacheWrite, u.CostUSD); err != nil {
+	if _, err := l.Pool.Exec(context.WithoutCancel(ctx), `INSERT INTO usage (user_id, run_id, client_id, agent, connection_id, model, tokens_in, tokens_out, cache_read, cache_write, cost_usd, group_agent_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, u.UserID, u.RunID, u.ClientID, nilIfEmpty(u.Agent), u.ConnectionID, nilIfEmpty(u.Model),
+		u.TokensIn, u.TokensOut, u.CacheRead, u.CacheWrite, u.CostUSD, u.GroupAgentID); err != nil {
 		slog.ErrorContext(ctx, "usage write failed", "err", err)
 	}
 }
@@ -270,7 +275,10 @@ func (l *Ledger) UsageReport(ctx context.Context, from, to time.Time, groupBy st
 	var key, label, join string
 	switch groupBy {
 	case "user":
-		key, label, join = "u.user_id::text", "COALESCE(x.email, 'service')", " LEFT JOIN users x ON x.id = u.user_id"
+		// a group agent is a separate line with the group and its owner (FTR.NAB.CMN-0002 R16)
+		key = "COALESCE(u.group_agent_id::text, u.user_id::text)"
+		label = "CASE WHEN u.group_agent_id IS NOT NULL THEN 'group agent · ' || COALESCE(g.chat_title, g.external_chat_id, '—') || ' · ' || COALESCE(o.email, '—') ELSE COALESCE(x.email, 'service') END"
+		join = " LEFT JOIN users x ON x.id = u.user_id LEFT JOIN group_agents g ON g.id = u.group_agent_id LEFT JOIN users o ON o.id = g.owner_id"
 	case "agent":
 		key, label = "COALESCE(u.agent, 'personal')", "COALESCE(u.agent, 'personal')"
 	case "client":

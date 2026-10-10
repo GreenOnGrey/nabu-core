@@ -11,7 +11,7 @@ Nabu is three repositories checked out side by side, next to Hammurapi:
 | `nabu-core` (this one) | Go backend: one binary with modes, migrations, the agent operator, `relay`, sandboxes |
 | `nabu-web` | React SPA |
 | `nabu` | Docs and the reusable deploy workflow `deploy-component.yml` |
-| `hammurapi-specs` | Source of truth: `specs/NAB/CMN/FTR.NAB.CMN-0001` (and `FTR.HMR.CMN-0006` for Hammurapi) |
+| `hammurapi-specs` | Source of truth: `specs/NAB/CMN/FTR.NAB.CMN-0001`, `FTR.NAB.CMN-0002` (channels and accounts) and `FTR.HMR.CMN-0006` for Hammurapi |
 | `hammurapi-infra` | The stand: charts `nabu-core`/`nabu-web` and `bin/nabu-deploy` next to those of Hammurapi |
 
 - Every change implements a feature specification from `hammurapi-specs/specs/NAB/<GROUP>/FTR.NAB.<GROUP>-NNNN/`.
@@ -25,7 +25,7 @@ Nabu is three repositories checked out side by side, next to Hammurapi:
 ## Stack and layout
 
 Go 1.27, Postgres (pgx, goose), Kafka (segmentio/kafka-go), S3 (minio-go), chi, coder/websocket,
-robfig/cron. JWTs (Ed25519) are Nabu's own: `internal/platform/jwt`, keys from `SECRETS_KEY`, JWKS at
+robfig/cron, goldmark (answers → channel formats), go-imap v2 and go-message (mail), bot-golang (VK Teams). JWTs (Ed25519) are Nabu's own: `internal/platform/jwt`, keys from `SECRETS_KEY`, JWKS at
 `/.well-known/jwks.json`.
 
 ```text
@@ -40,7 +40,12 @@ internal/relay/       the WebSocket channel of workspaces (server and client; fr
 internal/workspace/   the workspace server (fs/*, grep, exec) served in sandboxes and runners
 internal/space, sandbox/   personal spaces: sandbox pods, S3 sync
 internal/catalog/     catalog, MCP proxy with credentials, skills
-internal/auth, users, clients, services, importer, tasks, memory, chat, channels, ledger, models, admin
+internal/channels/    registry and availability of channels, Telegram (keys, rich messages), VK Teams; email/ — the mail channel
+internal/render/      the agent's Markdown → Telegram rich blocks, messenger HTML, letters
+internal/groups/      group agents of Telegram and VK Teams chats (data owned by a technical user, created_via = 'group')
+internal/accounts/    archiving, restoring and the purge of accounts
+internal/confirm/     tools that change data wait for the user in mail topics
+internal/auth, users, clients, services, importer, tasks, memory, chat, ledger, models, admin
 internal/platform/*   adapters: postgres, kafka, storage, jwt, mcp, k8s, agent (operator, Pi files), …
 internal/itest/       integration tests (build tag integration)
 deploy/versions.env   DEPLOY_WORKFLOW_REF, CHART_VERSION, PI_VERSION — changed only by PR
@@ -55,7 +60,8 @@ deploy/versions.env   DEPLOY_WORKFLOW_REF, CHART_VERSION, PI_VERSION — changed
 make build                                               # bin/nabu
 go test ./...                                            # unit tests
 go test -tags integration -count=1 ./internal/itest/...  # Postgres: dockertest, or
-NABU_TEST_DATABASE_URL=postgres://… go test -tags integration ./internal/itest/   # an existing server (fresh DB per run)
+NABU_TEST_DATABASE_URL=postgres://… go test -tags integration ./internal/itest/   # an existing server (fresh DB per run);
+                                                         # without Docker: github.com/fergusstrange/embedded-postgres
 PIRPC_PI_CMD=pi NABU_PI_CMD=pi go test ./pkg/pirpc/ ./internal/platform/agent/... ./internal/relay/ ./internal/workspace/   # real Pi
 PIRPC_PI_CMD=pi NABU_PI_CMD=pi go test -tags integration -run TestEngineWithPi ./internal/itest/   # the engine with real Pi
 golangci-lint run ./... && golangci-lint run --build-tags integration ./internal/itest/
@@ -74,6 +80,11 @@ handing work over.
   `nabu-web/locales/*.json` (`errors.<code>`).
 - A new environment variable goes to `internal/config/config.go`, `nabu/docs/configuration.md` and,
   if the stand needs it, the chart `hammurapi-infra/charts/nabu-core` and `hammurapi-infra/bin/nabu-deploy`.
+- The web source never names a client product (`nabu-web` tests it): a product channel is data — the
+  name of its service client — not a literal in the interface.
+- A channel adapter knows nothing of conversations; messages of every channel pass the availability
+  rule (`channels.Registry.Available`) on the way in and on delivery. One IMAP receiver and one VK
+  Teams poller per instance run under `postgres.RunLocked`.
 - Secrets never go to argv, logs, files or the environment of Pi: LLM keys and MCP credentials stay in
   `api`/`worker` (the MCP proxy adds them per call). Audit entries are masked.
 - The release image must not contain Pi extensions that schedule work or run in the background;

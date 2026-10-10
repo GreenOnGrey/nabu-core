@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5"
@@ -90,3 +91,54 @@ func IsCheckViolation(err error) bool {
 
 // IsNoRows reports pgx.ErrNoRows.
 func IsNoRows(err error) bool { return errors.Is(err, pgx.ErrNoRows) }
+
+// RunLocked runs fn while this process holds the advisory lock of key
+// (FTR.NAB.CMN-0002 arch §3.1, §4: one mail receiver and one VK Teams poller
+// per instance). Without the lock it retries every interval; when the
+// connection holding the lock breaks, fn is cancelled and the lock is taken
+// again by any instance.
+func RunLocked(ctx context.Context, pool *pgxpool.Pool, key string, interval time.Duration, fn func(ctx context.Context)) {
+	for ctx.Err() == nil {
+		held := func() bool {
+			conn, err := pool.Acquire(ctx)
+			if err != nil {
+				return false
+			}
+			defer conn.Release()
+			var ok bool
+			if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext($1))`, key).Scan(&ok); err != nil || !ok {
+				return false
+			}
+			defer conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock(hashtext($1))`, key) //nolint:errcheck // the session ends anyway
+			fctx, cancel := context.WithCancel(ctx)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				fn(fctx)
+			}()
+			t := time.NewTicker(interval)
+			defer t.Stop()
+			for {
+				select {
+				case <-done:
+					cancel()
+					return true
+				case <-t.C:
+					if err := conn.Ping(ctx); err != nil {
+						cancel()
+						<-done
+						return true
+					}
+				}
+			}
+		}()
+		wait := interval
+		if held {
+			wait = time.Second
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(wait):
+		}
+	}
+}

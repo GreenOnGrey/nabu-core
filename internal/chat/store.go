@@ -27,7 +27,12 @@ type Conversation struct {
 	LastMessageAt *time.Time `json:"lastMessageAt"`
 	ArchivedAt    *time.Time `json:"archivedAt"`
 	CreatedAt     time.Time  `json:"createdAt"`
-	userID        uuid.UUID
+	// FTR.NAB.CMN-0002 tech §3: mail topics.
+	Source      string `json:"source"` // chat | email | group
+	UnreadCount int    `json:"unreadCount"`
+	// WritesRequireConfirmation: tools that change data wait for the user (R9).
+	WritesRequireConfirmation bool `json:"writesRequireConfirmation"`
+	userID                    uuid.UUID
 }
 
 // ToolStep is a step of the agent's work with a tool (R30).
@@ -69,11 +74,11 @@ type Message struct {
 // Store is the conversation repository.
 type Store struct{ Pool *pgxpool.Pool }
 
-const convCols = `id, user_id, kind, title, last_message_at, archived_at, created_at`
+const convCols = `id, user_id, kind, title, last_message_at, archived_at, created_at, source, unread_count, writes_require_confirmation`
 
 func scanConv(row pgx.Row) (*Conversation, error) {
 	var c Conversation
-	err := row.Scan(&c.ID, &c.userID, &c.Kind, &c.Title, &c.LastMessageAt, &c.ArchivedAt, &c.CreatedAt)
+	err := row.Scan(&c.ID, &c.userID, &c.Kind, &c.Title, &c.LastMessageAt, &c.ArchivedAt, &c.CreatedAt, &c.Source, &c.UnreadCount, &c.WritesRequireConfirmation)
 	return &c, err
 }
 
@@ -142,6 +147,19 @@ func (s *Store) Patch(ctx context.Context, uid, id uuid.UUID, title *string, arc
 		return nil, err
 	}
 	return s.Get(ctx, uid, id)
+}
+
+// Read resets the unread counter of a conversation (UI-04).
+func (s *Store) Read(ctx context.Context, uid, id uuid.UUID) error {
+	_, err := s.Pool.Exec(ctx, `UPDATE conversations SET unread_count = 0 WHERE id = $1 AND user_id = $2`, id, uid)
+	return err
+}
+
+// Source is the source of a conversation: chat, email or group.
+func (s *Store) Source(ctx context.Context, id uuid.UUID) string {
+	var src string
+	_ = s.Pool.QueryRow(ctx, `SELECT source FROM conversations WHERE id = $1`, id).Scan(&src)
+	return src
 }
 
 // ArchiveIdle archives topics without activity (R5: 14 days, CONV-06).

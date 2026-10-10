@@ -22,8 +22,10 @@ import (
 	"github.com/ory/dockertest/v4"
 
 	"github.com/GreenOnGrey/nabu-core/internal/catalog"
+	"github.com/GreenOnGrey/nabu-core/internal/channels"
 	"github.com/GreenOnGrey/nabu-core/internal/chat"
 	"github.com/GreenOnGrey/nabu-core/internal/clients"
+	"github.com/GreenOnGrey/nabu-core/internal/engine"
 	"github.com/GreenOnGrey/nabu-core/internal/ledger"
 	"github.com/GreenOnGrey/nabu-core/internal/memory"
 	"github.com/GreenOnGrey/nabu-core/internal/models"
@@ -179,7 +181,7 @@ func TestSignIn(t *testing.T) {
 	if err != nil || d.CreatedVia != "delegation" {
 		t.Fatal(d, err)
 	}
-	list, err := r.List(ctx, "x.org", "", 500)
+	list, err := r.List(ctx, "x.org", "", 0, 500)
 	n := 0
 	for _, u := range list {
 		if u.Email == "ann@new.org" || u.Email == "boss@x.org" || u.Email == "new@x.org" {
@@ -240,6 +242,9 @@ func TestTasks(t *testing.T) {
 	b := &bus{}
 	s := &tasks.Service{Pool: pool, Bus: b, Rules: tasks.Rules{MinInterval: 15 * time.Minute, MaxActive: 3}, Catchup: time.Hour,
 		Tick: time.Second, MaxFailures: 3, DefaultTimezone: "Europe/Moscow"}
+	box, _ := crypto.NewBox(key)
+	s.Deliverable = (&engine.Engine{Pool: pool, Users: repo(), Registry: &channels.Registry{Pool: pool, Box: box},
+		Keys: &channels.Keys{Pool: pool, Pepper: key}}).Deliverable
 	uid := newUser(t, "t1@x.org")
 	in := tasks.CreateInput{Title: "Metrics", Instruction: "Send a metrics summary"}
 	in.Schedule.Cron = "*/5 * * * *"
@@ -257,6 +262,20 @@ func TestTasks(t *testing.T) {
 		t.Fatal("past time accepted")
 	}
 	in2.Schedule.Once = time.Now().Add(time.Hour).Format("2006-01-02T15:04")
+	// a channel that is switched off is not available; switched on — not linked yet
+	reg := &channels.Registry{Pool: pool, Box: box}
+	on, off := true, false
+	if _, err := reg.Update(ctx, "telegram", channels.Patch{Enabled: &off}, nil); err != nil {
+		t.Fatal(err)
+	}
+	s.Deliverable = (&engine.Engine{Pool: pool, Users: repo(), Registry: reg, Keys: &channels.Keys{Pool: pool, Pepper: key}}).Deliverable
+	if _, err := s.Create(ctx, uid, in2, "telegram", nil); err == nil || !strings.Contains(err.Error(), "not available") {
+		t.Fatalf("telegram off: %v", err)
+	}
+	if _, err := reg.Update(ctx, "telegram", channels.Patch{Enabled: &on, AllUsers: &on}, nil); err != nil {
+		t.Fatal(err)
+	}
+	s.Deliverable = (&engine.Engine{Pool: pool, Users: repo(), Registry: reg, Keys: &channels.Keys{Pool: pool, Pepper: key}}).Deliverable
 	if _, err := s.Create(ctx, uid, in2, "telegram", nil); err == nil || !strings.Contains(err.Error(), "not linked") {
 		t.Fatalf("telegram unlinked: %v", err)
 	}
@@ -419,6 +438,9 @@ func TestClientsAndRuns(t *testing.T) {
 		Mode: &pmode, PersonalAuth: &catalog.PersonalAuth{Kind: "delegation", Audience: "hammurapi"}})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if di.ReadOnly { // the product applies the rights of the user: its tools that change data are allowed by default
+		t.Fatal("a delegation item is read-only by default")
 	}
 	if di, err = cat.Check(ctx, di.ID, "admin@x.org"); err != nil || di.Status == nil || *di.Status != "ok" {
 		t.Fatalf("%+v %v", di, err)

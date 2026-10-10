@@ -43,16 +43,17 @@ type Inbound struct {
 
 // API serves the site's (and the delegated clients') conversation endpoints.
 type API struct {
-	Store   *Store
-	Pool    *pgxpool.Pool
-	Users   *users.Repo
-	Models  *models.Service
-	Links   *channels.Links
-	Bus     kafka.Publisher
-	Events  events.Publisher
-	S3      storage.Storage
-	Whisper whisper.Transcriber
-	MaxFile int64
+	Store  *Store
+	Pool   *pgxpool.Pool
+	Users  *users.Repo
+	Models *models.Service
+	// Channels lists the channels of a user for GET /me.
+	Channels func(ctx context.Context, uid uuid.UUID) ([]channels.MyChannel, error)
+	Bus      kafka.Publisher
+	Events   events.Publisher
+	S3       storage.Storage
+	Whisper  whisper.Transcriber
+	MaxFile  int64
 }
 
 // ─── attachments ────────────────────────────────────────────────────
@@ -167,9 +168,10 @@ func (a *API) enqueue(ctx context.Context, in Inbound) error {
 	return nil
 }
 
-// Receive implements channels.Inbox: messenger messages go to the main conversation.
+// Receive implements channels.Inbox: messenger messages go to the main
+// conversation, letters to their topic (FTR.NAB.CMN-0002 R3).
 func (a *API) Receive(ctx context.Context, in channels.Inbound) error {
-	_, err := a.Post(ctx, in.UserID, nil, in.Text, in.Channel, nil, in.Attachments, nil)
+	_, err := a.Post(ctx, in.UserID, in.Conversation, in.Text, in.Channel, nil, in.Attachments, in.Context)
 	return err
 }
 
@@ -194,15 +196,15 @@ func (a *API) Retry(ctx context.Context, p *domain.Principal, id uuid.UUID) erro
 
 // Me is GET /me.
 type Me struct {
-	ID       uuid.UUID          `json:"id"`
-	Email    string             `json:"email"`
-	Name     string             `json:"name"`
-	Avatar   string             `json:"avatarUrl,omitempty"`
-	IsAdmin  bool               `json:"isAdmin"`
-	Language string             `json:"language"`
-	Theme    string             `json:"theme"`
-	Timezone string             `json:"timezone"`
-	Channels []channels.Channel `json:"channels"`
+	ID       uuid.UUID            `json:"id"`
+	Email    string               `json:"email"`
+	Name     string               `json:"name"`
+	Avatar   string               `json:"avatarUrl,omitempty"`
+	IsAdmin  bool                 `json:"isAdmin"`
+	Language string               `json:"language"`
+	Theme    string               `json:"theme"`
+	Timezone string               `json:"timezone"`
+	Channels []channels.MyChannel `json:"channels"`
 }
 
 // AgentView is GET /agent.
@@ -296,9 +298,11 @@ func (a *API) Routes(r chi.Router, site bool) {
 			if err != nil || u == nil {
 				return apperr.ErrNoSession
 			}
-			chs, err := a.Links.Of(r.Context(), p.UserID)
-			if err != nil {
-				return err
+			chs := []channels.MyChannel{}
+			if a.Channels != nil {
+				if chs, err = a.Channels(r.Context(), p.UserID); err != nil {
+					return err
+				}
 			}
 			httpx.JSON(w, 200, Me{ID: u.ID, Email: u.Email, Name: u.Name, Avatar: u.AvatarURL, IsAdmin: u.IsAdmin, Language: u.Language,
 				Theme: u.Theme, Timezone: u.Timezone, Channels: chs})
@@ -426,6 +430,22 @@ func (a *API) Routes(r chi.Router, site bool) {
 		}
 		a.Events.Publish(r.Context(), events.Event{Type: events.ConversationUpdated, UserID: &p.UserID, Data: c})
 		httpx.JSON(w, 200, c)
+		return nil
+	}))
+	r.Post("/conversations/{id}/read", h(func(w http.ResponseWriter, r *http.Request) error {
+		p, err := httpx.MustPrincipal(r)
+		if err != nil {
+			return err
+		}
+		id, err := convID(r, a, p)
+		if err != nil {
+			return err
+		}
+		if err := a.Store.Read(r.Context(), p.UserID, id); err != nil {
+			return err
+		}
+		a.Events.Publish(r.Context(), events.Event{Type: "conversation.unread", UserID: &p.UserID, Data: map[string]any{"conversationId": id, "unreadCount": 0}})
+		httpx.NoContent(w)
 		return nil
 	}))
 	r.Get("/conversations/{id}/messages", h(func(w http.ResponseWriter, r *http.Request) error {

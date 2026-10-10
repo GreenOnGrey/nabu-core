@@ -19,6 +19,7 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/channels"
 	"github.com/GreenOnGrey/nabu-core/internal/chat"
 	"github.com/GreenOnGrey/nabu-core/internal/domain"
+	"github.com/GreenOnGrey/nabu-core/internal/groups"
 	"github.com/GreenOnGrey/nabu-core/internal/ledger"
 	"github.com/GreenOnGrey/nabu-core/internal/memory"
 	"github.com/GreenOnGrey/nabu-core/internal/models"
@@ -75,8 +76,13 @@ type Engine struct {
 	S3        storage.Storage
 	Events    events.Publisher
 	Bus       kafka.Publisher
-	Links     *channels.Links
 	Adapters  map[string]channels.Adapter
+	// FTR.NAB.CMN-0002: availability of channels, Telegram bindings, group
+	// agents and the mail channel.
+	Registry *channels.Registry
+	Keys     *channels.Keys
+	Groups   *groups.Service
+	Mail     Mailer
 	// Connected reports whether an external workspace is connected to the relay.
 	Connected func(ctx context.Context, workspaceID string) bool
 
@@ -103,11 +109,16 @@ type built struct {
 	persona Persona
 	secrets []string
 	model   agent.ModelSpec
+	// group is set in the session of a group agent.
+	group *groups.Agent
 }
 
 // personalRequest builds the session of a personal agent: the model, the
 // built-in MCP, the connected catalog items, skills and the personal space.
 func (e *Engine) personalRequest(ctx context.Context, u *users.User, conv uuid.UUID, taskID *uuid.UUID, label string) (*built, error) {
+	if ga := e.group(ctx, u); ga != nil {
+		return e.groupRequest(ctx, u, ga, conv, label)
+	}
 	ag, err := e.Users.GetAgent(ctx, u.ID)
 	if err != nil {
 		return nil, err
@@ -419,17 +430,23 @@ func (e *Engine) HandleInbound(ctx context.Context, _, value []byte) error {
 		return err
 	}
 	e.publish(ctx, events.MessageCreated, u.ID, asst)
-	if u.Status == "blocked" {
+	if u.Status == "blocked" || u.Status == "archived" {
 		e.fail(ctx, u, asst.ID, in.Channel, "user_blocked", "Access to the agent is closed for this user.", nil)
 		return nil
 	}
+	started := time.Now()
+	mctx := parseContext(in.Context)
+	var draft *drafter
 	if domain.Messenger(in.Channel) {
 		if ad := e.Adapters[in.Channel]; ad != nil {
-			if chatID, ok := e.Links.ChatOf(ctx, u.ID, in.Channel); ok {
+			if chatID, ok := e.chatOf(ctx, u, in.Channel); ok {
+				if in.Channel == domain.ChannelTelegram && u.CreatedVia != "group" {
+					draft = newDrafter(ad, chatID) // R14: private chats show the answer as it is written
+				}
 				tctx, stop := context.WithCancel(ctx)
 				defer stop()
 				go func() {
-					t := time.NewTicker(5 * time.Second)
+					t := time.NewTicker(4 * time.Second) // tech §7: typing every 4 seconds until the answer
 					defer t.Stop()
 					for {
 						ad.Typing(tctx, chatID)
@@ -444,7 +461,11 @@ func (e *Engine) HandleInbound(ctx context.Context, _, value []byte) error {
 		}
 	}
 	text, images := e.promptOf(ctx, u, userMsg, in)
-	res := e.personalTurn(ctx, u, in.ConversationID, asst.ID, in.Channel, in.ClientID, text, images)
+	var author *uuid.UUID
+	if mctx.Group != nil && mctx.Group.AuthorID != uuid.Nil {
+		author = &mctx.Group.AuthorID
+	}
+	res := e.personalTurn(ctx, u, in.ConversationID, asst.ID, in.Channel, in.ClientID, text, images, author, draft)
 	status := "done"
 	if res.errClass != "" {
 		status = "failed"
@@ -462,14 +483,32 @@ func (e *Engine) HandleInbound(ctx context.Context, _, value []byte) error {
 		metrics.Turns.WithLabelValues(channelLabel(in.Channel), "ok").Inc()
 	}
 	e.publish(ctx, events.MessageDone, u.ID, final)
-	if domain.Messenger(in.Channel) {
+	switch {
+	case e.Chat.Source(ctx, in.ConversationID) == "email":
+		// R8: a letter in the thread when the bot was the only recipient,
+		// otherwise the topic with an unread mark; a failure stays in the topic.
+		if e.Mail != nil && res.errClass == "" {
+			if err := e.Mail.Reply(context.WithoutCancel(ctx), u.ID, in.ConversationID, res.text, started); err != nil {
+				slog.WarnContext(ctx, "mail reply", "conversation", in.ConversationID, "err", err)
+			}
+		}
+	case domain.Messenger(in.Channel):
 		out := res.text
 		if res.errClass != "" {
 			out = errorText(u.Language, res.errClass)
+		} else if ga := e.group(ctx, u); ga != nil {
+			out = "**" + ga.Name + " " + groupMark(u.Language) + "**\n\n" + out // design §5 #4: the group agent signs its answers
 		}
 		e.deliver(ctx, u.ID, in.Channel, out)
 	}
 	return nil
+}
+
+func groupMark(lang string) string {
+	if lang == "ru" {
+		return "(групповой)"
+	}
+	return "(group)"
 }
 
 func channelLabel(ch string) string {
@@ -502,7 +541,8 @@ func (e *Engine) promptOf(ctx context.Context, u *users.User, m *chat.Message, i
 	var b strings.Builder
 	b.WriteString(channelRules(in.Channel, time.Now(), u.Timezone))
 	b.WriteByte('\n')
-	if len(in.Context) > 0 {
+	mc := parseContext(in.Context)
+	if len(in.Context) > 0 && mc.Email == nil && mc.Group == nil && mc.Confirmation == nil {
 		b.WriteString("[Context of the user's current screen in " + strings.TrimPrefix(in.Channel, "client:") + ": " + clip(string(in.Context), 8000) + "]\n")
 	}
 	var images []agent.Image
@@ -536,7 +576,14 @@ func (e *Engine) promptOf(ctx context.Context, u *users.User, m *chat.Message, i
 		}
 		fmt.Fprintf(&b, "[The user attached %s (%s, %d bytes).]\n", a.FileName, a.MimeType, a.Size)
 	}
-	b.WriteString(m.Text)
+	switch {
+	case mc.Email != nil:
+		b.WriteString(emailPrompt(mc, m.Text))
+	case mc.Group != nil:
+		b.WriteString(groupPrompt(mc, m.Text))
+	default:
+		b.WriteString(m.Text)
+	}
 	return b.String(), images
 }
 
@@ -545,7 +592,8 @@ type turnResult struct {
 	steps                   []chat.ToolStep
 }
 
-func (e *Engine) personalTurn(ctx context.Context, u *users.User, conv, msgID uuid.UUID, ch string, clientID *uuid.UUID, text string, images []agent.Image) turnResult {
+func (e *Engine) personalTurn(ctx context.Context, u *users.User, conv, msgID uuid.UUID, ch string, clientID *uuid.UUID, text string, images []agent.Image,
+	author *uuid.UUID, draft *drafter) turnResult {
 	b, err := e.personalRequest(ctx, u, conv, nil, "conv "+conv.String()[:8])
 	if err != nil {
 		var class = "agent_not_configured"
@@ -566,6 +614,14 @@ func (e *Engine) personalTurn(ctx context.Context, u *users.User, conv, msgID uu
 		audit: ledger.Entry{AgentKind: "personal", Agent: b.persona.Agent.Name, UserID: &u.ID, ClientID: clientID, Channel: ch}}
 	connID, _ := uuid.Parse(b.model.ConnectionID)
 	col.usage = ledger.UsageRow{UserID: &u.ID, ClientID: clientID, Agent: "", Model: b.model.ModelID, ConnectionID: &connID}
+	if b.group != nil {
+		// GR-08: the cost and the audit of a group agent go to the group; the audit names the author
+		col.audit.Agent, col.audit.UserID, col.audit.GroupAgentID = b.group.Name+" (group)", author, &b.group.ID
+		col.usage = ledger.UsageRow{GroupAgentID: &b.group.ID, Agent: "group agent", Model: b.model.ModelID, ConnectionID: &connID}
+	}
+	if draft != nil {
+		col.onEvent = func(ev agent.Event) { draft.event(ctx, ev) }
+	}
 	var sess *convSession
 	for attempt := 0; attempt < 2; attempt++ {
 		sess, err = e.ensureSession(ctx, conv, b, attempt > 0)
@@ -666,11 +722,23 @@ func (e *Engine) HandleOutbound(ctx context.Context, _, value []byte) error {
 	if ad == nil {
 		return nil
 	}
-	chatID, ok := e.Links.ChatOf(ctx, o.UserID, o.Channel)
+	u, err := e.Users.Get(ctx, o.UserID)
+	if err != nil || u == nil {
+		return err
+	}
+	// arch §2.2: the availability is checked when the answer is delivered too
+	if u.CreatedVia != "group" && e.Registry != nil && !e.Registry.Open(ctx, o.UserID, o.Channel) {
+		metrics.ChannelOutbound.WithLabelValues(o.Channel, "unavailable").Inc()
+		return nil
+	}
+	chatID, ok := e.chatOf(ctx, u, o.Channel)
 	if !ok {
 		return nil
 	}
-	return ad.Send(ctx, chatID, o.Text)
+	if err := ad.Send(ctx, chatID, o.Text); err != nil {
+		slog.WarnContext(ctx, "channel delivery", "channel", o.Channel, "err", err)
+	}
+	return nil
 }
 
 var errorTexts = map[string]map[string]string{

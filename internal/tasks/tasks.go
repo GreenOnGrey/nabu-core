@@ -50,12 +50,15 @@ type LastRun struct {
 
 // Run is one run of a task.
 type Run struct {
-	ID           uuid.UUID  `json:"id"`
-	StartedAt    time.Time  `json:"startedAt"`
-	FinishedAt   *time.Time `json:"finishedAt"`
-	Status       string     `json:"status"`
-	Summary      *string    `json:"summary"`
-	MessageID    *uuid.UUID `json:"messageId"`
+	ID         uuid.UUID  `json:"id"`
+	StartedAt  time.Time  `json:"startedAt"`
+	FinishedAt *time.Time `json:"finishedAt"`
+	Status     string     `json:"status"`
+	Summary    *string    `json:"summary"`
+	MessageID  *uuid.UUID `json:"messageId"`
+	// DeliveryNote: channel_unavailable — the channel was not available, the
+	// result went to the web (R5, CH-07).
+	DeliveryNote *string    `json:"deliveryNote"`
 	ErrorClass   *string    `json:"errorClass"`
 	ErrorText    *string    `json:"errorText"`
 	ScheduledFor *time.Time `json:"scheduledFor"`
@@ -80,9 +83,11 @@ type Service struct {
 	MaxFailures int
 	// DefaultTimezone is used when the profile has none.
 	DefaultTimezone string
-	// VKWS reports whether the VK WorkSpace channel is enabled.
-	VKWS bool
-	now  func() time.Time
+	// Deliverable reports whether results can be delivered to the channel of
+	// the user now (FTR.NAB.CMN-0002 R5): the channel is available, Telegram is
+	// bound, the user wrote to the VK Teams bot; the reason explains a refusal.
+	Deliverable func(ctx context.Context, uid uuid.UUID, channel string) (bool, string)
+	now         func() time.Time
 }
 
 func (s *Service) clock() time.Time {
@@ -170,7 +175,7 @@ func (s *Service) Runs(ctx context.Context, uid, id uuid.UUID, page httpx.Page) 
 		cond = ` AND (started_at, id) < ($3, $4)`
 		args = append(args, page.Cursor.T, page.Cursor.ID)
 	}
-	rows, err := s.Pool.Query(ctx, `SELECT id, started_at, finished_at, status, summary, message_id, error_class, error_text, scheduled_for
+	rows, err := s.Pool.Query(ctx, `SELECT id, started_at, finished_at, status, summary, message_id, error_class, error_text, scheduled_for, delivery_note
 		FROM task_runs WHERE task_id = $1`+cond+` ORDER BY started_at DESC, id DESC LIMIT $2`, args...)
 	if err != nil {
 		return httpx.List[Run]{}, err
@@ -179,7 +184,7 @@ func (s *Service) Runs(ctx context.Context, uid, id uuid.UUID, page httpx.Page) 
 	var out []Run
 	for rows.Next() {
 		var r Run
-		if err := rows.Scan(&r.ID, &r.StartedAt, &r.FinishedAt, &r.Status, &r.Summary, &r.MessageID, &r.ErrorClass, &r.ErrorText, &r.ScheduledFor); err != nil {
+		if err := rows.Scan(&r.ID, &r.StartedAt, &r.FinishedAt, &r.Status, &r.Summary, &r.MessageID, &r.ErrorClass, &r.ErrorText, &r.ScheduledFor, &r.DeliveryNote); err != nil {
 			return httpx.List[Run]{}, err
 		}
 		out = append(out, r)
@@ -227,15 +232,20 @@ func (s *Service) Create(ctx context.Context, uid uuid.UUID, in CreateInput, def
 	if strings.HasPrefix(ch, "client:") || strings.HasPrefix(ch, "task:") || ch == "" {
 		ch = domain.ChannelWeb
 	}
-	if ch != domain.ChannelWeb && ch != domain.ChannelTelegram && (ch != domain.ChannelVKWS || !s.VKWS) {
-		return nil, fmt.Errorf("unknown channel %q: use web, telegram or vkws", ch)
+	ch = domain.ChannelOf(ch)
+	if in.Channel == "" && ch == domain.ChannelEmail {
+		ch = domain.ChannelWeb // R11: mail delivers only when the user asked for it
 	}
-	if domain.Messenger(ch) {
-		var n int
-		_ = s.Pool.QueryRow(ctx, `SELECT count(*) FROM channel_links WHERE user_id = $1 AND channel = $2`, uid, ch).Scan(&n)
-		if n == 0 {
-			return nil, fmt.Errorf("the %s channel is not linked; the user links it in Connections, or choose web", ch)
+	switch ch {
+	case domain.ChannelWeb:
+	case domain.ChannelTelegram, domain.ChannelVKTeams, domain.ChannelEmail:
+		if s.Deliverable != nil {
+			if ok, why := s.Deliverable(ctx, uid, ch); !ok {
+				return nil, fmt.Errorf("results cannot be delivered to %s: %s; choose web", ch, why)
+			}
 		}
+	default:
+		return nil, fmt.Errorf("unknown channel %q: use web, telegram, vkteams or email", ch)
 	}
 	now := s.clock()
 	var kind, cronExpr string
@@ -521,6 +531,12 @@ func (s *Service) Finish(ctx context.Context, runID uuid.UUID, ok bool, summary,
 	return nil
 }
 
+// NoteDelivery marks a run whose channel was not available: the result went
+// to the web and the run stays successful (R5).
+func (s *Service) NoteDelivery(ctx context.Context, runID uuid.UUID, note string) {
+	_, _ = s.Pool.Exec(ctx, `UPDATE task_runs SET delivery_note = $2 WHERE id = $1`, runID, note)
+}
+
 // PausedNow reports whether the task got paused by its latest failure, with the reason.
 func (s *Service) PausedNow(ctx context.Context, taskID uuid.UUID) (bool, string) {
 	var st string
@@ -625,7 +641,7 @@ func (s *Service) Tools() []mcp.Tool {
 				"instruction": map[string]any{"type": "string", "description": "What to do on each run, as an instruction to yourself"},
 				"schedule": map[string]any{"type": "object", "description": `Either {"once": "2026-10-09T11:30"} (local time) or {"cron": "0 10 * * 1"} (5 fields; at least 15 minutes between runs)`,
 					"properties": map[string]any{"once": map[string]any{"type": "string"}, "cron": map[string]any{"type": "string"}}},
-				"channel": map[string]any{"type": "string", "enum": []string{"web", "telegram", "vkws"}, "description": "Where to deliver the result; default — the channel of the current message"},
+				"channel": map[string]any{"type": "string", "enum": []string{"web", "telegram", "vkteams", "email"}, "description": "Where to deliver the result; default — the channel of the current message. Use email only when the user explicitly asked to send results by mail; a task created from a letter delivers to web by default — tell the user so"},
 			}, "title", "instruction", "schedule"),
 			Handler: func(ctx context.Context, g mcp.Grant, args json.RawMessage) (string, error) {
 				var in CreateInput

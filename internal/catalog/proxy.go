@@ -3,6 +3,7 @@ package catalog
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -15,20 +16,28 @@ import (
 
 	"github.com/GreenOnGrey/nabu-core/internal/platform/httpx"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/jwt"
+	"github.com/GreenOnGrey/nabu-core/internal/platform/mcp"
 )
 
 // DelegationHeader is the header with the email Nabu acts for.
 const DelegationHeader = "Nabu-On-Behalf-Of"
 
-// UserEmail loads the email of a user (delegation to products).
-type UserEmail func(r *http.Request, uid uuid.UUID) (email string, allowed bool)
+// UserEmail loads the email of a user (delegation to products); false — the
+// user may not use the agent (blocked, archived).
+type UserEmail func(ctx context.Context, uid uuid.UUID) (email string, allowed bool)
+
+// Hold keeps a call of a tool that changes data in a conversation whose
+// writes require confirmation (FTR.NAB.CMN-0002 R9, tech §6); held — the
+// answer to the agent.
+type Hold func(ctx context.Context, conv, uid uuid.UUID, item uuid.UUID, server, tool string, args json.RawMessage) (answer string, held bool)
 
 // ProxyRoutes mounts /internal/v1/mcp-proxy/{item}: the MCP servers of the
 // catalog as sessions see them. The proxy checks the session token, adds the
 // user's or the platform credentials and filters tools of read-only items.
-func (s *Service) ProxyRoutes(r chi.Router, userEmail UserEmail) {
+func (s *Service) ProxyRoutes(r chi.Router, userEmail UserEmail, hold Hold) {
+	s.userEmail = userEmail
 	r.HandleFunc("/internal/v1/mcp-proxy/{item}", func(w http.ResponseWriter, r *http.Request) {
-		s.proxy(w, r, userEmail)
+		s.proxy(w, r, hold)
 	})
 }
 
@@ -51,7 +60,80 @@ func rpcError(w http.ResponseWriter, status int, msg string) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": nil, "error": map[string]any{"code": -32001, "message": msg}})
 }
 
-func (s *Service) proxy(w http.ResponseWriter, r *http.Request, userEmail UserEmail) {
+type proxyErr struct {
+	status int
+	msg    string
+}
+
+// itemHeaders are the credentials of a call: platform ones, or the personal
+// access of the user (delegation, OAuth or a token).
+func (s *Service) itemHeaders(ctx context.Context, it *Item, uid uuid.UUID) (map[string]string, *proxyErr) {
+	var platEnc []byte
+	_ = s.Pool.QueryRow(ctx, `SELECT platform_auth_enc FROM catalog_items WHERE id = $1`, it.ID).Scan(&platEnc)
+	email := func() (string, bool) {
+		if s.userEmail == nil {
+			return "", false
+		}
+		return s.userEmail(ctx, uid)
+	}
+	switch {
+	case it.Mode != nil && *it.Mode == "platform":
+		h, err := s.platformHeaders(platEnc)
+		if err != nil {
+			return nil, &proxyErr{http.StatusBadGateway, "platform credentials unreadable"}
+		}
+		if uid != uuid.Nil {
+			if _, ok := email(); !ok {
+				return nil, &proxyErr{http.StatusForbidden, "user_blocked"}
+			}
+			if !s.connected(ctx, uid, it.ID) {
+				return nil, &proxyErr{http.StatusForbidden, "the item is not connected"}
+			}
+		}
+		return h, nil
+	case uid == uuid.Nil:
+		return nil, &proxyErr{http.StatusForbidden, "personal servers need a user"}
+	}
+	mail, ok := email()
+	if !ok {
+		return nil, &proxyErr{http.StatusForbidden, "user_blocked"}
+	}
+	if !s.connected(ctx, uid, it.ID) {
+		return nil, &proxyErr{http.StatusForbidden, "the access was revoked"} // CAT-03
+	}
+	pa := it.PersonalAuth
+	if pa.Kind == "delegation" {
+		return s.delegationHeaders(it, mail), nil
+	}
+	tok, err := s.userToken(ctx, uid, it)
+	if err != nil {
+		return nil, &proxyErr{http.StatusUnauthorized, "the personal access is missing or expired; connect the item again in Connections"}
+	}
+	h, prefix := pa.Header, pa.Prefix
+	if h == "" {
+		h, prefix = "Authorization", "Bearer "
+	}
+	return map[string]string{h: prefix + tok}, nil
+}
+
+// CallTool executes a confirmed call with the current credentials of the
+// user (tech §6: :approve).
+func (s *Service) CallTool(ctx context.Context, uid, itemID uuid.UUID, tool string, args json.RawMessage) (string, bool, error) {
+	it, err := s.Get(ctx, itemID)
+	if err != nil {
+		return "", true, err
+	}
+	if !it.Published || it.InDevelopment {
+		return "", true, ErrUnavailable()
+	}
+	headers, perr := s.itemHeaders(ctx, it, uid)
+	if perr != nil {
+		return perr.msg, true, nil
+	}
+	return mcp.CallTool(ctx, it.Source.URL, headers, tool, args)
+}
+
+func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 	itemID, err := uuid.Parse(chi.URLParam(r, "item"))
 	if err != nil {
 		http.NotFound(w, r)
@@ -67,57 +149,11 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, userEmail UserEm
 		rpcError(w, http.StatusConflict, "catalog_item_unavailable: the item was unpublished") // CAT-08
 		return
 	}
-	headers := map[string]string{}
-	var platEnc []byte
-	_ = s.Pool.QueryRow(r.Context(), `SELECT platform_auth_enc FROM catalog_items WHERE id = $1`, itemID).Scan(&platEnc)
 	uid, _ := uuid.Parse(c.User)
-	switch {
-	case it.Mode != nil && *it.Mode == "platform":
-		h, err := s.platformHeaders(platEnc)
-		if err != nil {
-			rpcError(w, http.StatusBadGateway, "platform credentials unreadable")
-			return
-		}
-		headers = h
-		if uid != uuid.Nil {
-			if _, ok := userEmail(r, uid); !ok {
-				rpcError(w, http.StatusForbidden, "user_blocked")
-				return
-			}
-			if !s.connected(r, uid, itemID) {
-				rpcError(w, http.StatusForbidden, "the item is not connected")
-				return
-			}
-		}
-	case uid == uuid.Nil:
-		rpcError(w, http.StatusForbidden, "personal servers need a user")
+	headers, perr := s.itemHeaders(r.Context(), it, uid)
+	if perr != nil {
+		rpcError(w, perr.status, perr.msg)
 		return
-	default:
-		email, ok := userEmail(r, uid)
-		if !ok {
-			rpcError(w, http.StatusForbidden, "user_blocked")
-			return
-		}
-		if !s.connected(r, uid, itemID) {
-			rpcError(w, http.StatusForbidden, "the access was revoked") // CAT-03
-			return
-		}
-		pa := it.PersonalAuth
-		switch pa.Kind {
-		case "delegation":
-			headers = s.delegationHeaders(it, email)
-		default:
-			tok, err := s.userToken(r.Context(), uid, it)
-			if err != nil {
-				rpcError(w, http.StatusUnauthorized, "the personal access is missing or expired; connect the item again in Connections")
-				return
-			}
-			h, prefix := pa.Header, pa.Prefix
-			if h == "" {
-				h, prefix = "Authorization", "Bearer "
-			}
-			headers[h] = prefix + tok
-		}
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
 	if err != nil {
@@ -131,6 +167,23 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, userEmail UserEm
 		} `json:"params"`
 	}
 	_ = json.Unmarshal(body, &call)
+	conv, _ := uuid.Parse(c.Conversation)
+	if hold != nil && conv != uuid.Nil && uid != uuid.Nil && call.Method == "tools/call" && !s.readOnlyTool(it, call.Params.Name) {
+		// R9: in a mail topic a call that changes data waits for the user (ML-17, ML-20)
+		var p struct {
+			ID     json.RawMessage `json:"id"`
+			Params struct {
+				Arguments json.RawMessage `json:"arguments"`
+			} `json:"params"`
+		}
+		_ = json.Unmarshal(body, &p)
+		if answer, held := hold(r.Context(), conv, uid, it.ID, it.Name, call.Params.Name, p.Params.Arguments); held {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": p.ID, "result": map[string]any{
+				"isError": false, "content": []map[string]string{{"type": "text", "text": answer}}}})
+			return
+		}
+	}
 	if it.ReadOnly && call.Method == "tools/call" && !s.readOnlyTool(it, call.Params.Name) {
 		var req struct {
 			ID json.RawMessage `json:"id"`
@@ -200,9 +253,9 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, userEmail UserEm
 	_, _ = w.Write(filterTools(raw))
 }
 
-func (s *Service) connected(r *http.Request, uid, item uuid.UUID) bool {
+func (s *Service) connected(ctx context.Context, uid, item uuid.UUID) bool {
 	var n int
-	_ = s.Pool.QueryRow(r.Context(), `SELECT count(*) FROM user_connections WHERE user_id = $1 AND item_id = $2`, uid, item).Scan(&n)
+	_ = s.Pool.QueryRow(ctx, `SELECT count(*) FROM user_connections WHERE user_id = $1 AND item_id = $2`, uid, item).Scan(&n)
 	return n > 0
 }
 
