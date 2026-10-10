@@ -28,6 +28,7 @@ import (
 
 	"github.com/GreenOnGrey/nabu-core/internal/accounts"
 	"github.com/GreenOnGrey/nabu-core/internal/admin"
+	"github.com/GreenOnGrey/nabu-core/internal/agentpods"
 	"github.com/GreenOnGrey/nabu-core/internal/apperr"
 	"github.com/GreenOnGrey/nabu-core/internal/auth"
 	"github.com/GreenOnGrey/nabu-core/internal/catalog"
@@ -514,6 +515,10 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 		c.mail.LogRoute(r)
 		c.accounts.AdminRoutes(r)
 		c.groups.AdminRoutes(r, allowedModel)
+		(&agentpods.Admin{Pool: c.pool, Local: cfg.AgentExecutor != "k8s", Audit: func(ctx context.Context, admin, owner uuid.UUID, title string) {
+			args, _ := json.Marshal(map[string]any{"owner": owner, "title": title})
+			c.ledger.Audit(ctx, ledger.Entry{AgentKind: "personal", Agent: "nabu", UserID: &admin, Channel: "admin", Tool: "agent_pod.stop", Result: "ok"}, string(args), nil)
+		}}).AdminRoutes(r)
 	})
 	c.services.EventsRoute(r, hub, func(r *http.Request) (uuid.UUID, bool) {
 		cl, err := c.signer.Verify(httpx.Bearer(r), jwt.AudClient)
@@ -611,6 +616,13 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 	}
 	c.accounts.Sandboxes = sandboxStopper{sandboxes}
 	c.accounts.CloseSessions = eng.CloseSessions
+	// FTR.NAB.CMN-0004: conversations and tasks run in the pod of their owner.
+	pods := &agentpods.Manager{Cfg: podsConfig(cfg), Pool: c.pool, Signer: c.signer, Bus: c.producer, Events: c.events, Shared: c.operator,
+		Expire: eng.QueueExpired, Notify: eng.QueueNotify, Waiting: eng.QueueTyping}
+	if !pods.Cfg.Local {
+		pods.Kube = k8s.NewInCluster()
+	}
+	eng.Pods = pods
 	vkPoller := &channels.VKPoller{Bot: c.vk, Pool: c.pool, Registry: c.registry, Users: c.users, Inbox: c.chatAPI, Groups: c.groups,
 		Attachments: c.chatAPI.Attachments(), MaxFile: cfg.UploadMaxBytes,
 		ByEmail: func(ctx context.Context, addr string) (uuid.UUID, bool) {
@@ -639,6 +651,7 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 		return kafka.ConsumeParallel(gctx, cfg.KafkaBrokers, "nabu-worker", kafka.TopicRuns, 2, eng.HandleRun)
 	})
 	g.Go(func() error { c.tasks.Run(gctx); return nil })
+	g.Go(func() error { pods.Run(gctx); return nil }) // one manager of agent pods per instance (advisory lock)
 	if sandboxes != nil {
 		g.Go(func() error { sandboxes.Run(gctx); return nil })
 	}
@@ -793,4 +806,13 @@ func RunCleaner(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("mail log: %w", err)
 	}
 	return (&ledger.Ledger{Pool: pool}).Partitions(ctx, cfg.AuditRetention)
+}
+
+func podsConfig(cfg *config.Config) agentpods.Config {
+	return agentpods.Config{Local: cfg.AgentExecutor != "k8s", Namespace: cfg.AgentNamespace, Image: cfg.AgentImage,
+		CPURequest: cfg.AgentPodCPURequest, CPU: cfg.AgentPodCPU, MemoryRequest: cfg.AgentPodMemRequest, Memory: cfg.AgentPodMemory,
+		Work: cfg.AgentPodWork, MaxSessions: cfg.AgentPodMaxSessions, SessionIdle: cfg.AgentIdleTimeout,
+		IdleTimeout: cfg.AgentPodIdleTimeout, MinIdle: cfg.AgentPodMinIdle, PodsMax: cfg.AgentPodsMax, StartParallel: cfg.AgentStartParallel,
+		StartTimeout: cfg.AgentStartTimeout, ScheduleTimeout: cfg.AgentScheduleTimeout, QueueTimeout: cfg.AgentQueueTimeout,
+		TurnTimeout: max(cfg.TurnTimeout, cfg.TaskRunTimeout), WarmWindow: cfg.AgentWarmWindow, WarmShare: cfg.AgentWarmShare, WarmMax: cfg.AgentWarmMax}
 }

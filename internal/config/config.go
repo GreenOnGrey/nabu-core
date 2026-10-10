@@ -76,6 +76,27 @@ type Config struct {
 	TurnTimeout       time.Duration
 	InboundWorkers    int
 
+	// FTR.NAB.CMN-0004 tech §7.1: the pods of agents.
+	AgentExecutor        string // k8s | local
+	AgentNamespace       string
+	AgentImage           string
+	AgentPodCPURequest   string
+	AgentPodCPU          string
+	AgentPodMemRequest   string
+	AgentPodMemory       string
+	AgentPodWork         int64
+	AgentPodMaxSessions  int
+	AgentPodIdleTimeout  time.Duration
+	AgentPodMinIdle      time.Duration
+	AgentPodsMax         int
+	AgentStartParallel   int
+	AgentStartTimeout    time.Duration
+	AgentScheduleTimeout time.Duration
+	AgentQueueTimeout    time.Duration
+	AgentWarmWindow      time.Duration
+	AgentWarmShare       float64
+	AgentWarmMax         int
+
 	SandboxExecutor    string // k8s | none
 	SandboxNamespace   string
 	SandboxImage       string
@@ -150,6 +171,19 @@ func (p *parser) int(k string, def int) int {
 		p.errs = append(p.errs, fmt.Errorf("%s: %w", k, err))
 	}
 	return n
+}
+
+func (p *parser) float(k string, def float64) float64 {
+	v := os.Getenv(k)
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		p.errs = append(p.errs, fmt.Errorf("%s: %w", k, err))
+		return def
+	}
+	return f
 }
 
 func (p *parser) bool(k string, def bool) bool {
@@ -238,6 +272,17 @@ func Load() (*Config, error) {
 		AgentIdleTimeout: p.dur("AGENT_IDLE_TIMEOUT", "15m"), TurnTimeout: p.dur("TURN_TIMEOUT", "30m"),
 		InboundWorkers: p.int("INBOUND_WORKERS", 4),
 
+		AgentExecutor: env("AGENT_EXECUTOR", "local"), AgentNamespace: env("AGENT_NAMESPACE", "nabu-agents"),
+		AgentImage:         os.Getenv("AGENT_IMAGE"),
+		AgentPodCPURequest: env("AGENT_POD_CPU_REQUEST", "100m"), AgentPodCPU: env("AGENT_POD_CPU", "1"),
+		AgentPodMemRequest: env("AGENT_POD_MEMORY_REQUEST", "256Mi"), AgentPodMemory: env("AGENT_POD_MEMORY", "1Gi"),
+		AgentPodWork: p.bytes("AGENT_POD_WORK", "1GB"), AgentPodMaxSessions: p.int("AGENT_POD_MAX_SESSIONS", 8),
+		AgentPodIdleTimeout: p.dur("AGENT_POD_IDLE_TIMEOUT", "15m"), AgentPodMinIdle: p.dur("AGENT_POD_MIN_IDLE", "60s"),
+		AgentPodsMax: p.int("AGENT_PODS_MAX", 0), AgentStartParallel: p.int("AGENT_START_PARALLEL", 10),
+		AgentStartTimeout: p.dur("AGENT_START_TIMEOUT", "60s"), AgentScheduleTimeout: p.dur("AGENT_SCHEDULE_TIMEOUT", "15s"),
+		AgentQueueTimeout: p.dur("AGENT_QUEUE_TIMEOUT", "10m"), AgentWarmWindow: p.dur("AGENT_WARM_WINDOW", "3h"),
+		AgentWarmShare: p.float("AGENT_WARM_SHARE", 0.3), AgentWarmMax: p.int("AGENT_WARM_MAX", 0),
+
 		SandboxExecutor: env("SANDBOX_EXECUTOR", "none"), SandboxNamespace: env("SANDBOX_NAMESPACE", "nabu-sandboxes"),
 		SandboxImage: os.Getenv("SANDBOX_IMAGE"), SandboxIdleTimeout: p.dur("SANDBOX_IDLE_TIMEOUT", "30m"),
 		SandboxCPU: env("SANDBOX_CPU", "1"), SandboxMemory: env("SANDBOX_MEMORY", "1Gi"),
@@ -307,6 +352,19 @@ func (c *Config) Validate(mode string) error {
 	}
 	if mode == "worker" {
 		need("AGENT_SERVICE_TOKEN", c.AgentServiceToken)
+		switch c.AgentExecutor {
+		case "k8s":
+			need("AGENT_IMAGE", c.AgentImage)
+		case "local":
+		default:
+			errs = append(errs, fmt.Errorf("AGENT_EXECUTOR must be k8s or local"))
+		}
+		if c.AgentWarmShare < 0 || c.AgentWarmShare > 1 {
+			errs = append(errs, fmt.Errorf("AGENT_WARM_SHARE must be between 0 and 1"))
+		}
+		if c.AgentPodMinIdle >= c.AgentPodIdleTimeout {
+			errs = append(errs, fmt.Errorf("AGENT_POD_MIN_IDLE must be less than AGENT_POD_IDLE_TIMEOUT"))
+		}
 		if c.SandboxExecutor == "k8s" {
 			need("SANDBOX_IMAGE", c.SandboxImage)
 		} else if c.SandboxExecutor != "none" {

@@ -126,3 +126,17 @@ func ExtractTarGz(r io.Reader, dst string, maxBytes int64, maxFiles int) error {
 		}
 	}
 }
+
+// known lists the hashes of the snapshots the cache holds.
+func (c *skillCache) known() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	es, _ := os.ReadDir(c.dir)
+	out := make([]string, 0, len(es))
+	for _, e := range es {
+		if e.IsDir() && len(e.Name()) == 64 {
+			out = append(out, "sha256:"+e.Name())
+		}
+	}
+	return out
+}

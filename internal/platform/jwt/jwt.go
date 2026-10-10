@@ -28,6 +28,7 @@ const (
 	AudCall      = "nabu:call"      // the agent calling a workspace through the relay
 	AudSandbox   = "nabu:sandbox"   // a sandbox syncing its files through the api
 	AudMCP       = "nabu:mcp"       // the built-in MCP of a session
+	AudAgent     = "nabu:agent"     // the worker calling the agent pod of one owner
 )
 
 // Claims are the claims Nabu uses.
@@ -50,6 +51,8 @@ type Claims struct {
 	Run          string `json:"run,omitempty"`
 	Task         string `json:"task,omitempty"`
 	Email        string `json:"email,omitempty"`
+	// Generation is the start of the agent pod an agent token is for.
+	Generation int64 `json:"gen,omitempty"`
 }
 
 // HasScope reports whether s is in the scope.
@@ -84,6 +87,19 @@ func NewSigner(issuer string, secretsKey []byte) *Signer {
 
 // Issuer is the iss of the tokens (the public API URL).
 func (s *Signer) Issuer() string { return s.issuer }
+
+// PublicKey is the verification key in the form agent pods get in their
+// environment (FTR.NAB.CMN-0004 tech §3.1); it is not a secret.
+func (s *Signer) PublicKey() string { return b64(s.pub) }
+
+// ParsePublicKey reads the key of PublicKey.
+func ParsePublicKey(v string) (ed25519.PublicKey, error) {
+	b, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(v))
+	if err != nil || len(b) != ed25519.PublicKeySize {
+		return nil, errors.New("not an Ed25519 public key")
+	}
+	return ed25519.PublicKey(b), nil
+}
 
 // Issue signs claims; Issuer, IssuedAt, ExpiresAt and ID are filled in.
 func (s *Signer) Issue(c Claims, ttl time.Duration) string {

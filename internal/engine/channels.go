@@ -13,13 +13,18 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/GreenOnGrey/nabu-core/internal/agentpods"
 	"github.com/GreenOnGrey/nabu-core/internal/catalog"
 	"github.com/GreenOnGrey/nabu-core/internal/channels"
+	"github.com/GreenOnGrey/nabu-core/internal/chat"
 	"github.com/GreenOnGrey/nabu-core/internal/domain"
 	"github.com/GreenOnGrey/nabu-core/internal/groups"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/agent"
+	"github.com/GreenOnGrey/nabu-core/internal/platform/events"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/jwt"
+	"github.com/GreenOnGrey/nabu-core/internal/platform/metrics"
 	"github.com/GreenOnGrey/nabu-core/internal/space"
+	"github.com/GreenOnGrey/nabu-core/internal/tasks"
 	"github.com/GreenOnGrey/nabu-core/internal/users"
 )
 
@@ -287,14 +292,100 @@ func (e *Engine) CloseSessions(ctx context.Context, uid uuid.UUID) error {
 		}
 	}
 	rows.Close()
+	// The sessions live in the pod of the user; a snapshot is saved after
+	// every turn, so a pod that is gone already loses nothing.
+	op := e.Op
+	ok := op != nil
+	if e.Pods != nil {
+		op, ok = e.Pods.Peek(ctx, uid)
+	}
 	for _, s := range list {
-		if s.op != "" {
-			e.saveSnapshot(ctx, s.conv, s.op)
-			_ = e.Op.Close(ctx, s.op)
+		if s.op != "" && ok {
+			e.saveSnapshot(ctx, op, s.conv, s.op)
+			_ = op.Close(ctx, s.op)
 		}
 		if _, err := e.Pool.Exec(ctx, `UPDATE harness_sessions SET closed_at = now() WHERE id = $1`, s.id); err != nil {
 			return err
 		}
 	}
+	if e.Pods != nil {
+		if _, err := e.Pods.Stop(ctx, uid, agentpods.StopLifecycle); err != nil { // R15
+			return err
+		}
+	}
 	return nil
+}
+
+// ─── the queue of turns (FTR.NAB.CMN-0004 tech §4.6) ────────────────
+
+// QueueExpired answers a turn that did not get a pod within the queue
+// timeout (R13): the message of the user stays, the answer is an error the
+// user may retry; a run of a task fails with no_capacity.
+func (e *Engine) QueueExpired(ctx context.Context, it agentpods.Item) {
+	if it.Turn.Kind == agentpods.KindTask {
+		var m tasks.RunMessage
+		if json.Unmarshal(it.Turn.Value, &m) == nil {
+			_ = e.Tasks.Skip(ctx, m.RunID, "no_capacity", "no free capacity for the agent")
+		}
+		return
+	}
+	var in chat.Inbound
+	if json.Unmarshal(it.Turn.Value, &in) != nil {
+		return
+	}
+	u, err := e.Users.Get(ctx, in.UserID)
+	if err != nil || u == nil {
+		return
+	}
+	var asst *chat.Message
+	if it.Resume != uuid.Nil {
+		asst, _ = e.Chat.Message(ctx, in.UserID, it.Resume) // the answer a lost pod left unfinished
+	}
+	if asst == nil {
+		if asst, err = e.Chat.AddAssistant(ctx, in.ConversationID, in.Channel, &in.MessageID, "", in.RetryOf); err != nil {
+			return
+		}
+		e.publish(ctx, events.MessageCreated, u.ID, asst)
+	}
+	text := errorText("en", "agent_busy")
+	final, err := e.Chat.Finish(ctx, asst.ID, "", "failed", nil, "agent_busy", text)
+	if err != nil {
+		return
+	}
+	final.Retryable = true
+	metrics.Turns.WithLabelValues(channelLabel(in.Channel), "failed").Inc()
+	e.publish(ctx, events.ChatError, u.ID, map[string]any{"messageId": asst.ID, "conversationId": in.ConversationID,
+		"errorClass": "agent_busy", "retryable": true, "text": text})
+	e.publish(ctx, events.MessageDone, u.ID, final)
+	if domain.Messenger(in.Channel) {
+		e.deliver(ctx, u.ID, in.Channel, errorText(u.Language, "agent_busy"))
+	}
+}
+
+// QueueTyping keeps the typing mark in a messenger while the turn waits for
+// its pod (R12, Q-14).
+func (e *Engine) QueueTyping(ctx context.Context, it agentpods.Item) {
+	if !domain.Messenger(it.Turn.Channel) {
+		return
+	}
+	ad := e.Adapters[it.Turn.Channel]
+	u, err := e.Users.Get(ctx, it.Owner)
+	if ad == nil || err != nil || u == nil {
+		return
+	}
+	if chatID, ok := e.chatOf(ctx, u, it.Turn.Channel); ok {
+		ad.Typing(ctx, chatID)
+	}
+}
+
+// QueueNotify tells a messenger user once that the agent is busy (R12).
+func (e *Engine) QueueNotify(ctx context.Context, it agentpods.Item) {
+	if !domain.Messenger(it.Turn.Channel) {
+		return
+	}
+	u, err := e.Users.Get(ctx, it.Owner)
+	if err != nil || u == nil {
+		return
+	}
+	e.deliver(ctx, u.ID, it.Turn.Channel, errorText(u.Language, "queue_busy"))
 }

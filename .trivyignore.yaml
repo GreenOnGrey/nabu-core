@@ -2,20 +2,4 @@
 # Code scanning report still lists everything. Every entry has a reason and an
 # expiry: after expired_at the finding blocks the release again.
 
-vulnerabilities:
-  # Pi 1.0.0 (PI_VERSION, the latest release on 2026-10-03) bundles
-  # minimatch 10.2.6 with brace-expansion 5.0.9 inline (esbuild bundle and
-  # npm-shrinkwrap), so npm overrides cannot replace it. The patterns reach it
-  # only from the agent's own glob/find tool calls in a Pi session process; the
-  # worst case is a stack overflow of that one process, which the agent
-  # operator restarts. Remove when Pi ships brace-expansion >= 5.0.11.
-  - id: CVE-2026-102276
-    purls:
-      - pkg:npm/brace-expansion@5.0.9
-    expired_at: 2026-10-31
-    statement: "Bundled in Pi 1.0.0; DoS limited to one agent session process; waiting for a Pi release with brace-expansion >= 5.0.11"
-  - id: CVE-2026-102278
-    purls:
-      - pkg:npm/brace-expansion@5.0.9
-    expired_at: 2026-10-31
-    statement: "Bundled in Pi 1.0.0; DoS limited to one agent session process; waiting for a Pi release with brace-expansion >= 5.0.11"
+vulnerabilities: []

@@ -7,6 +7,7 @@ package operator
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -27,6 +28,7 @@ import (
 
 	"github.com/GreenOnGrey/nabu-core/internal/platform/agent"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/agent/pi"
+	"github.com/GreenOnGrey/nabu-core/internal/platform/jwt"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/metrics"
 )
 
@@ -40,7 +42,24 @@ type Config struct {
 	IdleTimeout  time.Duration
 	// MaxBody bounds request bodies (skills bundles, snapshots, images).
 	MaxBody int64
+	// Mode is all (one operator for everything: development), pool (service
+	// agents and checks) or owner (the pod of one owner): FTR.NAB.CMN-0004
+	// tech §3.1.
+	Mode string
+	// Owner, Generation and PublicKey identify the pod of an owner: it admits
+	// only tokens the worker signed for this owner and this start of the pod.
+	Owner      string
+	Generation int64
+	PublicKey  ed25519.PublicKey
+	Version    string
 }
+
+// Modes of the operator.
+const (
+	ModeAll   = "all"
+	ModePool  = "pool"
+	ModeOwner = "owner"
+)
 
 // Operator runs Pi sessions.
 type Operator struct {
@@ -67,7 +86,19 @@ type entry struct {
 
 // New creates the operator; WorkDir must be writable.
 func New(cfg Config) (*Operator, error) {
-	if cfg.ServiceToken == "" {
+	switch cfg.Mode {
+	case "":
+		cfg.Mode = ModeAll
+	case ModeAll, ModePool, ModeOwner:
+	default:
+		return nil, errors.New("AGENT_MODE must be all, pool or owner")
+	}
+	if cfg.Mode == ModeOwner {
+		if cfg.Owner == "" || cfg.Generation <= 0 || len(cfg.PublicKey) != ed25519.PublicKeySize {
+			return nil, errors.New("AGENT_OWNER, AGENT_GENERATION and AGENT_JWT_PUBLIC_KEY are required in the owner mode")
+		}
+		cfg.ServiceToken = "" // a pod of an owner has no shared secret
+	} else if cfg.ServiceToken == "" {
 		return nil, errors.New("AGENT_SERVICE_TOKEN is required")
 	}
 	if cfg.MaxSessions <= 0 {
@@ -110,8 +141,12 @@ func (o *Operator) Handler() http.Handler {
 			r.With(o.service).Patch("/", o.patch)
 			r.With(o.service).Get("/snapshot", o.snapshot)
 		})
-		r.With(o.service).Post("/checks/llm", o.checkLLM)
-		r.With(o.service).Post("/checks/mcp", o.checkMCP)
+		if o.cfg.Mode == ModeOwner {
+			r.With(o.service).Get("/status", o.status)
+		} else {
+			r.With(o.service).Post("/checks/llm", o.checkLLM)
+			r.With(o.service).Post("/checks/mcp", o.checkMCP)
+		}
 	})
 	return r
 }
@@ -128,7 +163,28 @@ func bearer(r *http.Request) string {
 
 func equal(a, b string) bool { return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1 }
 
+// podToken admits the token of this pod: signed by Nabu for this owner and
+// this generation (TOK-01). A token of another pod is rejected, so a request
+// sent to a reused address never runs here (TOK-02).
+func (o *Operator) podToken(tok string) bool {
+	c, err := jwt.VerifyWith(tok, o.cfg.PublicKey, "", jwt.AudAgent, time.Now())
+	return err == nil && c.Subject == o.cfg.Owner && c.Generation == o.cfg.Generation
+}
+
+func (o *Operator) owner(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !o.podToken(bearer(r)) {
+			writeErr(w, http.StatusUnauthorized, "unauthorized", "a valid token of this pod is required")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (o *Operator) service(next http.Handler) http.Handler {
+	if o.cfg.Mode == ModeOwner {
+		return o.owner(next)
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !equal(bearer(r), o.cfg.ServiceToken) {
 			writeErr(w, http.StatusUnauthorized, "unauthorized", "a valid service token is required")
@@ -141,6 +197,9 @@ func (o *Operator) service(next http.Handler) http.Handler {
 // sessionOrService admits the service token, or the token of the session in
 // the path — never a token of another session.
 func (o *Operator) sessionOrService(next http.Handler) http.Handler {
+	if o.cfg.Mode == ModeOwner {
+		return o.owner(next)
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tok := bearer(r)
 		if tok != "" && equal(tok, o.cfg.ServiceToken) {
@@ -225,6 +284,11 @@ func (o *Operator) open(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := validate(&req); err != nil {
 		writeErr(w, http.StatusUnprocessableEntity, "invalid_session", err.Error())
+		return
+	}
+	// POD-05: the pool runs service agents, a pod of an owner — conversations.
+	if (o.cfg.Mode == ModePool && req.Kind != agent.KindRun) || (o.cfg.Mode == ModeOwner && req.Kind != agent.KindChat) {
+		writeErr(w, http.StatusBadRequest, "invalid_request", "sessions of the kind "+string(req.Kind)+" do not run in the "+o.cfg.Mode+" mode")
 		return
 	}
 	skillsDir := ""
@@ -450,6 +514,25 @@ func (o *Operator) reap() {
 	for _, id := range idle {
 		o.drop(id, "idle")
 	}
+}
+
+// status reports the sessions of the pod to the pod manager.
+func (o *Operator) status(w http.ResponseWriter, _ *http.Request) {
+	st := agent.Status{Owner: o.cfg.Owner, Generation: o.cfg.Generation, Version: o.cfg.Version, Skills: o.skills.known()}
+	o.mu.Lock()
+	st.Sessions = len(o.sessions)
+	for _, e := range o.sessions {
+		e.mu.Lock()
+		if e.busy {
+			st.Busy++
+		}
+		if e.last.After(st.LastActivity) {
+			st.LastActivity = e.last
+		}
+		e.mu.Unlock()
+	}
+	o.mu.Unlock()
+	writeJSON(w, http.StatusOK, st)
 }
 
 // ─── checks ─────────────────────────────────────────────────────────

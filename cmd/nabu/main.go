@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"fmt"
 	"log/slog"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/config"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/agent/operator"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/agent/pi"
+	"github.com/GreenOnGrey/nabu-core/internal/platform/jwt"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/logging"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/telemetry"
 	"github.com/GreenOnGrey/nabu-core/internal/sandbox"
@@ -128,7 +130,21 @@ func runOperator(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("AGENT_IDLE_TIMEOUT: %w", err)
 	}
+	mode := envOr("AGENT_MODE", operator.ModeAll)
+	var gen int64
+	var pub ed25519.PublicKey
+	if mode == operator.ModeOwner {
+		// The pod of one owner (FTR.NAB.CMN-0004): the worker passes the owner,
+		// the generation and the public key — no secret in the environment.
+		if gen, err = strconv.ParseInt(os.Getenv("AGENT_GENERATION"), 10, 64); err != nil {
+			return fmt.Errorf("AGENT_GENERATION: %w", err)
+		}
+		if pub, err = jwt.ParsePublicKey(os.Getenv("AGENT_JWT_PUBLIC_KEY")); err != nil {
+			return fmt.Errorf("AGENT_JWT_PUBLIC_KEY: %w", err)
+		}
+	}
 	op, err := operator.New(operator.Config{
+		Mode: mode, Owner: os.Getenv("AGENT_OWNER"), Generation: gen, PublicKey: pub, Version: version,
 		Runtime: pi.Runtime{Command: strings.Fields(envOr("PI_BINARY", "/usr/local/bin/pi")), Options: pi.Options{
 			ExtensionDir: envOr("PI_EXTENSION_DIR", "/opt/nabu/pi-extensions/nabu-workspace"),
 			Path:         envOr("PATH", "/usr/local/bin:/usr/bin:/bin"), Lang: os.Getenv("LANG"),

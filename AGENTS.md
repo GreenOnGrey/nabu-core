@@ -36,6 +36,8 @@ migrations/           goose migrations, embedded
 internal/app/         wiring per mode (RunAPI, RunWorker, RunRelay, RunOperator, …)
 internal/config/      every environment variable
 internal/engine/      turns of personal agents, runs of service agents, persona, snapshots
+internal/agentpods/   a pod per owner for conversations and tasks (FTR.NAB.CMN-0004): leases for the engine, the manager
+                      loop (capacity, warm reserve, queue of turns), the Agents section of the administration
 internal/relay/       the WebSocket channel of workspaces (server and client; frames in proto.go)
 internal/workspace/   the workspace server (fs/*, grep, exec) served in sandboxes and runners
 internal/space, sandbox/   personal spaces: sandbox pods, S3 sync

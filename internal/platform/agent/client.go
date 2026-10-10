@@ -20,7 +20,10 @@ import (
 type Client struct {
 	BaseURL string
 	Token   string
-	HTTP    *http.Client
+	// TokenFunc issues a token per request (the short-lived tokens of an
+	// agent pod); it wins over Token.
+	TokenFunc func() string
+	HTTP      *http.Client
 }
 
 // BusyError is the operator's 503 agent_busy.
@@ -71,7 +74,11 @@ func (c *Client) do(ctx context.Context, method, path string, in any, timeout ti
 		cancel()
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.Token)
+	tok := c.Token
+	if c.TokenFunc != nil {
+		tok = c.TokenFunc()
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -101,6 +108,9 @@ func (c *Client) do(ctx context.Context, method, path string, in any, timeout ti
 		return nil, &BusyError{RetryAfter: ra}
 	case resp.StatusCode == http.StatusNotFound && e.Error == "session_not_found":
 		return nil, ErrSessionGone
+	case c.TokenFunc != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden):
+		// the address belongs to another pod now: the session went with its pod
+		return nil, fmt.Errorf("%w: the pod rejected the token", ErrSessionGone)
 	}
 	if e.Error == "" {
 		e.Error, e.Message = http.StatusText(resp.StatusCode), strings.TrimSpace(string(raw))
@@ -236,4 +246,25 @@ func (c *cancelOnClose) Close() error {
 	err := c.ReadCloser.Close()
 	c.cancel()
 	return err
+}
+
+// Status is the answer of GET /v1/status of an agent pod.
+type Status struct {
+	Owner        string    `json:"owner"`
+	Generation   int64     `json:"generation"`
+	Sessions     int       `json:"sessions"`
+	Busy         int       `json:"busy"`
+	LastActivity time.Time `json:"lastActivity"`
+	Skills       []string  `json:"skills"`
+	Version      string    `json:"version"`
+}
+
+// Status asks an agent pod for its sessions.
+func (c *Client) Status(ctx context.Context) (Status, error) {
+	var out Status
+	resp, err := c.do(ctx, http.MethodGet, "/v1/status", nil, 5*time.Second)
+	if err != nil {
+		return out, err
+	}
+	return out, decodeBody(resp, &out)
 }

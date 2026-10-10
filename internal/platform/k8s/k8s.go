@@ -100,11 +100,81 @@ type Pod struct {
 	Metadata struct {
 		Name              string            `json:"name"`
 		Labels            map[string]string `json:"labels"`
+		CreationTimestamp *time.Time        `json:"creationTimestamp"`
 		DeletionTimestamp *time.Time        `json:"deletionTimestamp"`
 	} `json:"metadata"`
+	Spec struct {
+		NodeName   string `json:"nodeName"`
+		Containers []struct {
+			Image string `json:"image"`
+		} `json:"containers"`
+	} `json:"spec"`
 	Status struct {
-		Phase string `json:"phase"`
+		Phase      string `json:"phase"`
+		PodIP      string `json:"podIP"`
+		Conditions []struct {
+			Type               string     `json:"type"`
+			Status             string     `json:"status"`
+			Reason             string     `json:"reason"`
+			LastTransitionTime *time.Time `json:"lastTransitionTime"`
+		} `json:"conditions"`
 	} `json:"status"`
+}
+
+// Ready reports the Ready condition of a running pod with an address.
+func (p *Pod) Ready() bool {
+	if p.Status.PodIP == "" || p.Metadata.DeletionTimestamp != nil {
+		return false
+	}
+	for _, c := range p.Status.Conditions {
+		if c.Type == "Ready" {
+			return c.Status == "True"
+		}
+	}
+	return false
+}
+
+// Unschedulable reports since when the cluster cannot place the pod.
+func (p *Pod) Unschedulable() (time.Time, bool) {
+	for _, c := range p.Status.Conditions {
+		if c.Type == "PodScheduled" && c.Status == "False" && c.Reason == "Unschedulable" {
+			if c.LastTransitionTime != nil {
+				return *c.LastTransitionTime, true
+			}
+			if p.Metadata.CreationTimestamp != nil {
+				return *p.Metadata.CreationTimestamp, true
+			}
+			return time.Time{}, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// Image is the image of the first container.
+func (p *Pod) Image() string {
+	if len(p.Spec.Containers) == 0 {
+		return ""
+	}
+	return p.Spec.Containers[0].Image
+}
+
+// Quotas returns the hard limits of the resource quotas of a namespace.
+func (c *Client) Quotas(ctx context.Context, ns string) ([]map[string]string, error) {
+	var l struct {
+		Items []struct {
+			Spec struct {
+				Hard map[string]string `json:"hard"`
+			} `json:"spec"`
+		} `json:"items"`
+	}
+	if err := c.Do(ctx, http.MethodGet, "/api/v1/namespaces/"+ns+"/resourcequotas", nil, &l); err != nil {
+		return nil, err
+	}
+	out := make([]map[string]string, 0, len(l.Items))
+	for _, it := range l.Items {
+		out = append(out, it.Spec.Hard)
+	}
+	return out, nil
 }
 
 // CreatePod creates a pod from a manifest.

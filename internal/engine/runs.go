@@ -11,12 +11,14 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/GreenOnGrey/nabu-core/internal/agentpods"
 	"github.com/GreenOnGrey/nabu-core/internal/chat"
 	"github.com/GreenOnGrey/nabu-core/internal/domain"
 	"github.com/GreenOnGrey/nabu-core/internal/ledger"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/agent"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/events"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/jwt"
+	"github.com/GreenOnGrey/nabu-core/internal/platform/kafka"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/metrics"
 	"github.com/GreenOnGrey/nabu-core/internal/services"
 	"github.com/GreenOnGrey/nabu-core/internal/tasks"
@@ -28,7 +30,7 @@ import (
 // the user's personal agent: the same memory, connections and space; only the
 // final message goes to the main conversation (TSK-07) and to the task's
 // channel (TSK-06).
-func (e *Engine) HandleTaskRun(ctx context.Context, _, value []byte) error {
+func (e *Engine) HandleTaskRun(ctx context.Context, key, value []byte) error {
 	var m tasks.RunMessage
 	if err := json.Unmarshal(value, &m); err != nil {
 		return nil
@@ -37,11 +39,14 @@ func (e *Engine) HandleTaskRun(ctx context.Context, _, value []byte) error {
 	if err != nil {
 		return err
 	}
+	ref := "t:" + m.RunID.String()
 	if ri == nil || ri.Status != "running" {
+		e.Pods.Drop(ctx, m.UserID, ref) // nobody will run it: the later turns of the owner go on
 		return nil
 	}
 	if e.Tasks.Cancelled(ctx, ri.TaskID) { // TSK-05: a cancelled task does not run
 		_, _ = e.Pool.Exec(ctx, `DELETE FROM task_runs WHERE id = $1`, ri.RunID)
+		e.Pods.Drop(ctx, ri.UserID, ref)
 		return nil
 	}
 	u, err := e.Users.Get(ctx, ri.UserID)
@@ -49,11 +54,28 @@ func (e *Engine) HandleTaskRun(ctx context.Context, _, value []byte) error {
 		return err
 	}
 	if u.Status == "blocked" || u.Status == "archived" { // TSK-10
+		e.Pods.Drop(ctx, u.ID, ref)
 		return e.Tasks.Finish(ctx, ri.RunID, false, "", "user_blocked", "the user is blocked", nil)
 	}
+	// Q-16: a run waits for the pod of its user like a message does.
+	turn := agentpods.Turn{Kind: agentpods.KindTask, Ref: ref, Topic: kafka.TopicTaskRun, Key: string(key), Value: value, Channel: ri.Channel}
+	lease, err := e.acquire(ctx, u.ID, turn)
+	if errors.Is(err, agentpods.ErrQueued) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer lease.Release(ctx)
 	ctx, cancel := context.WithTimeout(ctx, e.Cfg.TaskRunTimeout)
 	defer cancel()
-	text, class, errText := e.taskTurn(ctx, ri)
+	text, class, errText, lost := e.taskTurn(ctx, lease, ri)
+	if lost {
+		// R5: the pod went away before the run began — it waits for a new one.
+		if err := e.Pods.Requeue(ctx, lease, turn, uuid.Nil); err == nil {
+			return nil
+		}
+	}
 	main, err := e.Chat.Main(ctx, u.ID)
 	if err != nil {
 		return err
@@ -119,10 +141,13 @@ func (e *Engine) postTaskMessage(ctx context.Context, uid, conv uuid.UUID, ri *t
 	return final
 }
 
-func (e *Engine) taskTurn(ctx context.Context, ri *tasks.RunInfo) (string, string, string) {
+// taskTurn runs a task in the pod of its user; the last result reports a pod
+// that went away before the run produced anything.
+func (e *Engine) taskTurn(ctx context.Context, lease *agentpods.Lease, ri *tasks.RunInfo) (string, string, string, bool) {
+	op := lease.Operator()
 	user, err := e.Users.Get(ctx, ri.UserID)
 	if err != nil || user == nil {
-		return "", string(agent.ErrAgentCrashed), "the user is gone"
+		return "", string(agent.ErrAgentCrashed), "the user is gone", false
 	}
 	if e.Sandboxes != nil && e.Space.Enabled {
 		if err := e.Sandboxes.Ensure(ctx, user.ID); err != nil { // R37: the space comes up for the run
@@ -131,13 +156,13 @@ func (e *Engine) taskTurn(ctx context.Context, ri *tasks.RunInfo) (string, strin
 	}
 	b, err := e.personalRequest(ctx, user, uuid.Nil, &ri.TaskID, "task "+ri.TaskID.String()[:8])
 	if err != nil {
-		return "", "agent_not_configured", err.Error()
+		return "", "agent_not_configured", err.Error(), false
 	}
-	resp, err := e.open(ctx, b.req)
+	resp, err := e.open(ctx, op, b.req)
 	if err != nil {
-		return "", operatorClass(err), operatorText(err)
+		return "", operatorClass(err), operatorText(err), e.podLost(lease, err)
 	}
-	defer e.Op.Close(context.WithoutCancel(ctx), resp.SessionID)
+	defer op.Close(context.WithoutCancel(ctx), resp.SessionID)
 	col := &collector{e: e, ctx: ctx, uid: user.ID, secrets: b.secrets,
 		audit: ledger.Entry{AgentKind: "personal", Agent: b.persona.Agent.Name, UserID: &user.ID, Channel: "task:" + ri.TaskID.String()}}
 	connID, _ := uuid.Parse(b.model.ConnectionID)
@@ -146,22 +171,22 @@ func (e *Engine) taskTurn(ctx context.Context, ri *tasks.RunInfo) (string, strin
 		"[This is a run of the scheduled task «" + ri.Title + "», not a live chat: the user is not here to answer questions. " +
 		"Do the work with your tools and reply with the final result for the user only — it will be delivered to the main conversation" +
 		deliveryNote(ri.Channel) + ".]\n\nTask instruction: " + ri.Instruction
-	err = e.Op.Prompt(ctx, resp.SessionID, agent.PromptRequest{Text: prompt}, col.handle)
+	err = op.Prompt(ctx, resp.SessionID, agent.PromptRequest{Text: prompt}, col.handle)
 	if col.failure != nil {
-		return "", string(col.failure.ErrorClass), col.failure.Message
+		return "", string(col.failure.ErrorClass), col.failure.Message, false
 	}
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			_ = e.Op.Abort(context.WithoutCancel(ctx), resp.SessionID)
-			return "", string(agent.ErrUnavailable), "the run did not finish within the time limit"
+			_ = op.Abort(context.WithoutCancel(ctx), resp.SessionID)
+			return "", string(agent.ErrUnavailable), "the run did not finish within the time limit", false
 		}
-		return "", operatorClass(err), operatorText(err)
+		return "", operatorClass(err), operatorText(err), col.text.Len() == 0 && len(col.steps) == 0 && e.podLost(lease, err)
 	}
 	text := strings.TrimSpace(col.text.String())
 	if text == "" {
 		text = "(the run finished without a message)"
 	}
-	return text, "", ""
+	return text, "", "", false
 }
 
 func deliveryNote(ch string) string {
@@ -301,7 +326,7 @@ func (e *Engine) serviceTurn(ctx context.Context, runID uuid.UUID, ag *services.
 		req.Workspace = &agent.Workspace{ID: wsID, URL: e.Cfg.RelayInternalURL + "/internal/v1/workspaces/" + wsID, Token: call,
 			Note: "The working directory is a temporary sandbox of this run; its files are deleted after the run."}
 	}
-	resp, err := e.open(ctx, req)
+	resp, err := e.open(ctx, e.Op, req)
 	if err != nil {
 		return "", operatorClass(err), operatorText(err), total, false
 	}

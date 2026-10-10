@@ -86,6 +86,54 @@ var (
 	}, []string{"kind"})
 )
 
+// FTR.NAB.CMN-0004 arch §9: the pods of agents and the queue of turns.
+var (
+	AgentPods = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "nabu_agent_pods", Help: "Agent pods by state.",
+	}, []string{"state"})
+	AgentPodsCapacity = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "nabu_agent_pods_capacity", Help: "The ceiling of agent pods by its source; 0 without a ceiling.",
+	}, []string{"source"})
+	AgentPodsWarm = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "nabu_agent_pods_warm", Help: "Agent pods kept warm.",
+	})
+	AgentPodsWarmTarget = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "nabu_agent_pods_warm_target", Help: "The size of the warm reserve the manager aims at.",
+	})
+	AgentPodStart = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name: "nabu_agent_pod_start_seconds", Help: "From creating an agent pod to its readiness.",
+		Buckets: []float64{1, 2, 3, 5, 8, 12, 20, 30, 60},
+	})
+	AgentPodStops = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_agent_pod_stops_total", Help: "Stopped agent pods by reason.",
+	}, []string{"reason"})
+	AgentQueueLength = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "nabu_agent_queue_length", Help: "Turns waiting for an agent pod by reason.",
+	}, []string{"reason"})
+	AgentQueueEnqueued = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_agent_queue_enqueued_total", Help: "Turns put into the queue by reason.",
+	}, []string{"reason"})
+	AgentQueueWait = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name: "nabu_agent_queue_wait_seconds", Help: "The time a turn waited for its agent pod.",
+		Buckets: []float64{1, 2, 5, 10, 20, 30, 60, 120, 300, 600},
+	})
+	AgentQueueExpired = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "nabu_agent_queue_expired_total", Help: "Turns that did not get a pod within the queue timeout.",
+	})
+	AgentManagerLoop = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "nabu_agent_manager_last_loop_timestamp_seconds", Help: "The time of the last loop of the pod manager.",
+	})
+	TurnFirstToken = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "nabu_turn_first_token_seconds", Help: "From a message to the first piece of the answer by start (hot, warm, cold).",
+		Buckets: []float64{0.5, 1, 2, 3, 5, 8, 12, 20, 30, 45, 60, 120},
+	}, []string{"start"})
+)
+
+func init() {
+	Registry.MustRegister(AgentPods, AgentPodsCapacity, AgentPodsWarm, AgentPodsWarmTarget, AgentPodStart, AgentPodStops,
+		AgentQueueLength, AgentQueueEnqueued, AgentQueueWait, AgentQueueExpired, AgentManagerLoop, TurnFirstToken)
+}
+
 func init() {
 	Registry.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		HTTPRequests, HTTPDuration, KafkaLag, AgentSessions, AgentProcessStarts, LLMRequests, LLMErrors, LLMTokens, LLMCost,

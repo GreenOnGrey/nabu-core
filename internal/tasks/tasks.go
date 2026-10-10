@@ -531,6 +531,25 @@ func (s *Service) Finish(ctx context.Context, runID uuid.UUID, ok bool, summary,
 	return nil
 }
 
+// Skip closes a run that never started — there was no capacity for the agent
+// (FTR.NAB.CMN-0004 R13): the run is failed with its reason, but the failure
+// counter and the schedule of the task stay as they are.
+func (s *Service) Skip(ctx context.Context, runID uuid.UUID, errClass, errText string) error {
+	var taskID, uid uuid.UUID
+	err := s.Pool.QueryRow(ctx, `WITH r AS (UPDATE task_runs SET status = 'failed', error_class = $2, error_text = $3, finished_at = now()
+			WHERE id = $1 AND status = 'running' RETURNING task_id)
+		SELECT t.id, t.user_id FROM scheduled_tasks t JOIN r ON r.task_id = t.id`, runID, errClass, clip(errText, 500)).Scan(&taskID, &uid)
+	if postgres.IsNoRows(err) {
+		return nil // already finished
+	}
+	if err != nil {
+		return err
+	}
+	metrics.TaskRuns.WithLabelValues("failed").Inc()
+	s.publish(ctx, events.TaskRunFinished, uid, map[string]any{"taskId": taskID, "runId": runID, "status": "failed", "paused": false})
+	return nil
+}
+
 // NoteDelivery marks a run whose channel was not available: the result went
 // to the web and the run stays successful (R5).
 func (s *Service) NoteDelivery(ctx context.Context, runID uuid.UUID, note string) {
