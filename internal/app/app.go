@@ -168,8 +168,8 @@ func newCore(ctx context.Context, cfg *config.Config) (*core, error) {
 		Validators: map[string]channels.Validator{domain.ChannelTelegram: channels.ValidateTelegram, domain.ChannelVKTeams: channels.ValidateVKTeams,
 			domain.ChannelEmail: email.Validate},
 		Checkers: map[string]channels.Checker{
-			domain.ChannelTelegram: func(ctx context.Context) error { _, _, err := c.tg.Me(ctx); return err },
-			domain.ChannelVKTeams:  func(ctx context.Context) error { _, err := c.vk.Me(ctx); return err },
+			domain.ChannelTelegram: c.checkTelegram,
+			domain.ChannelVKTeams:  c.checkVKTeams,
 			domain.ChannelEmail:    c.mail.Check,
 		}}
 	c.chatAPI.Channels = c.chanAPI.Mine
@@ -283,6 +283,30 @@ func (c *core) configureChannel(ctx context.Context, kind string) {
 	case domain.ChannelEmail:
 		c.mail.Reset()
 	}
+}
+
+// checkTelegram checks the bot with the stored token: the adapter of this
+// pod may not have re-read the channel yet (the change arrives as an event).
+func (c *core) checkTelegram(ctx context.Context) error {
+	sec, _, err := c.registry.Config(ctx, domain.ChannelTelegram, nil)
+	if err != nil {
+		return err
+	}
+	c.tg.Configure(sec["botToken"], sec["webhookSecret"])
+	_, _, err = c.tg.Me(ctx)
+	return err
+}
+
+// checkVKTeams checks the bot with the stored settings, like checkTelegram.
+func (c *core) checkVKTeams(ctx context.Context) error {
+	var st channels.VKTeamsSettings
+	sec, _, err := c.registry.Config(ctx, domain.ChannelVKTeams, &st)
+	if err != nil {
+		return err
+	}
+	c.vk.Configure(st.APIURL, sec["token"], st.BotID)
+	_, err = c.vk.Me(ctx)
+	return err
 }
 
 func (c *core) close() {
