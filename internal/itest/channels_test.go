@@ -448,6 +448,29 @@ func TestTelegramBotAndGroups(t *testing.T) {
 	if ga.Status != groups.Active || *ga.DataUserID != dataUser || n != 1 || ga.Name != "Платон" {
 		t.Fatalf("GR-10: %+v %d", ga, n)
 	}
+	// an agent switched off by an administrator stays off: neither a change of
+	// the bot's rights nor its return to the chat switches it on
+	off := groups.Disabled
+	if _, err := gs.Update(ctx, admin, ga.ID, groups.Patch{Status: &off}, nil); err != nil {
+		t.Fatal(err)
+	}
+	promoted := channels.Update{}
+	_ = json.Unmarshal([]byte(`{"my_chat_member":{"chat":{"id":-500,"type":"supergroup"},"from":{"id":9001},
+		"old_chat_member":{"status":"member"},"new_chat_member":{"status":"administrator"}}}`), &promoted)
+	left := f.count("leaveChat")
+	for _, u := range []channels.Update{promoted, added(-500, 9001, "left"), added(-500, 9001, "member")} {
+		wh.Handle(ctx, u)
+		if ga, _ = gs.ByChat(ctx, domain.ChannelTelegram, "-500"); ga.Status != groups.Disabled || ga.DataUntil == nil || *ga.DataUserID != dataUser {
+			t.Fatalf("a switched off agent: %+v", ga)
+		}
+	}
+	if f.count("leaveChat") != left {
+		t.Fatal("the bot left the chat of a switched off agent")
+	}
+	on := groups.Active
+	if _, err := gs.Update(ctx, admin, ga.ID, groups.Patch{Status: &on}, nil); err != nil {
+		t.Fatal(err)
+	}
 	// GR-11: the purge deletes the data after data_until
 	s3.m["spaces/"+dataUser.String()+"/notes.md"] = []byte("x")
 	wh.Handle(ctx, added(-500, 9001, "kicked"))

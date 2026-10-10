@@ -346,10 +346,15 @@ func (p *VKPoller) private(ctx context.Context, pl botgolang.EventPayload) {
 			slog.WarnContext(ctx, "vkteams file", "err", err)
 			continue
 		}
-		id, err := p.Attachments.Store(ctx, uid, name, "", io.LimitReader(rc, p.MaxFile), -1)
+		id, err := p.Attachments.Store(ctx, uid, name, "", rc, -1)
 		rc.Close()
-		if err == nil {
+		switch {
+		case err == nil:
 			atts = append(atts, id)
+		case tooLarge(err):
+			p.say(ctx, chat, p.Users.Language(ctx, uid), "tg.too_large")
+		default:
+			slog.WarnContext(ctx, "vkteams attachment", "err", err)
 		}
 		if text == "" {
 			text = strings.TrimSpace(part.Payload.Caption)

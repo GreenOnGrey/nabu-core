@@ -88,6 +88,36 @@ func TestHTMLPartsLimit(t *testing.T) {
 	}
 }
 
+// A list or a paragraph longer than the limit is cut inside the block with
+// the tags closed and opened again.
+func TestHTMLPartsLongBlock(t *testing.T) {
+	var sb strings.Builder
+	for i := 0; i < 300; i++ {
+		sb.WriteString("- пункт **важный** с [ссылкой](https://x.org/a?b=1&c=2) и `кодом` <тег>\n")
+	}
+	md := sb.String() + "\n" + strings.Repeat("слово ", 600) + "\n\n**" + strings.Repeat("я", 2500) + "**"
+	parts := HTMLParts(Parse(md), 1000)
+	if len(parts) < 20 {
+		t.Fatal(len(parts))
+	}
+	var text strings.Builder
+	for _, p := range parts {
+		if n := len([]rune(p)); n > 1000 {
+			t.Fatal(n)
+		}
+		for _, tag := range []string{"b", "a", "code"} {
+			if strings.Count(p, "<"+tag) != strings.Count(p, "</"+tag+">") {
+				t.Fatal("broken tags", p)
+			}
+		}
+		text.WriteString(StripHTML(p))
+	}
+	if got := text.String(); strings.Count(got, "пункт") != 300 || strings.Count(got, "слово") != 600 || strings.Count(got, "я") != 2500 ||
+		strings.Count(got, "<тег>") != 300 || strings.ContainsAny(got, "&") {
+		t.Fatal("the text was lost or left escaped")
+	}
+}
+
 // ML-16: a letter with an HTML table and a text version.
 func TestEmail(t *testing.T) {
 	h, txt := Email(Parse(answer))

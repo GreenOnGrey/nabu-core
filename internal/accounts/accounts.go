@@ -217,14 +217,14 @@ func (s *Service) Archive(ctx context.Context, emails []string, opt ArchiveOptio
 			return nil, apperr.Unprocessable("invalid_transfer", "group agents are transferred to an active administrator").With("field", "transferTo")
 		}
 	}
+	if by.UserID != nil && contains(list, by.Email) {
+		return nil, apperr.Conflict("cannot_archive_self", "you cannot archive your own account")
+	}
 	retention := s.Retention(ctx)
 	params, _ := json.Marshal(map[string]any{"groupAgents": opt.GroupAgents, "transferTo": opt.TransferTo, "by": by.By(),
 		"clientId": by.ClientID, "initiator": by.Initiator, "actorId": by.UserID})
 	out := make([]Result, 0, len(list))
 	for _, email := range list {
-		if by.UserID != nil && email == domain.NormalizeEmail(by.Email) {
-			return nil, apperr.Conflict("cannot_archive_self", "you cannot archive your own account")
-		}
 		var r Result
 		r.Email = email
 		err := postgres.InTx(ctx, s.Pool, func(tx pgx.Tx) error {
@@ -257,6 +257,7 @@ func (s *Service) Archive(ctx context.Context, emails []string, opt ArchiveOptio
 			return err
 		})
 		if err != nil {
+			s.accessChanged(ctx) // the accounts archived before the failure are committed
 			return nil, err
 		}
 		if r.Result == NotFound && s.purgedEmail(ctx, email) {
@@ -302,13 +303,19 @@ func (s *Service) RunJobs(ctx context.Context) {
 }
 
 func (s *Service) runPending(ctx context.Context) {
-	for i := 0; i < 20 && ctx.Err() == nil; i++ {
-		done, err := s.RunOne(ctx)
+	// a job that failed waits for the next pass and does not hold back the others
+	failed := []uuid.UUID{}
+	for ctx.Err() == nil {
+		id, err := s.runOne(ctx, failed)
 		if err != nil {
-			slog.WarnContext(ctx, "account job", "err", err)
-			return
+			slog.WarnContext(ctx, "account job", "job", id, "err", err)
+			if id == uuid.Nil {
+				return
+			}
+			failed = append(failed, id)
+			continue
 		}
-		if !done {
+		if id == uuid.Nil {
 			return
 		}
 	}
@@ -325,16 +332,55 @@ type jobParams struct {
 
 // RunOne performs one running job to its end; false — none is waiting.
 func (s *Service) RunOne(ctx context.Context) (bool, error) {
-	tx, err := s.Pool.Begin(ctx)
+	id, err := s.runOne(ctx, []uuid.UUID{})
+	return err == nil && id != uuid.Nil, err
+}
+
+// runOne performs the oldest running job not listed in skip and returns its
+// ID; uuid.Nil — none is waiting. The job is held by a session advisory
+// lock, not by a transaction: the steps call Kubernetes and S3.
+func (s *Service) runOne(ctx context.Context, skip []uuid.UUID) (uuid.UUID, error) {
+	conn, err := s.Pool.Acquire(ctx)
 	if err != nil {
-		return false, err
+		return uuid.Nil, err
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck // after commit
-	var id, uid uuid.UUID
+	defer conn.Release()
+	rows, err := conn.Query(ctx, `SELECT id FROM account_jobs WHERE status = 'running' AND kind = 'archive' AND NOT (id = ANY($1::uuid[]))
+		ORDER BY created_at`, skip)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	if err != nil {
+		return uuid.Nil, err
+	}
+	for _, id := range ids {
+		key := "nabu:account-job:" + id.String()
+		var ok bool
+		if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext($1))`, key).Scan(&ok); err != nil {
+			return uuid.Nil, err
+		}
+		if !ok {
+			continue // another worker performs it
+		}
+		ran, err := s.runJob(ctx, id)
+		if _, uerr := conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock(hashtext($1))`, key); uerr != nil {
+			_ = conn.Conn().Close(context.WithoutCancel(ctx)) // the lock ends with the session
+		}
+		if ran || err != nil {
+			return id, err
+		}
+	}
+	return uuid.Nil, nil
+}
+
+// runJob performs the steps of a job from the one it stopped at; false —
+// another worker finished the job first.
+func (s *Service) runJob(ctx context.Context, id uuid.UUID) (bool, error) {
+	var uid uuid.UUID
 	var step string
 	var raw []byte
-	err = tx.QueryRow(ctx, `SELECT id, user_id, step, params FROM account_jobs WHERE status = 'running' AND kind = 'archive'
-		ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED`).Scan(&id, &uid, &step, &raw)
+	err := s.Pool.QueryRow(ctx, `SELECT user_id, step, params FROM account_jobs WHERE id = $1 AND status = 'running'`, id).Scan(&uid, &step, &raw)
 	if postgres.IsNoRows(err) {
 		return false, nil
 	}
@@ -344,12 +390,9 @@ func (s *Service) RunOne(ctx context.Context) (bool, error) {
 	var p jobParams
 	_ = json.Unmarshal(raw, &p)
 	var status string
-	_ = tx.QueryRow(ctx, `SELECT status FROM users WHERE id = $1`, uid).Scan(&status)
+	_ = s.Pool.QueryRow(ctx, `SELECT status FROM users WHERE id = $1`, uid).Scan(&status)
 	if status != "archived" { // restored before the job finished
-		_, err := tx.Exec(ctx, `UPDATE account_jobs SET status = 'cancelled', finished_at = now() WHERE id = $1`, id)
-		if err == nil {
-			err = tx.Commit(ctx)
-		}
+		_, err := s.Pool.Exec(ctx, `UPDATE account_jobs SET status = 'cancelled', finished_at = now() WHERE id = $1`, id)
 		return true, err
 	}
 	start := 0
@@ -359,19 +402,16 @@ func (s *Service) RunOne(ctx context.Context) (bool, error) {
 		}
 	}
 	for _, st := range Steps[start:] {
-		if err := s.step(ctx, st, uid, p); err != nil {
-			_, _ = tx.Exec(ctx, `UPDATE account_jobs SET step = $2 WHERE id = $1`, id, st)
-			_ = tx.Commit(ctx)
-			return false, errors.Join(errors.New("archive step "+st), err)
-		}
-		if _, err := tx.Exec(ctx, `UPDATE account_jobs SET step = $2 WHERE id = $1`, id, st); err != nil {
+		// the step is recorded before it runs: a failure resumes here (AR-02)
+		if _, err := s.Pool.Exec(ctx, `UPDATE account_jobs SET step = $2 WHERE id = $1`, id, st); err != nil {
 			return false, err
 		}
+		if err := s.step(ctx, st, uid, p); err != nil {
+			return false, errors.Join(errors.New("archive step "+st), err)
+		}
 	}
-	if _, err := tx.Exec(ctx, `UPDATE account_jobs SET step = 'done', status = 'done', finished_at = now() WHERE id = $1`, id); err != nil {
-		return false, err
-	}
-	return true, tx.Commit(ctx)
+	_, err = s.Pool.Exec(ctx, `UPDATE account_jobs SET step = 'done', status = 'done', finished_at = now() WHERE id = $1`, id)
+	return true, err
 }
 
 func (s *Service) step(ctx context.Context, st string, uid uuid.UUID, p jobParams) error {

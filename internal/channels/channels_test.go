@@ -49,6 +49,9 @@ func TestMentions(t *testing.T) {
 	if !parse(`{"text":"а подробнее?","reply_to_message":{"from":{"id":7}}}`).Mentions("nabu_bot", 7) {
 		t.Fatal("a reply to the bot")
 	}
+	if !parse(`{"caption":"@nabu_bot разбери","caption_entities":[{"type":"mention","offset":0,"length":9}],"photo":[{"file_id":"f"}]}`).Mentions("nabu_bot", 7) {
+		t.Fatal("a mention in the caption of a photo")
+	}
 	if parse(`{"text":"обсуждаем релиз","reply_to_message":{"from":{"id":8}}}`).Mentions("nabu_bot", 7) {
 		t.Fatal("GR-03: a message not for the bot")
 	}

@@ -19,6 +19,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/GreenOnGrey/nabu-core/internal/apperr"
 	"github.com/GreenOnGrey/nabu-core/internal/domain"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/metrics"
 	"github.com/GreenOnGrey/nabu-core/internal/render"
@@ -119,6 +120,12 @@ func (e *TelegramError) Error() string {
 	return fmt.Sprintf("telegram %d: %s", e.Status, e.Description)
 }
 
+// Permanent reports a refusal a repeated call does not change (a blocked
+// bot, a wrong chat); 429 and 5xx are worth a retry.
+func (e *TelegramError) Permanent() bool {
+	return e.Status >= 400 && e.Status < 500 && e.Status != http.StatusTooManyRequests
+}
+
 func scrub(err error, token string) error {
 	if token == "" {
 		return err
@@ -172,7 +179,7 @@ func (t *Telegram) Send(ctx context.Context, chatID, md string) error {
 	if len(blocks) == 0 {
 		return nil
 	}
-	err := t.sendRich(ctx, chatID, blocks)
+	sent, err := t.sendRich(ctx, chatID, blocks)
 	if err == nil {
 		return nil
 	}
@@ -181,18 +188,21 @@ func (t *Telegram) Send(ctx context.Context, chatID, md string) error {
 	}
 	slog.InfoContext(ctx, "telegram rich message refused, sending HTML", "err", err)
 	metrics.ChannelOutbound.WithLabelValues("telegram", "fallback").Inc()
-	return t.sendHTML(ctx, chatID, blocks)
+	return t.sendHTML(ctx, chatID, blocks[sent:]) // the delivered messages are not repeated
 }
 
-func (t *Telegram) sendRich(ctx context.Context, chatID string, blocks []render.Block) error {
+// sendRich returns the number of blocks of the answer it delivered.
+func (t *Telegram) sendRich(ctx context.Context, chatID string, blocks []render.Block) (int, error) {
+	sent := 0
 	for _, msg := range render.TelegramRich(blocks, t.TableMaxCols) {
 		if err := t.call(ctx, "sendRichMessage", map[string]any{"chat_id": chatID,
 			"rich_message": map[string]any{"blocks": msg, "skip_entity_detection": false}}, nil); err != nil {
-			return err
+			return sent, err
 		}
+		sent += len(msg) // one rich block per block of the answer
 		metrics.ChannelOutbound.WithLabelValues("telegram", "ok").Inc()
 	}
-	return nil
+	return sent, nil
 }
 
 func (t *Telegram) sendHTML(ctx context.Context, chatID string, blocks []render.Block) error {
@@ -200,7 +210,7 @@ func (t *Telegram) sendHTML(ctx context.Context, chatID string, blocks []render.
 		err := t.call(ctx, "sendMessage", map[string]any{"chat_id": chatID, "text": part, "parse_mode": "HTML",
 			"link_preview_options": map[string]bool{"is_disabled": true}}, nil)
 		if err != nil && isRefusal(err) {
-			err = t.SendText(ctx, chatID, render.Text(render.Parse(part)))
+			err = t.SendText(ctx, chatID, render.StripHTML(part))
 		}
 		if err != nil {
 			metrics.ChannelOutbound.WithLabelValues("telegram", "error").Inc()
@@ -301,20 +311,25 @@ type TGChat struct {
 	Title string `json:"title"`
 }
 
+// TGEntity is a special entity of a text: offsets in UTF-16 units.
+type TGEntity struct {
+	Type   string `json:"type"`
+	Offset int    `json:"offset"`
+	Length int    `json:"length"`
+}
+
 // TGMessage is the part of a message Nabu reads.
 type TGMessage struct {
-	MessageID int64   `json:"message_id"`
-	From      *TGUser `json:"from"`
-	Chat      TGChat  `json:"chat"`
-	Text      string  `json:"text"`
-	Caption   string  `json:"caption"`
-	Entities  []struct {
-		Type   string `json:"type"`
-		Offset int    `json:"offset"`
-		Length int    `json:"length"`
-	} `json:"entities"`
-	ReplyTo  *TGMessage `json:"reply_to_message"`
-	Document *struct {
+	MessageID int64      `json:"message_id"`
+	From      *TGUser    `json:"from"`
+	Chat      TGChat     `json:"chat"`
+	Text      string     `json:"text"`
+	Caption   string     `json:"caption"`
+	Entities  []TGEntity `json:"entities"`
+	// CaptionEntities are the entities of the caption of a media message.
+	CaptionEntities []TGEntity `json:"caption_entities"`
+	ReplyTo         *TGMessage `json:"reply_to_message"`
+	Document        *struct {
 		FileID   string `json:"file_id"`
 		FileName string `json:"file_name"`
 		MimeType string `json:"mime_type"`
@@ -336,6 +351,9 @@ type Update struct {
 	MyChatMember *struct {
 		Chat          TGChat `json:"chat"`
 		From          TGUser `json:"from"`
+		OldChatMember struct {
+			Status string `json:"status"`
+		} `json:"old_chat_member"`
 		NewChatMember struct {
 			Status string `json:"status"`
 		} `json:"new_chat_member"`
@@ -348,12 +366,12 @@ func (m *TGMessage) Mentions(botUsername string, botID int64) bool {
 	if m.ReplyTo != nil && m.ReplyTo.From != nil && m.ReplyTo.From.ID == botID {
 		return true
 	}
-	text := m.Text
+	text, entities := m.Text, m.Entities
 	if text == "" {
-		text = m.Caption
+		text, entities = m.Caption, m.CaptionEntities
 	}
 	u16 := utf16Units(text)
-	for _, e := range m.Entities {
+	for _, e := range entities {
 		if e.Type != "mention" || e.Offset < 0 || e.Offset+e.Length > len(u16) {
 			continue
 		}
@@ -420,7 +438,7 @@ func (h *Webhook) Handle(ctx context.Context, u Update) {
 		return
 	}
 	if m := u.MyChatMember; m != nil {
-		h.membership(ctx, m.Chat, m.From, m.NewChatMember.Status)
+		h.membership(ctx, m.Chat, m.From, m.OldChatMember.Status, m.NewChatMember.Status)
 		return
 	}
 	m := u.Message
@@ -514,8 +532,15 @@ func (h *Webhook) fetchAll(ctx context.Context, uid uuid.UUID, chat, lang string
 		if name == "" {
 			name = path[strings.LastIndex(path, "/")+1:]
 		}
-		id, err := h.Attachments.Store(ctx, uid, name, mime, io.LimitReader(rc, h.MaxFile), size)
+		if size <= 0 {
+			size = -1 // unknown: the store reads to the end and refuses a file over the limit
+		}
+		id, err := h.Attachments.Store(ctx, uid, name, mime, rc, size)
 		if err != nil {
+			if tooLarge(err) {
+				h.say(ctx, chat, lang, "tg.too_large")
+				return
+			}
 			slog.WarnContext(ctx, "telegram attachment", "err", err)
 			return
 		}
@@ -534,6 +559,11 @@ func (h *Webhook) fetchAll(ctx context.Context, uid uuid.UUID, chat, lang string
 	return atts
 }
 
+func tooLarge(err error) bool {
+	e, ok := apperr.As(err)
+	return ok && e.Code == "too_large"
+}
+
 func (h *Webhook) botIdentity(ctx context.Context) (int64, string) {
 	if h.botID.Load() == 0 || h.Bot.Username() == "" {
 		if id, _, err := h.Bot.Me(ctx); err == nil {
@@ -544,13 +574,16 @@ func (h *Webhook) botIdentity(ctx context.Context) (int64, string) {
 }
 
 // membership handles the bot added to or removed from a group (arch §5.3).
-func (h *Webhook) membership(ctx context.Context, chat TGChat, from TGUser, status string) {
+func (h *Webhook) membership(ctx context.Context, chat TGChat, from TGUser, old, status string) {
 	if chat.Type == "private" || chat.Type == "channel" || h.Groups == nil {
 		return
 	}
 	chatID := strconv.FormatInt(chat.ID, 10)
 	switch status {
 	case "member", "administrator":
+		if old == "member" || old == "administrator" {
+			return // the rights of the bot changed; it was not added
+		}
 		adder, _, _ := h.Keys.UserOf(ctx, from.ID)
 		ev := GroupEvent{Channel: domain.ChannelTelegram, ChatID: chatID, Title: chat.Title, AdderID: adder,
 			Members: h.Bot.MemberCount(ctx, chatID), Language: from.LanguageCode}

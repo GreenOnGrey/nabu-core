@@ -126,6 +126,9 @@ func (s *Service) CallTool(ctx context.Context, uid, itemID uuid.UUID, tool stri
 	if !it.Published || it.InDevelopment {
 		return "", true, ErrUnavailable()
 	}
+	if it.ReadOnly && !s.readOnlyTool(it, tool) {
+		return readOnlyRefusal(tool), true, nil
+	}
 	headers, perr := s.itemHeaders(ctx, it, uid)
 	if perr != nil {
 		return perr.msg, true, nil
@@ -167,6 +170,17 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 		} `json:"params"`
 	}
 	_ = json.Unmarshal(body, &call)
+	// the read-only restriction of the item comes first: a refused call is never held for a confirmation
+	if it.ReadOnly && call.Method == "tools/call" && !s.readOnlyTool(it, call.Params.Name) {
+		var req struct {
+			ID json.RawMessage `json:"id"`
+		}
+		_ = json.Unmarshal(body, &req)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{
+			"isError": true, "content": []map[string]string{{"type": "text", "text": readOnlyRefusal(call.Params.Name)}}}})
+		return
+	}
 	conv, _ := uuid.Parse(c.Conversation)
 	if hold != nil && conv != uuid.Nil && uid != uuid.Nil && call.Method == "tools/call" && !s.readOnlyTool(it, call.Params.Name) {
 		// R9: in a mail topic a call that changes data waits for the user (ML-17, ML-20)
@@ -183,16 +197,6 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 				"isError": false, "content": []map[string]string{{"type": "text", "text": answer}}}})
 			return
 		}
-	}
-	if it.ReadOnly && call.Method == "tools/call" && !s.readOnlyTool(it, call.Params.Name) {
-		var req struct {
-			ID json.RawMessage `json:"id"`
-		}
-		_ = json.Unmarshal(body, &req)
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{
-			"isError": true, "content": []map[string]string{{"type": "text", "text": "The tool " + call.Params.Name + " changes data; this server is read-only in Nabu."}}}})
-		return
 	}
 	up, err := http.NewRequestWithContext(r.Context(), r.Method, it.Source.URL, bytes.NewReader(body))
 	if err != nil {
@@ -257,6 +261,10 @@ func (s *Service) connected(ctx context.Context, uid, item uuid.UUID) bool {
 	var n int
 	_ = s.Pool.QueryRow(ctx, `SELECT count(*) FROM user_connections WHERE user_id = $1 AND item_id = $2`, uid, item).Scan(&n)
 	return n > 0
+}
+
+func readOnlyRefusal(tool string) string {
+	return "The tool " + tool + " changes data; this server is read-only in Nabu."
 }
 
 // readOnlyTool reports whether the tool is marked read-only in the stored

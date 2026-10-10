@@ -152,6 +152,7 @@ func (s *Service) Added(ctx context.Context, ev channels.GroupEvent) (string, bo
 		members = &ev.Members
 	}
 	var owner string
+	disabled := false
 	err := postgres.InTx(ctx, s.Pool, func(tx pgx.Tx) error {
 		var id uuid.UUID
 		var ownerID, dataUser *uuid.UUID
@@ -175,6 +176,11 @@ func (s *Service) Added(ctx context.Context, ev channels.GroupEvent) (string, bo
 			return err
 		case status == Active:
 			// added again while active: nothing changes
+		case status == Disabled:
+			// switched off by an administrator or with its archived owner:
+			// bringing the bot back does not switch the agent on
+			disabled = true
+			return nil
 		case ownerID != nil && *ownerID == ev.AdderID && until != nil && until.After(time.Now()) && dataUser != nil:
 			// R17: the same owner brings the bot back — the data return
 			if _, err := tx.Exec(ctx, `UPDATE group_agents SET status = 'active', data_until = NULL, chat_title = COALESCE(NULLIF($2,''), chat_title),
@@ -209,13 +215,17 @@ func (s *Service) Added(ctx context.Context, ev channels.GroupEvent) (string, bo
 		slog.ErrorContext(ctx, "group agent added", "err", err)
 		return "", false
 	}
+	if disabled {
+		return channels.T(lang, "group.inactive"), true
+	}
 	return channels.T(lang, "group.welcome", owner), true
 }
 
 // Removed implements channels.Groups: the data are kept for the archive
-// retention (R17).
+// retention (R17). A switched off agent stays switched off with its term.
 func (s *Service) Removed(ctx context.Context, channel, chatID string) {
-	_, err := s.Pool.Exec(ctx, `UPDATE group_agents SET status = 'removed', data_until = $3 WHERE channel = $1 AND external_chat_id = $2`,
+	_, err := s.Pool.Exec(ctx, `UPDATE group_agents SET status = 'removed', data_until = $3
+		WHERE channel = $1 AND external_chat_id = $2 AND status <> 'disabled'`,
 		channel, chatID, time.Now().Add(s.retention(ctx)))
 	if err != nil {
 		slog.ErrorContext(ctx, "group agent removed", "err", err)

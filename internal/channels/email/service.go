@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
@@ -22,6 +23,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/GreenOnGrey/nabu-core/internal/apperr"
 	"github.com/GreenOnGrey/nabu-core/internal/channels"
 	"github.com/GreenOnGrey/nabu-core/internal/domain"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/events"
@@ -37,6 +39,9 @@ const (
 	Rejected    = "rejected"
 	Ignored     = "ignored"
 	Unavailable = "unavailable"
+	// Deferred is not a row of the log: a temporary failure, the letter
+	// stays in the mailbox for the next pass of the receiver.
+	Deferred = "deferred"
 )
 
 // ProcessedFlag and ProcessedFolder mark handled letters (arch §3.1).
@@ -234,7 +239,7 @@ func (m *Mail) Process(ctx context.Context, c Credentials, raw []byte, key strin
 	acc, err := m.Accounts(ctx, l.From)
 	if err != nil {
 		slog.ErrorContext(ctx, "mail account", "err", err)
-		return ""
+		return Deferred
 	}
 	if acc == nil || acc.Status != "active" || !m.Registry.Open(ctx, acc.ID, domain.ChannelEmail) {
 		// R10: a short answer, once a day, only when the bot is the only recipient.
@@ -251,7 +256,7 @@ func (m *Mail) Process(ctx context.Context, c Credentials, raw []byte, key strin
 	conv, err := m.thread(ctx, acc.ID, l, mode)
 	if err != nil {
 		slog.ErrorContext(ctx, "mail thread", "err", err)
-		return ""
+		return Deferred
 	}
 	var atts []uuid.UUID
 	for _, f := range l.Files {
@@ -266,16 +271,39 @@ func (m *Mail) Process(ctx context.Context, c Credentials, raw []byte, key strin
 	if text == "" && len(atts) == 0 {
 		text = "(" + CleanSubject(l.Subject) + ")"
 	}
-	meta := map[string]any{"email": map[string]any{"from": l.From, "fromName": l.FromName, "to": l.To, "cc": l.Cc,
-		"subject": l.Subject, "mode": mode, "quoted": clip(l.Quoted, 6000), "tooLarge": l.TooLarge}}
-	mctx, _ := json.Marshal(meta)
 	if err := m.Inbox.Receive(ctx, channels.Inbound{UserID: acc.ID, Channel: domain.ChannelEmail, Text: clip(text, 30000),
-		Attachments: atts, Conversation: &conv, Context: mctx}); err != nil {
+		Attachments: atts, Conversation: &conv, Context: mailContext(l, mode)}); err != nil {
 		slog.ErrorContext(ctx, "mail inbound", "err", err)
-		return ""
+		if e, ok := apperr.As(err); ok && e.Status < http.StatusInternalServerError {
+			// the message itself is refused: a retry gives the same answer
+			m.log(ctx, l, key, Rejected, e.Code, &conv)
+			return Rejected
+		}
+		return Deferred
 	}
 	m.log(ctx, l, key, Accepted, "", &conv)
 	return Accepted
+}
+
+// contextMax is the limit of the context of a message (chat.Post).
+const contextMax = 16 << 10
+
+// mailContext is the context of a letter for the agent; the quoted text is
+// shortened until the JSON fits the limit of a message context.
+func mailContext(l *Letter, mode string) json.RawMessage {
+	quoted := clip(l.Quoted, 6000)
+	for {
+		b, _ := json.Marshal(map[string]any{"email": map[string]any{"from": l.From, "fromName": l.FromName, "to": l.To, "cc": l.Cc,
+			"subject": l.Subject, "mode": mode, "quoted": quoted, "tooLarge": l.TooLarge}})
+		if len(b) <= contextMax || quoted == "" {
+			return b
+		}
+		if n := utf8.RuneCountInString(quoted) / 2; n > 0 {
+			quoted = clip(quoted, n-1)
+		} else {
+			quoted = ""
+		}
+	}
 }
 
 func rejectLabel(why string) string {
@@ -296,7 +324,7 @@ func (m *Mail) thread(ctx context.Context, uid uuid.UUID, l *Letter, mode string
 	var conv uuid.UUID
 	err := postgres.InTx(ctx, m.Pool, func(tx pgx.Tx) error {
 		err := tx.QueryRow(ctx, `SELECT t.conversation_id FROM email_threads t JOIN conversations c ON c.id = t.conversation_id
-			WHERE c.user_id = $1 AND t.message_ids && $2::text[] LIMIT 1`, uid, l.IDs()).Scan(&conv)
+			WHERE c.user_id = $1 AND t.message_ids && $2::text[] LIMIT 1`, uid, append(l.IDs(), l.MessageID)).Scan(&conv) // its own ID: a letter deferred after this step
 		if postgres.IsNoRows(err) {
 			if err := tx.QueryRow(ctx, `INSERT INTO conversations (user_id, kind, title, source, writes_require_confirmation)
 				VALUES ($1,'topic',$2,'email',true) RETURNING id`, uid, clip(CleanSubject(l.Subject), 120)).Scan(&conv); err != nil {
@@ -700,10 +728,12 @@ func (m *Mail) fetchNew(ctx context.Context, c Credentials, cl *imapclient.Clien
 		for _, msg := range msgs {
 			raw := msg.FindBodySection(section)
 			key := fmt.Sprintf("uid:%d/%d", uidValidity, msg.UID)
+			handle := m.Process
 			if m.handle != nil {
-				m.handle(ctx, c, raw, key)
-			} else {
-				m.Process(ctx, c, raw, key)
+				handle = m.handle
+			}
+			if handle(ctx, c, raw, key) == Deferred {
+				continue // neither flagged nor moved: the next pass takes it again
 			}
 			one := imap.UIDSetNum(msg.UID)
 			if err := cl.Store(one, &imap.StoreFlags{Op: imap.StoreFlagsAdd, Silent: true, Flags: []imap.Flag{ProcessedFlag}}, nil).Close(); err != nil {

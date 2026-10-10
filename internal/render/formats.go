@@ -160,7 +160,8 @@ func richBlock(b Block, maxCols int) (any, int, int) {
 
 // HTMLParts renders blocks as the HTML of messengers (b, i, s, code, pre,
 // a, blockquote; lists with symbols; tables as aligned pre) split into
-// messages of at most limit characters by block boundaries.
+// messages of at most limit characters by block boundaries; a block longer
+// than limit is cut by lines, then words.
 func HTMLParts(bs []Block, limit int) []string {
 	var parts []string
 	var cur strings.Builder
@@ -171,14 +172,20 @@ func HTMLParts(bs []Block, limit int) []string {
 		cur.Reset()
 	}
 	for _, b := range bs {
-		for _, piece := range htmlBlock(b, limit) {
-			if cur.Len() > 0 && utf8.RuneCountInString(cur.String())+utf8.RuneCountInString(piece)+2 > limit {
-				flush()
+		for _, whole := range htmlBlock(b, limit) {
+			pieces := []string{whole}
+			if utf8.RuneCountInString(whole) > limit {
+				pieces = splitHTML(whole, limit)
 			}
-			if cur.Len() > 0 {
-				cur.WriteString("\n\n")
+			for _, piece := range pieces {
+				if cur.Len() > 0 && utf8.RuneCountInString(cur.String())+utf8.RuneCountInString(piece)+2 > limit {
+					flush()
+				}
+				if cur.Len() > 0 {
+					cur.WriteString("\n\n")
+				}
+				cur.WriteString(piece)
 			}
-			cur.WriteString(piece)
 		}
 	}
 	flush()
@@ -187,6 +194,123 @@ func HTMLParts(bs []Block, limit int) []string {
 
 // HTML renders all blocks as the messenger HTML in one string.
 func HTML(bs []Block) string { return strings.Join(HTMLParts(bs, 1<<30), "\n\n") }
+
+type htmlToken struct {
+	s    string
+	open string // the name of an opening tag
+	end  string // the name of a closing tag
+}
+
+// htmlTokens cuts the HTML of htmlBlock into tags, entities and characters.
+func htmlTokens(s string) []htmlToken {
+	var out []htmlToken
+	for len(s) > 0 {
+		switch s[0] {
+		case '<':
+			if i := strings.IndexByte(s, '>'); i > 0 {
+				t := htmlToken{s: s[:i+1]}
+				if s[1] == '/' {
+					t.end = s[2:i]
+				} else {
+					t.open, _, _ = strings.Cut(s[1:i], " ")
+				}
+				out, s = append(out, t), s[i+1:]
+				continue
+			}
+		case '&':
+			if i := strings.IndexByte(s, ';'); i > 0 && i <= 8 {
+				out, s = append(out, htmlToken{s: s[:i+1]}), s[i+1:]
+				continue
+			}
+		}
+		_, n := utf8.DecodeRuneInString(s)
+		out, s = append(out, htmlToken{s: s[:n]}), s[n:]
+	}
+	return out
+}
+
+// StripHTML is the plain text of a part of HTMLParts.
+func StripHTML(s string) string {
+	var b strings.Builder
+	for _, t := range htmlTokens(s) {
+		if t.open == "" && t.end == "" {
+			b.WriteString(t.s)
+		}
+	}
+	return html.UnescapeString(b.String())
+}
+
+// splitHTML cuts a piece into parts of at most limit characters at a line
+// end, else at a space, else anywhere outside tags and entities; the tags
+// open at a cut are closed there and opened again in the next part.
+func splitHTML(s string, limit int) []string {
+	toks := htmlTokens(s)
+	var parts []string
+	var stack []htmlToken // the tags open at the start of the part
+	for len(toks) > 0 {
+		var b strings.Builder
+		size := 0
+		for _, t := range stack {
+			b.WriteString(t.s)
+			size += utf8.RuneCountInString(t.s)
+		}
+		head := b.Len()
+		open := append([]htmlToken{}, stack...)
+		closing := func(open []htmlToken) (string, int) {
+			var c strings.Builder
+			for i := len(open) - 1; i >= 0; i-- {
+				c.WriteString("</" + open[i].open + ">")
+			}
+			return c.String(), utf8.RuneCountInString(c.String())
+		}
+		// the last line end and the last space that still fit: the number of
+		// tokens taken, the length of the text and the tags open there
+		type point struct {
+			n, len int
+			open   []htmlToken
+		}
+		var line, space point
+		n := 0
+		for ; n < len(toks); n++ {
+			t := toks[n]
+			next := open
+			switch {
+			case t.open != "":
+				next = append(append([]htmlToken{}, open...), t)
+			case t.end != "" && len(open) > 0:
+				next = open[:len(open)-1]
+			}
+			_, tail := closing(next)
+			if size+utf8.RuneCountInString(t.s)+tail > limit && b.Len() > head {
+				break
+			}
+			b.WriteString(t.s)
+			size += utf8.RuneCountInString(t.s)
+			open = next
+			switch t.s {
+			case "\n":
+				line = point{n + 1, b.Len(), open}
+			case " ":
+				space = point{n + 1, b.Len(), open}
+			}
+		}
+		text := b.String()
+		if n < len(toks) {
+			for _, p := range []point{line, space} {
+				if p.n > 0 {
+					n, text, open = p.n, text[:p.len], p.open
+					break
+				}
+			}
+		}
+		tail, _ := closing(open)
+		if part := strings.TrimSpace(text[head:]); part != "" {
+			parts = append(parts, strings.TrimRight(text, " \n")+tail)
+		}
+		toks, stack = toks[n:], open
+	}
+	return parts
+}
 
 func esc(s string) string { return html.EscapeString(s) }
 

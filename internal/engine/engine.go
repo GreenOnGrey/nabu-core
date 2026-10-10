@@ -736,7 +736,12 @@ func (e *Engine) HandleOutbound(ctx context.Context, _, value []byte) error {
 		return nil
 	}
 	if err := ad.Send(ctx, chatID, o.Text); err != nil {
-		slog.WarnContext(ctx, "channel delivery", "channel", o.Channel, "err", err)
+		var refusal interface{ Permanent() bool }
+		if errors.As(err, &refusal) && refusal.Permanent() {
+			slog.WarnContext(ctx, "channel delivery", "channel", o.Channel, "err", err)
+			return nil
+		}
+		return err // a transient failure: the consumer retries the delivery
 	}
 	return nil
 }
