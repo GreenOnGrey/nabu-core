@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/exaring/otelpgx"
@@ -25,6 +26,13 @@ type Querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
+// minPoolConns is the least size of the pool unless DATABASE_URL sets
+// pool_max_conns. The default of pgx is the number of CPUs, at least 4, and a
+// worker keeps several connections for as long as it runs: the listener of
+// events and one per advisory lock (mail, VK Teams, agent pods, account jobs).
+// With four of them held nothing else could reach the database.
+const minPoolConns = 16
+
 // Connect opens a pool with OpenTelemetry SQL tracing.
 func Connect(ctx context.Context, url string) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(url)
@@ -32,6 +40,9 @@ func Connect(ctx context.Context, url string) (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("parse DATABASE_URL: %w", err)
 	}
 	cfg.ConnConfig.Tracer = otelpgx.NewTracer()
+	if !strings.Contains(url, "pool_max_conns") && cfg.MaxConns < minPoolConns {
+		cfg.MaxConns = minPoolConns
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
