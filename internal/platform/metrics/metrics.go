@@ -52,6 +52,30 @@ var (
 	TaskRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nabu_task_runs_total", Help: "Scheduled task runs by result.",
 	}, []string{"result"})
+	// FTR.NAB.CMN-0003 arch §9: the memory of communications.
+	MemoryMaskedSecrets = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "nabu_memory_masked_secrets_total", Help: "Secrets masked in the notes and commitments the collector saved.",
+	})
+	MemoryDeniedTools = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "nabu_memory_denied_tools_total", Help: "Tool calls of collector runs refused by the built-in MCP or the MCP proxy.",
+	})
+	MemoryCollect = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_memory_collect_runs_total", Help: "Runs of the collection of communications by result.",
+	}, []string{"result"})
+	MemoryCollectSeconds = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name: "nabu_memory_collect_seconds", Help: "Duration of a run of the collector agent over a batch.",
+		Buckets: []float64{5, 15, 30, 60, 120, 300, 600},
+	})
+	MemoryEmbedPending = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "nabu_memory_embed_pending", Help: "Notes waiting for a vector of the current model of embeddings.",
+	})
+	MemoryDigests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_memory_digests_total", Help: "Digests of commitments by period and result.",
+	}, []string{"period", "result"})
+	MemorySearch = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "nabu_memory_search_seconds", Help: "Duration of the search, the table and the graph of communications.",
+		Buckets: []float64{.01, .025, .05, .1, .25, .5, 1, 2, 3, 5},
+	}, []string{"kind"})
 	ServiceRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nabu_service_agent_runs_total", Help: "Service agent runs by agent and result.",
 	}, []string{"agent", "result"})
@@ -138,5 +162,6 @@ func init() {
 	Registry.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		HTTPRequests, HTTPDuration, KafkaLag, AgentSessions, AgentProcessStarts, LLMRequests, LLMErrors, LLMTokens, LLMCost,
 		Turns, WorkspaceConnections, WorkspaceCalls, Sandboxes, TaskRuns, ServiceRuns, ChannelMessages,
-		ChannelInbound, ChannelOutbound, EmailAuthRejected, IMAPConnected, VKTeamsPollLag, PendingConfirmations, Users, PurgeDeleted)
+		ChannelInbound, ChannelOutbound, EmailAuthRejected, IMAPConnected, VKTeamsPollLag, PendingConfirmations, Users, PurgeDeleted,
+		MemoryMaskedSecrets, MemoryDeniedTools, MemoryDigests, MemorySearch, MemoryCollect, MemoryCollectSeconds, MemoryEmbedPending)
 }

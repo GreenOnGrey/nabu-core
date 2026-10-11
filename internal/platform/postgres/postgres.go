@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/exaring/otelpgx"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -152,4 +153,29 @@ func RunLocked(ctx context.Context, pool *pgxpool.Pool, key string, interval tim
 		case <-time.After(wait):
 		}
 	}
+}
+
+// AsUser runs fn in a transaction that names the user to the row policies of
+// the memory of communications (FTR.NAB.CMN-0003 R22, tech §11): the comm_*
+// tables and commitments show only the rows of this user. Without it they
+// show nothing.
+func AsUser(ctx context.Context, pool *pgxpool.Pool, userID uuid.UUID, fn func(tx pgx.Tx) error) error {
+	return InTx(ctx, pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT set_config('nabu.user_id', $1, true)`, userID.String()); err != nil {
+			return err
+		}
+		return fn(tx)
+	})
+}
+
+// AsMaintenance runs fn seeing the rows of every user: the cleaner and the
+// recount of vectors only. Handlers of HTTP and of MCP tools never call it
+// (FTR.NAB.CMN-0003 tech §11; TestMaintenanceCallers of internal/comm lists the callers).
+func AsMaintenance(ctx context.Context, pool *pgxpool.Pool, fn func(tx pgx.Tx) error) error {
+	return InTx(ctx, pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT set_config('nabu.maintenance', 'on', true)`); err != nil {
+			return err
+		}
+		return fn(tx)
+	})
 }

@@ -57,6 +57,12 @@ func (e *Engine) HandleTaskRun(ctx context.Context, key, value []byte) error {
 		e.Pods.Drop(ctx, u.ID, ref)
 		return e.Tasks.Finish(ctx, ri.RunID, false, "", "user_blocked", "the user is blocked", nil)
 	}
+	if ri.Kind != "" && ri.Kind != tasks.KindAgent {
+		// FTR.NAB.CMN-0003 arch §1: a memory task needs neither the pod of the
+		// user nor their personal agent.
+		e.Pods.Drop(ctx, u.ID, ref)
+		return e.memoryTask(ctx, u, ri)
+	}
 	// Q-16: a run waits for the pod of its user like a message does.
 	turn := agentpods.Turn{Kind: agentpods.KindTask, Ref: ref, Topic: kafka.TopicTaskRun, Key: string(key), Value: value, Channel: ri.Channel}
 	lease, err := e.acquire(ctx, u.ID, turn)
@@ -102,6 +108,12 @@ func (e *Engine) HandleTaskRun(ctx context.Context, key, value []byte) error {
 // postTaskMessage writes the result to the main conversation with the task
 // mark and sends it to the task's channel.
 func (e *Engine) postTaskMessage(ctx context.Context, uid, conv uuid.UUID, ri *tasks.RunInfo, text string) *chat.Message {
+	return e.postTaskCard(ctx, uid, conv, ri, text, nil)
+}
+
+// postTaskCard is postTaskMessage with a card for the web chat: the channels
+// get the text (FTR.NAB.CMN-0003 arch §3.5).
+func (e *Engine) postTaskCard(ctx context.Context, uid, conv uuid.UUID, ri *tasks.RunInfo, text string, card json.RawMessage) *chat.Message {
 	m, err := e.Chat.AddAssistant(ctx, conv, "task:"+ri.TaskID.String(), nil, "", nil)
 	if err != nil {
 		slog.ErrorContext(ctx, "task message", "err", err)
@@ -110,6 +122,11 @@ func (e *Engine) postTaskMessage(ctx context.Context, uid, conv uuid.UUID, ri *t
 	final, err := e.Chat.Finish(ctx, m.ID, text, "done", nil, "", "")
 	if err != nil {
 		return nil
+	}
+	if len(card) > 0 {
+		if err := e.Chat.SetCard(ctx, m.ID, card); err == nil {
+			final.Card = card
+		}
 	}
 	e.publish(ctx, events.MessageCreated, uid, final)
 	e.publish(ctx, events.MessageDone, uid, final)

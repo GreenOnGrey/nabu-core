@@ -37,7 +37,12 @@ type Task struct {
 	PauseReason *string    `json:"pauseReason"`
 	LastRun     *LastRun   `json:"lastRun"`
 	CreatedAt   time.Time  `json:"createdAt"`
-	userID      uuid.UUID
+	// Kind is agent for a task created in the chat, or a prepared memory task
+	// (FTR.NAB.CMN-0003 R13, R14); PauseKind tells why a memory task waits.
+	Kind      string          `json:"kind"`
+	PauseKind *string         `json:"pauseKind"`
+	Settings  json.RawMessage `json:"settings,omitempty"`
+	userID    uuid.UUID
 }
 
 // LastRun is the outcome of the latest run.
@@ -87,7 +92,10 @@ type Service struct {
 	// the user now (FTR.NAB.CMN-0002 R5): the channel is available, Telegram is
 	// bound, the user wrote to the VK Teams bot; the reason explains a refusal.
 	Deliverable func(ctx context.Context, uid uuid.UUID, channel string) (bool, string)
-	now         func() time.Time
+	// MemoryGate checks what a memory task needs before it is switched on
+	// (FTR.NAB.CMN-0003 R13, R21): the consent and the connected sources.
+	MemoryGate func(ctx context.Context, uid uuid.UUID, kind string, settings []byte) error
+	now        func() time.Time
 }
 
 func (s *Service) clock() time.Time {
@@ -98,7 +106,7 @@ func (s *Service) clock() time.Time {
 }
 
 const taskCols = `t.id, t.user_id, t.title, t.instruction, t.schedule_kind, t.run_at, COALESCE(t.cron,''), t.timezone, t.channel, t.status,
-	t.next_run_at, t.failures, t.pause_reason, t.created_at,
+	t.next_run_at, t.failures, t.pause_reason, t.created_at, t.kind, t.pause_kind, t.settings,
 	lr.started_at, lr.status, lr.summary, lr.error_text`
 
 const taskFrom = ` FROM scheduled_tasks t LEFT JOIN LATERAL (SELECT started_at, status, summary, error_text FROM task_runs r
@@ -109,8 +117,11 @@ func scanTask(row pgx.Row) (*Task, error) {
 	var lrAt *time.Time
 	var lrStatus, lrSummary, lrErr *string
 	if err := row.Scan(&t.ID, &t.userID, &t.Title, &t.Instruction, &t.Schedule.Kind, &t.Schedule.At, &t.Schedule.Cron, &t.Schedule.Timezone,
-		&t.Channel, &t.Status, &t.NextRunAt, &t.Failures, &t.PauseReason, &t.CreatedAt, &lrAt, &lrStatus, &lrSummary, &lrErr); err != nil {
+		&t.Channel, &t.Status, &t.NextRunAt, &t.Failures, &t.PauseReason, &t.CreatedAt, &t.Kind, &t.PauseKind, &t.Settings, &lrAt, &lrStatus, &lrSummary, &lrErr); err != nil {
 		return nil, err
+	}
+	if t.Kind == KindAgent {
+		t.Settings = nil
 	}
 	t.Schedule.Human = Human(t.Schedule.Kind, t.Schedule.Cron, t.Schedule.At, t.Schedule.Timezone)
 	if lrAt != nil {
@@ -279,7 +290,7 @@ func (s *Service) Create(ctx context.Context, uid uuid.UUID, in CreateInput, def
 			return err
 		}
 		var active int
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM scheduled_tasks WHERE user_id = $1 AND status IN ('active','paused')`, uid).Scan(&active); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM scheduled_tasks WHERE user_id = $1 AND status IN ('active','paused') AND kind = 'agent'`, uid).Scan(&active); err != nil {
 			return err
 		}
 		if active >= s.Rules.MaxActive {
@@ -338,7 +349,7 @@ func (s *Service) Resume(ctx context.Context, uid, id uuid.UUID) (*Task, error) 
 			next = *t.Schedule.At
 		}
 	}
-	if _, err := s.Pool.Exec(ctx, `UPDATE scheduled_tasks SET status = 'active', failures = 0, pause_reason = NULL, next_run_at = $3
+	if _, err := s.Pool.Exec(ctx, `UPDATE scheduled_tasks SET status = 'active', failures = 0, pause_reason = NULL, pause_kind = NULL, next_run_at = $3
 		WHERE id = $1 AND user_id = $2`, id, uid, next); err != nil {
 		return nil, err
 	}
@@ -468,14 +479,17 @@ type RunInfo struct {
 	RunID, TaskID, UserID uuid.UUID
 	Title, Instruction    string
 	Channel, Status       string
+	// Kind and Settings choose who performs the run (FTR.NAB.CMN-0003 arch §1).
+	Kind     string
+	Settings json.RawMessage
 }
 
 // LoadRun loads a run that is still running.
 func (s *Service) LoadRun(ctx context.Context, runID uuid.UUID) (*RunInfo, error) {
 	var ri RunInfo
-	err := s.Pool.QueryRow(ctx, `SELECT r.id, t.id, t.user_id, t.title, t.instruction, t.channel, r.status
+	err := s.Pool.QueryRow(ctx, `SELECT r.id, t.id, t.user_id, t.title, t.instruction, t.channel, r.status, t.kind, t.settings
 		FROM task_runs r JOIN scheduled_tasks t ON t.id = r.task_id WHERE r.id = $1`, runID).
-		Scan(&ri.RunID, &ri.TaskID, &ri.UserID, &ri.Title, &ri.Instruction, &ri.Channel, &ri.Status)
+		Scan(&ri.RunID, &ri.TaskID, &ri.UserID, &ri.Title, &ri.Instruction, &ri.Channel, &ri.Status, &ri.Kind, &ri.Settings)
 	if postgres.IsNoRows(err) {
 		return nil, nil
 	}
@@ -635,6 +649,7 @@ func (s *Service) Routes(r chi.Router) {
 		})
 	}
 	r.Post("/tasks/{id}/cancel", action(s.Cancel))
+	r.Post("/tasks/{id}/pause", action(s.Pause))
 	r.Post("/tasks/{id}/resume", action(s.Resume))
 }
 
@@ -647,7 +662,11 @@ func describe(t *Task) string {
 		}
 		next = t.NextRunAt.In(loc).Format("2006-01-02 15:04") + " " + t.Schedule.Timezone
 	}
-	return fmt.Sprintf("Task %s %q: %s; schedule: %s; next run: %s; channel: %s", t.ID, t.Title, t.Status, t.Schedule.Human, next, t.Channel)
+	kind := ""
+	if t.Kind != KindAgent {
+		kind = " (prepared memory task, managed in the Memory section)"
+	}
+	return fmt.Sprintf("Task %s %q%s: %s; schedule: %s; next run: %s; channel: %s", t.ID, t.Title, kind, t.Status, t.Schedule.Human, next, t.Channel)
 }
 
 // Tools are task_create, task_list and task_cancel of the built-in MCP.
@@ -706,6 +725,10 @@ func (s *Service) Tools() []mcp.Tool {
 				id, err := uuid.Parse(in.ID)
 				if err != nil {
 					return "", &mcp.ToolError{Msg: "invalid id"}
+				}
+				if cur, err := s.Get(ctx, g.UserID, id); err == nil && cur.Kind != KindAgent {
+					// FTR.NAB.CMN-0003 tech §5.2: memory_task_locked
+					return "", &mcp.ToolError{Msg: "This is a prepared memory task: it is switched on and off in the Memory section, not cancelled here. Tell the user to open Memory → Memory tasks."}
 				}
 				t, err := s.Cancel(ctx, g.UserID, id)
 				if err != nil {

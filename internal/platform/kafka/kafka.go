@@ -29,10 +29,14 @@ const (
 	TopicTaskRun = "nabu.task.run"
 	// TopicRuns: a run of a service agent requested by a client.
 	TopicRuns = "nabu.runs"
+	// TopicMemoryCollect: a batch of threads for a run of the collector of
+	// communications (FTR.NAB.CMN-0003 arch §2); key — user id, so the
+	// batches of a user go one after another.
+	TopicMemoryCollect = "nabu.memory.collect"
 )
 
 // AllTopics lists every topic of Nabu.
-var AllTopics = []string{TopicInbound, TopicOutbound, TopicTaskRun, TopicRuns}
+var AllTopics = []string{TopicInbound, TopicOutbound, TopicTaskRun, TopicRuns, TopicMemoryCollect}
 
 // Publisher publishes keyed messages.
 type Publisher interface {

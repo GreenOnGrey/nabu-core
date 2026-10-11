@@ -63,12 +63,15 @@ type Message struct {
 	Attachments    []Attachment    `json:"attachments"`
 	ToolSteps      []ToolStep      `json:"toolSteps"`
 	Context        json.RawMessage `json:"context,omitempty"`
-	Model          *string         `json:"model"`
-	ErrorClass     *string         `json:"errorClass"`
-	ErrorText      *string         `json:"errorText"`
-	Retryable      bool            `json:"retryable,omitempty"`
-	ReplyTo        *uuid.UUID      `json:"replyTo"`
-	CreatedAt      time.Time       `json:"createdAt"`
+	// Card is the structured part of a message the web chat draws instead of
+	// the text: the digest of commitments (FTR.NAB.CMN-0003 tech §3.5).
+	Card       json.RawMessage `json:"card,omitempty"`
+	Model      *string         `json:"model"`
+	ErrorClass *string         `json:"errorClass"`
+	ErrorText  *string         `json:"errorText"`
+	Retryable  bool            `json:"retryable,omitempty"`
+	ReplyTo    *uuid.UUID      `json:"replyTo"`
+	CreatedAt  time.Time       `json:"createdAt"`
 }
 
 // Store is the conversation repository.
@@ -181,14 +184,17 @@ func (s *Store) ArchiveIdle(ctx context.Context, after time.Duration) ([]uuid.UU
 }
 
 const msgCols = `m.id, m.conversation_id, m.role, m.text, m.channel, m.status, m.attachments, m.tool_steps, m.context, m.model,
-	m.error_class, m.error_text, m.reply_to, m.created_at`
+	m.error_class, m.error_text, m.reply_to, m.created_at, m.card`
 
 func scanMsg(row pgx.Row) (*Message, error) {
 	var m Message
-	var atts, steps, ctxb []byte
+	var atts, steps, ctxb, card []byte
 	if err := row.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Text, &m.Channel, &m.Status, &atts, &steps, &ctxb, &m.Model,
-		&m.ErrorClass, &m.ErrorText, &m.ReplyTo, &m.CreatedAt); err != nil {
+		&m.ErrorClass, &m.ErrorText, &m.ReplyTo, &m.CreatedAt, &card); err != nil {
 		return nil, err
+	}
+	if len(card) > 0 {
+		m.Card = card
 	}
 	_ = json.Unmarshal(atts, &m.Attachments)
 	_ = json.Unmarshal(steps, &m.ToolSteps)
@@ -270,6 +276,12 @@ func (s *Store) Finish(ctx context.Context, id uuid.UUID, text, status string, s
 		_, _ = s.Pool.Exec(ctx, `UPDATE conversations SET last_message_at = now() WHERE id = $1`, m.ConversationID)
 	}
 	return m, err
+}
+
+// SetCard attaches a card to a message (the digest of commitments).
+func (s *Store) SetCard(ctx context.Context, id uuid.UUID, card json.RawMessage) error {
+	_, err := s.Pool.Exec(ctx, `UPDATE messages SET card = $2 WHERE id = $1`, id, []byte(card))
+	return err
 }
 
 // History returns the latest messages of a conversation, oldest first.

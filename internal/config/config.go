@@ -110,11 +110,23 @@ type Config struct {
 	AuditRetention    time.Duration
 	TopicArchiveAfter time.Duration
 
-	TaskTick          time.Duration
-	TaskRunTimeout    time.Duration
-	TaskMinInterval   time.Duration
-	TaskMaxActive     int
-	TaskMaxFailures   int
+	TaskTick        time.Duration
+	TaskRunTimeout  time.Duration
+	TaskMinInterval time.Duration
+	TaskMaxActive   int
+	TaskMaxFailures int
+	// FTR.NAB.CMN-0003 tech §12: the memory of communications.
+	MemoryGraphMaxNodes      int
+	MemoryCollectConcurrency int
+	MemoryBatchThreads       int
+	MemoryRunTimeout         time.Duration
+	MemoryBackfillDays       int
+	MemoryHousekeepingEvery  time.Duration
+	MemoryBackfillPoolShare  float64
+	MemoryEmbedBatch         int
+	MemoryGmailOverlap       time.Duration
+	// MemoryAgentAddr is the pool of the collector agent (agent-memory); empty — the common pool.
+	MemoryAgentAddr   string
 	TaskCatchupWindow time.Duration
 	DefaultTimezone   string
 	DefaultLanguage   string
@@ -293,7 +305,14 @@ func Load() (*Config, error) {
 
 		TaskTick: p.dur("TASK_TICK", "15s"), TaskRunTimeout: p.dur("TASK_RUN_TIMEOUT", "30m"),
 		TaskMinInterval: p.dur("TASK_MIN_INTERVAL", "15m"), TaskMaxActive: p.int("TASK_MAX_ACTIVE", 20),
-		TaskMaxFailures: p.int("TASK_MAX_FAILURES", 3), TaskCatchupWindow: p.dur("TASK_CATCHUP_WINDOW", "1h"),
+		MemoryGraphMaxNodes:      p.int("MEMORY_GRAPH_MAX_NODES", 150),
+		MemoryCollectConcurrency: p.int("MEMORY_COLLECT_CONCURRENCY", 40), MemoryBatchThreads: p.int("MEMORY_BATCH_THREADS", 20),
+		MemoryRunTimeout: p.dur("MEMORY_RUN_TIMEOUT", "10m"), MemoryBackfillDays: p.int("MEMORY_BACKFILL_DAYS", 30),
+		MemoryHousekeepingEvery: p.dur("MEMORY_HOUSEKEEPING_EVERY", "10m"),
+		MemoryBackfillPoolShare: p.float("MEMORY_BACKFILL_POOL_SHARE", 0.3), MemoryEmbedBatch: p.int("MEMORY_EMBED_BATCH", 64),
+		MemoryGmailOverlap: p.dur("MEMORY_GMAIL_OVERLAP", "24h"),
+		MemoryAgentAddr:    strings.TrimRight(os.Getenv("MEMORY_AGENT_ADDR"), "/"),
+		TaskMaxFailures:    p.int("TASK_MAX_FAILURES", 3), TaskCatchupWindow: p.dur("TASK_CATCHUP_WINDOW", "1h"),
 		DefaultTimezone: env("DEFAULT_TIMEZONE", "Europe/Moscow"), DefaultLanguage: env("DEFAULT_LANGUAGE", "en"),
 
 		RunWorkspaceWait: p.dur("RUN_WORKSPACE_WAIT", "120s"), UploadMaxBytes: p.bytes("UPLOAD_MAX_BYTES", "50MB"),

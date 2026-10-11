@@ -99,6 +99,10 @@ type Service struct {
 	GitToken string
 
 	userEmail UserEmail
+	// MemoryRun checks a call of a run of the collector of communications
+	// (FTR.NAB.CMN-0003 tech §6.4): it returns the tools the run may see, or
+	// the reason the call is refused.
+	MemoryRun func(ctx context.Context, uid, run, item uuid.UUID, method, tool string, args json.RawMessage) (tools []string, refusal string)
 }
 
 var nameRe = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)

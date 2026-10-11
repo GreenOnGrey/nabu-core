@@ -31,8 +31,12 @@ const (
 	TaskUpdated         = "task.updated"
 	TaskRunFinished     = "task.run.finished"
 	MemoryChanged       = "memory.changed"
-	AgentUpdated        = "agent.updated"
-	ConnectionsChanged  = "connections.changed"
+	// FTR.NAB.CMN-0003 tech §3.5: the memory of communications.
+	CommChanged        = "comm.changed"
+	CommitmentsChanged = "commitments.changed"
+	CommCollect        = "comm.collect"
+	AgentUpdated       = "agent.updated"
+	ConnectionsChanged = "connections.changed"
 	// RunEvent carries one event of a service agent run (client API §5).
 	RunEvent = "run.event"
 )

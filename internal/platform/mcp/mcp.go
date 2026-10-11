@@ -27,7 +27,15 @@ type Grant struct {
 	Conversation uuid.UUID // the conversation of the session (uuid.Nil for task runs)
 	Channel      string    // channel of the current message: the default delivery of tasks
 	TaskID       uuid.UUID // set in task runs
+	// Scope is empty for a session of a personal or a group agent and
+	// ScopeMemoryRun for a run of the collector of communications, which gets
+	// only the tools of that scope (FTR.NAB.CMN-0003 tech §5); RunID is its run.
+	Scope string
+	RunID uuid.UUID
 }
+
+// ScopeMemoryRun is the scope of the token of a collector run.
+const ScopeMemoryRun = "memory-run"
 
 // Tool is an MCP tool.
 type Tool struct {
@@ -35,8 +43,19 @@ type Tool struct {
 	Description string
 	InputSchema map[string]any
 	ReadOnly    bool
+	// Scope is the scope of sessions the tool is for: a tool is offered only
+	// to grants of its scope.
+	Scope string
+	// Available hides the tool from the sessions it is not for (nil — for
+	// everybody): the tools of the memory of communications exist only for
+	// users who switched it on (FTR.NAB.CMN-0003 R22, tech §5.2).
+	Available func(ctx context.Context, g Grant) bool
 	// Summary renders the step shown in the chat ("Memory: saved …").
 	Handler func(ctx context.Context, g Grant, args json.RawMessage) (string, error)
+}
+
+func (t Tool) offered(ctx context.Context, g Grant) bool {
+	return t.Scope == g.Scope && (t.Available == nil || t.Available(ctx, g))
 }
 
 // ToolError is a tool failure reported to the agent as isError content.
@@ -61,7 +80,7 @@ type Server struct {
 // Execute runs a tool for a grant (a confirmed call, tech §6).
 func (s *Server) Execute(ctx context.Context, g Grant, name string, args json.RawMessage) (string, bool, error) {
 	for _, t := range s.tools {
-		if t.Name == name {
+		if t.Name == name && t.offered(ctx, g) {
 			out, err := t.Handler(ctx, g, args)
 			if err != nil {
 				return err.Error(), true, nil
@@ -104,6 +123,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	g.UserID, _ = uuid.Parse(c.User)
 	g.Conversation, _ = uuid.Parse(c.Conversation)
 	g.TaskID, _ = uuid.Parse(c.Task)
+	if c.HasScope(ScopeMemoryRun) {
+		g.Scope = ScopeMemoryRun
+		g.RunID, _ = uuid.Parse(c.Run)
+	}
 	if g.Channel == "" && g.Conversation != uuid.Nil && s.ChannelOf != nil {
 		g.Channel = s.ChannelOf(r.Context(), g.Conversation)
 	}
@@ -168,6 +191,9 @@ func (s *Server) dispatch(ctx context.Context, g Grant, req request) (any, *rpcE
 	case "tools/list":
 		list := []map[string]any{}
 		for _, t := range s.tools {
+			if !t.offered(ctx, g) {
+				continue
+			}
 			item := map[string]any{"name": t.Name, "description": t.Description, "inputSchema": t.InputSchema}
 			if t.ReadOnly {
 				item["annotations"] = map[string]any{"readOnlyHint": true}
@@ -187,7 +213,7 @@ func (s *Server) dispatch(ctx context.Context, g Grant, req request) (any, *rpcE
 			p.Arguments = json.RawMessage("{}")
 		}
 		for _, t := range s.tools {
-			if t.Name != p.Name {
+			if t.Name != p.Name || !t.offered(ctx, g) {
 				continue
 			}
 			if !t.ReadOnly && s.Hold != nil {

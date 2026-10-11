@@ -208,6 +208,10 @@ const agentSelect = `SELECT a.name, a.config, a.enabled, a.updated_at,
 	COALESCE((SELECT array_agg(c.name ORDER BY c.name) FROM service_clients c WHERE a.name = ANY(c.agents)), '{}')
 	FROM service_agents a`
 
+// notBuiltin hides the agents shipped with the release (FTR.NAB.CMN-0003 arch
+// §3.3: memory-collector): their instructions and tools are not edited.
+const notBuiltin = `a.config->>'builtin' IS NULL`
+
 func scanAgent(row pgx.Row) (*Agent, error) {
 	var a Agent
 	var cfg []byte
@@ -226,7 +230,7 @@ func scanAgent(row pgx.Row) (*Agent, error) {
 
 // List lists the service agents.
 func (s *Service) List(ctx context.Context) ([]Agent, error) {
-	rows, err := s.Pool.Query(ctx, agentSelect+` ORDER BY a.name`)
+	rows, err := s.Pool.Query(ctx, agentSelect+` WHERE `+notBuiltin+` ORDER BY a.name`)
 	if err != nil {
 		return nil, err
 	}
@@ -244,7 +248,7 @@ func (s *Service) List(ctx context.Context) ([]Agent, error) {
 
 // Get loads a service agent.
 func (s *Service) Get(ctx context.Context, name string) (*Agent, error) {
-	a, err := scanAgent(s.Pool.QueryRow(ctx, agentSelect+` WHERE a.name = $1`, name))
+	a, err := scanAgent(s.Pool.QueryRow(ctx, agentSelect+` WHERE a.name = $1 AND `+notBuiltin, name))
 	if postgres.IsNoRows(err) {
 		return nil, apperr.NotFound("not_found", "service agent not found")
 	}

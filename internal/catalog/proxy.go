@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -35,11 +37,16 @@ type Hold func(ctx context.Context, conv, uid uuid.UUID, item uuid.UUID, server,
 // catalog as sessions see them. The proxy checks the session token, adds the
 // user's or the platform credentials and filters tools of read-only items.
 func (s *Service) ProxyRoutes(r chi.Router, userEmail UserEmail, hold Hold) {
-	s.userEmail = userEmail
+	s.SetUserEmail(userEmail)
 	r.HandleFunc("/internal/v1/mcp-proxy/{item}", func(w http.ResponseWriter, r *http.Request) {
 		s.proxy(w, r, hold)
 	})
 }
+
+// SetUserEmail tells the catalog how to find the email of a user and whether
+// the user may use the agent: the worker calls sources without the proxy
+// routes (FTR.NAB.CMN-0003 arch §3.1).
+func (s *Service) SetUserEmail(fn UserEmail) { s.userEmail = fn }
 
 // delegationHeaders sign a Nabu JWT for the product of a delegation item and
 // name the user (R23: the product checks the signature by Nabu's JWKS).
@@ -181,6 +188,36 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 			"isError": true, "content": []map[string]string{{"type": "text", "text": readOnlyRefusal(call.Params.Name)}}}})
 		return
 	}
+	// FTR.NAB.CMN-0003 tech §6.4: a run of the collector of communications
+	// reaches only the item of its batch, only the read tools of the adapter
+	// and only the threads of the batch.
+	var only []string
+	if c.HasScope(mcp.ScopeMemoryRun) {
+		run, _ := uuid.Parse(c.Run)
+		var p struct {
+			ID     json.RawMessage `json:"id"`
+			Params struct {
+				Arguments json.RawMessage `json:"arguments"`
+			} `json:"params"`
+		}
+		_ = json.Unmarshal(body, &p)
+		if s.MemoryRun == nil {
+			rpcError(w, http.StatusForbidden, "collector runs are not enabled")
+			return
+		}
+		tools, reason := s.MemoryRun(r.Context(), uid, run, it.ID, call.Method, call.Params.Name, p.Params.Arguments)
+		if reason != "" {
+			if call.Method != "tools/call" {
+				rpcError(w, http.StatusForbidden, reason)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": p.ID, "result": map[string]any{
+				"isError": true, "content": []map[string]string{{"type": "text", "text": reason}}}})
+			return
+		}
+		only = tools
+	}
 	conv, _ := uuid.Parse(c.Conversation)
 	if hold != nil && conv != uuid.Nil && uid != uuid.Nil && call.Method == "tools/call" && !s.readOnlyTool(it, call.Params.Name) {
 		// R9: in a mail topic a call that changes data waits for the user (ML-17, ML-20)
@@ -223,7 +260,8 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 			w.Header().Set(h, v)
 		}
 	}
-	filter := it.ReadOnly && call.Method == "tools/list"
+	filter := (it.ReadOnly || only != nil) && call.Method == "tools/list"
+	filterTools := func(raw []byte) []byte { return filterToolsBy(raw, only) }
 	w.WriteHeader(resp.StatusCode)
 	if !filter {
 		fl, _ := w.(http.Flusher)
@@ -279,7 +317,9 @@ func (s *Service) readOnlyTool(it *Item, name string) bool {
 }
 
 // filterTools keeps only tools with readOnlyHint in a tools/list result (CAT-04).
-func filterTools(raw []byte) []byte {
+// filterToolsBy keeps the tools of a tools/list answer: the read-only ones,
+// or — with names — only the named ones (a collector run, FTR.NAB.CMN-0003).
+func filterToolsBy(raw []byte, names []string) []byte {
 	var msg map[string]json.RawMessage
 	if json.Unmarshal(raw, &msg) != nil {
 		return raw
@@ -302,6 +342,16 @@ func filterTools(raw []byte) []byte {
 			ReadOnlyHint *bool `json:"readOnlyHint"`
 		}
 		_ = json.Unmarshal(t["annotations"], &ann)
+		if names != nil {
+			var name string
+			_ = json.Unmarshal(t["name"], &name)
+			for _, n := range names {
+				if n == name {
+					kept = append(kept, t)
+				}
+			}
+			continue
+		}
 		if ann.ReadOnlyHint != nil && *ann.ReadOnlyHint {
 			kept = append(kept, t)
 		}
@@ -310,4 +360,40 @@ func filterTools(raw []byte) []byte {
 	msg["result"], _ = json.Marshal(r)
 	out, _ := json.Marshal(msg)
 	return out
+}
+
+// ErrSourceAccess reports that the personal access of the user to the server
+// was revoked, expired or refused (FTR.NAB.CMN-0003 R17).
+var ErrSourceAccess = errors.New("no access to the source")
+
+// CallSource calls a tool of a personal MCP server with the access of the
+// user, outside a session of an agent: the adapters of the sources of
+// communications learn what changed with it (FTR.NAB.CMN-0003 arch §3.1).
+// It returns the text of the result.
+func (s *Service) CallSource(ctx context.Context, uid, itemID uuid.UUID, tool string, args json.RawMessage) (string, error) {
+	it, err := s.Get(ctx, itemID)
+	if err != nil {
+		return "", err
+	}
+	if !it.Published || it.InDevelopment {
+		return "", ErrUnavailable()
+	}
+	headers, perr := s.itemHeaders(ctx, it, uid)
+	if perr != nil {
+		if perr.status == http.StatusUnauthorized || perr.status == http.StatusForbidden {
+			return "", ErrSourceAccess
+		}
+		return "", errors.New(perr.msg)
+	}
+	text, isErr, err := mcp.CallTool(ctx, it.Source.URL, headers, tool, args)
+	if err != nil {
+		if strings.Contains(err.Error(), "HTTP 401") || strings.Contains(err.Error(), "HTTP 403") {
+			return "", ErrSourceAccess
+		}
+		return "", err
+	}
+	if isErr {
+		return "", fmt.Errorf("the tool %s failed: %s", tool, text)
+	}
+	return text, nil
 }

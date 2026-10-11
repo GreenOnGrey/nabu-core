@@ -36,6 +36,8 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/channels/email"
 	"github.com/GreenOnGrey/nabu-core/internal/chat"
 	"github.com/GreenOnGrey/nabu-core/internal/clients"
+	"github.com/GreenOnGrey/nabu-core/internal/collect"
+	"github.com/GreenOnGrey/nabu-core/internal/comm"
 	"github.com/GreenOnGrey/nabu-core/internal/config"
 	"github.com/GreenOnGrey/nabu-core/internal/confirm"
 	"github.com/GreenOnGrey/nabu-core/internal/domain"
@@ -78,6 +80,7 @@ type core struct {
 	models   *models.Service
 	catalog  *catalog.Service
 	memory   *memory.Service
+	comm     *comm.Service
 	tasks    *tasks.Service
 	space    *space.Service
 	chat     *chat.Store
@@ -129,8 +132,35 @@ func newCore(ctx context.Context, cfg *config.Config) (*core, error) {
 			return &r, err
 		}}
 	c.memory = &memory.Service{Pool: pool, Events: pub}
+	c.comm = &comm.Service{Pool: pool, Events: pub}
+	c.comm.Embedder = func(ctx context.Context) *comm.Embedder {
+		// FTR.NAB.CMN-0003 R20: the model of embeddings is a model of a connection
+		st, err := c.comm.LoadSettings(ctx)
+		if err != nil || st.Embeddings == nil {
+			return nil
+		}
+		id, err := uuid.Parse(st.Embeddings.ConnectionID)
+		if err != nil {
+			return nil
+		}
+		spec, key, err := c.models.Resolve(ctx, models.Choice{ConnectionID: id, Model: st.Embeddings.Model})
+		if err != nil {
+			return nil
+		}
+		return &comm.Embedder{BaseURL: spec.BaseURL, Key: key, Model: spec.ModelID}
+	}
+	c.comm.EnsureVectors(ctx)
+	c.catalog.SetUserEmail(c.userEmail)
+	c.catalog.MemoryRun = c.comm.ProxyGuard // FTR.NAB.CMN-0003 tech §6.4
 	c.tasks = &tasks.Service{Pool: pool, Events: pub, Bus: producer, Rules: tasks.Rules{MinInterval: cfg.TaskMinInterval, MaxActive: cfg.TaskMaxActive},
 		Catchup: cfg.TaskCatchupWindow, Tick: cfg.TaskTick, MaxFailures: cfg.TaskMaxFailures, DefaultTimezone: cfg.DefaultTimezone}
+	// FTR.NAB.CMN-0003 R13, R21: the collection needs the consent and connected sources
+	c.tasks.MemoryGate = func(ctx context.Context, uid uuid.UUID, kind string, settings []byte) error {
+		if kind != tasks.KindCollect {
+			return nil
+		}
+		return c.comm.CheckCollect(ctx, uid, settings)
+	}
 	c.space = &space.Service{Pool: pool, S3: s3, Signer: signer, Events: pub, Quota: cfg.SpaceQuota, MaxFile: cfg.UploadMaxBytes,
 		Enabled: cfg.SandboxExecutor == "k8s"}
 	c.chat = &chat.Store{Pool: pool}
@@ -492,7 +522,12 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 				r.Use(auth.RequireActive)
 				chatAPI.Routes(r, true)
 				c.memory.Routes(r)
+				c.commAPI(cfg).Routes(r)
 				c.tasks.Routes(r)
+				c.tasks.MemoryRoutes(r, func(ctx context.Context) error {
+					_, err := c.comm.Allowed(ctx)
+					return err
+				})
 				c.space.Routes(r)
 				c.catalog.Routes(r)
 				c.chanAPI.Routes(r)
@@ -515,6 +550,7 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 		c.mail.LogRoute(r)
 		c.accounts.AdminRoutes(r)
 		c.groups.AdminRoutes(r, allowedModel)
+		c.comm.AdminRoutes(r)
 		(&agentpods.Admin{Pool: c.pool, Local: cfg.AgentExecutor != "k8s", Audit: func(ctx context.Context, admin, owner uuid.UUID, title string) {
 			args, _ := json.Marshal(map[string]any{"owner": owner, "title": title})
 			c.ledger.Audit(ctx, ledger.Entry{AgentKind: "personal", Agent: "nabu", UserID: &admin, Channel: "admin", Tool: "agent_pod.stop", Result: "ok"}, string(args), nil)
@@ -551,6 +587,14 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 	builtin.Register(c.memory.Tools()...)
 	builtin.Register(c.space.Tool())
 	builtin.Register(c.tasks.Tools()...)
+	builtin.Register(c.comm.Tools(func(id uuid.UUID) string {
+		return strings.TrimRight(cfg.PublicWebURL, "/") + "/memory?tab=comm&note=" + id.String()
+	}, c.userToday)...)
+	builtin.Register(c.comm.CollectTools(func(ctx context.Context, uid uuid.UUID) comm.UserInfo {
+		info := comm.UserInfo{Timezone: c.userLocation(ctx, uid).String()}
+		info.Email, _ = c.userEmail(ctx, uid)
+		return info
+	})...)
 	builtin.Allowed = c.users.Allowed
 	builtin.ChannelOf = c.chat.LastUserChannel
 	// R9: in mail topics tools that change data wait for the user
@@ -560,13 +604,7 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 	internal := chi.NewRouter()
 	internal.Use(httpx.Observe)
 	internal.Handle("/internal/v1/mcp", builtin)
-	c.catalog.ProxyRoutes(internal, func(ctx context.Context, uid uuid.UUID) (string, bool) {
-		u, err := c.users.Get(ctx, uid)
-		if err != nil || u == nil || u.Status == "blocked" || u.Status == "archived" {
-			return "", false
-		}
-		return u.Email, true
-	}, func(ctx context.Context, conv, uid, item uuid.UUID, server, tool string, args json.RawMessage) (string, bool) {
+	c.catalog.ProxyRoutes(internal, c.userEmail, func(ctx context.Context, conv, uid, item uuid.UUID, server, tool string, args json.RawMessage) (string, bool) {
 		return confirms.Hold(ctx, conv, uid, &item, server, tool, args)
 	})
 	c.space.InternalRoutes(internal)
@@ -606,7 +644,7 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 	eng := &engine.Engine{
 		Cfg: engine.Config{InternalURL: cfg.InternalURL, RelayInternalURL: cfg.RelayInternalURL, TurnTimeout: cfg.TurnTimeout,
 			TaskRunTimeout: cfg.TaskRunTimeout, RunWorkspaceWait: cfg.RunWorkspaceWait, SessionMaxAge: 12 * time.Hour, PiVersion: cfg.PiVersion},
-		Pool: c.pool, Op: c.operator, Users: c.users, Chat: c.chat, Models: c.models, Catalog: c.catalog, Memory: c.memory, Tasks: c.tasks,
+		Pool: c.pool, Op: c.operator, Users: c.users, Chat: c.chat, Models: c.models, Catalog: c.catalog, Memory: c.memory, Tasks: c.tasks, Comm: c.comm,
 		Space: c.space, Sandboxes: sandboxes, Services: c.services, Ledger: c.ledger, Signer: c.signer, S3: c.s3, Events: c.events,
 		Bus: c.producer, Adapters: adapters, Registry: c.registry, Keys: c.keys, Groups: c.groups, Mail: c.mail,
 		Connected: func(ctx context.Context, id string) bool {
@@ -617,6 +655,14 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 	c.accounts.Sandboxes = sandboxStopper{sandboxes}
 	c.accounts.CloseSessions = eng.CloseSessions
 	// FTR.NAB.CMN-0004: conversations and tasks run in the pod of their owner.
+	eng.Collector = eng
+	collect.SetGmailOverlap(cfg.MemoryGmailOverlap)
+	eng.CollectCfg = engine.CollectConfig{BatchThreads: cfg.MemoryBatchThreads, RunTimeout: cfg.MemoryRunTimeout, BackfillDays: cfg.MemoryBackfillDays,
+		BackfillSlots: max(1, int(float64(cfg.MemoryCollectConcurrency)*cfg.MemoryBackfillPoolShare)),
+		BotAddresses:  c.botAddresses}
+	if cfg.MemoryAgentAddr != "" {
+		eng.MemoryOp = &agent.Client{BaseURL: cfg.MemoryAgentAddr, Token: cfg.AgentServiceToken}
+	}
 	pods := &agentpods.Manager{Cfg: podsConfig(cfg), Pool: c.pool, Signer: c.signer, Bus: c.producer, Events: c.events, Shared: c.operator,
 		Expire: eng.QueueExpired, Notify: eng.QueueNotify, Waiting: eng.QueueTyping}
 	if !pods.Cfg.Local {
@@ -649,6 +695,41 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 	})
 	g.Go(func() error {
 		return kafka.ConsumeParallel(gctx, cfg.KafkaBrokers, "nabu-worker", kafka.TopicRuns, 2, eng.HandleRun)
+	})
+	g.Go(func() error {
+		return kafka.ConsumeParallel(gctx, cfg.KafkaBrokers, "nabu-worker", kafka.TopicMemoryCollect, cfg.MemoryCollectConcurrency, eng.HandleCollectBatch)
+	})
+	g.Go(func() error { // FTR.NAB.CMN-0003 R17: resume the collections whose pause is over
+		t := time.NewTicker(cfg.MemoryHousekeepingEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-gctx.Done():
+				return nil
+			case <-t.C:
+				eng.MemoryHousekeeping(gctx)
+			}
+		}
+	})
+	g.Go(func() error { // the vectors of new and changed notes, and the recount after a change of the model
+		for {
+			n, err := c.comm.EmbedPending(gctx, cfg.MemoryEmbedBatch)
+			if err != nil && gctx.Err() == nil {
+				slog.Warn("embed notes", "err", err)
+			}
+			if pending, err := c.comm.PendingVectors(gctx); err == nil {
+				metrics.MemoryEmbedPending.Set(float64(pending))
+			}
+			wait := 15 * time.Second
+			if n > 0 && err == nil {
+				wait = 200 * time.Millisecond // more may be waiting
+			}
+			select {
+			case <-gctx.Done():
+				return nil
+			case <-time.After(wait):
+			}
+		}
 	})
 	g.Go(func() error { c.tasks.Run(gctx); return nil })
 	g.Go(func() error { pods.Run(gctx); return nil }) // one manager of agent pods per instance (advisory lock)
@@ -801,6 +882,12 @@ func RunCleaner(ctx context.Context, cfg *config.Config) error {
 		}
 		slog.Info("cleaned", "what", name, "rows", tag.RowsAffected())
 	}
+	// FTR.NAB.CMN-0003 R23: the retention of the notes of communications
+	if purged, err := (&comm.Service{Pool: pool}).Purge(ctx); err != nil {
+		return fmt.Errorf("communications: %w", err)
+	} else {
+		slog.Info("cleaned", "what", "communications", "notes", purged.Notes, "people", purged.People, "topics", purged.Topics)
+	}
 	// the mail log is kept as long as the audit (arch §8)
 	if _, err := pool.Exec(ctx, `DELETE FROM email_log WHERE at < now() - make_interval(secs => $1)`, cfg.AuditRetention.Seconds()); err != nil {
 		return fmt.Errorf("mail log: %w", err)
@@ -815,4 +902,93 @@ func podsConfig(cfg *config.Config) agentpods.Config {
 		IdleTimeout: cfg.AgentPodIdleTimeout, MinIdle: cfg.AgentPodMinIdle, PodsMax: cfg.AgentPodsMax, StartParallel: cfg.AgentStartParallel,
 		StartTimeout: cfg.AgentStartTimeout, ScheduleTimeout: cfg.AgentScheduleTimeout, QueueTimeout: cfg.AgentQueueTimeout,
 		TurnTimeout: max(cfg.TurnTimeout, cfg.TaskRunTimeout), WarmWindow: cfg.AgentWarmWindow, WarmShare: cfg.AgentWarmShare, WarmMax: cfg.AgentWarmMax}
+}
+
+// userLocation is the time zone of a user: "today" of their commitments.
+func (c *core) userLocation(ctx context.Context, uid uuid.UUID) *time.Location {
+	if u, err := c.users.Get(ctx, uid); err == nil && u != nil && u.Timezone != "" {
+		if loc, err := time.LoadLocation(u.Timezone); err == nil {
+			return loc
+		}
+	}
+	return time.UTC
+}
+
+func (c *core) userToday(ctx context.Context, uid uuid.UUID) time.Time {
+	return time.Now().In(c.userLocation(ctx, uid))
+}
+
+// commAPI is the API of the memory of communications (FTR.NAB.CMN-0003 tech §3).
+func (c *core) commAPI(cfg *config.Config) *comm.API {
+	return &comm.API{Store: c.comm, Sources: c.commSources, Timezone: c.userLocation, GraphMaxNodes: cfg.MemoryGraphMaxNodes, Semantic: c.comm.Semantic,
+		Collect: func(ctx context.Context, uid uuid.UUID) (comm.CollectState, error) {
+			st := comm.CollectState{Status: "off"}
+			mt, err := c.tasks.MemoryTaskOf(ctx, uid, tasks.KindCollect)
+			if err != nil {
+				return st, err
+			}
+			st.Status, st.PauseKind, st.NextRunAt = mt.Status, mt.PauseKind, mt.NextRunAt
+			if st.Backfill, err = c.comm.Backfill(ctx, uid); err != nil {
+				return st, err
+			}
+			st.BudgetUsedPct, err = c.comm.BudgetUsedPct(ctx, uid)
+			return st, err
+		},
+		OnDeleteAll: func(ctx context.Context, uid uuid.UUID) {
+			if err := c.tasks.DisableMemoryTasks(ctx, uid); err != nil {
+				slog.ErrorContext(ctx, "switch the memory tasks off", "user", uid, "err", err)
+			}
+		}}
+}
+
+// commSources marks the sources the collection of the user reads.
+func (c *core) commSources(ctx context.Context, uid uuid.UUID) ([]comm.SourceState, error) {
+	src, err := c.comm.Sources(ctx, uid)
+	if err != nil {
+		return nil, err
+	}
+	mt, err := c.tasks.MemoryTaskOf(ctx, uid, tasks.KindCollect)
+	if err != nil {
+		return nil, err
+	}
+	var set tasks.CollectSettings
+	_ = json.Unmarshal(mt.Settings, &set)
+	for i := range src {
+		for _, on := range set.Sources {
+			if mt.Enabled && on.ItemID == src[i].ItemID && on.Source == src[i].Source {
+				src[i].Enabled = true
+			}
+		}
+	}
+	return src, nil
+}
+
+// userEmail is the email of a user who may use the agent.
+func (c *core) userEmail(ctx context.Context, uid uuid.UUID) (string, bool) {
+	u, err := c.users.Get(ctx, uid)
+	if err != nil || u == nil || u.Status == "blocked" || u.Status == "archived" {
+		return "", false
+	}
+	return u.Email, true
+}
+
+// botAddresses are the mailbox of the Nabu bot and its aliases: the letters
+// to and from the bot are not collected (FTR.NAB.CMN-0003 R4).
+func (c *core) botAddresses(ctx context.Context) []string {
+	var raw []byte
+	if err := c.pool.QueryRow(ctx, `SELECT settings FROM channels WHERE kind = 'email'`).Scan(&raw); err != nil {
+		return nil
+	}
+	var set struct {
+		Mailbox string   `json:"mailbox"`
+		Aliases []string `json:"aliases"`
+	}
+	_ = json.Unmarshal(raw, &set)
+	out := []string{}
+	for _, a := range append([]string{set.Mailbox}, set.Aliases...) {
+		if a != "" {
+			out = append(out, a)
+		}
+	}
+	return out
 }

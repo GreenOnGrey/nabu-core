@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,6 +20,7 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/catalog"
 	"github.com/GreenOnGrey/nabu-core/internal/channels"
 	"github.com/GreenOnGrey/nabu-core/internal/chat"
+	"github.com/GreenOnGrey/nabu-core/internal/comm"
 	"github.com/GreenOnGrey/nabu-core/internal/domain"
 	"github.com/GreenOnGrey/nabu-core/internal/groups"
 	"github.com/GreenOnGrey/nabu-core/internal/ledger"
@@ -59,22 +61,30 @@ type Engine struct {
 	Op   Operator
 	// Pods gives the pod of an owner for a turn of a conversation or a task
 	// (FTR.NAB.CMN-0004); nil runs everything in Op.
-	Pods      *agentpods.Manager
-	Users     *users.Repo
-	Chat      *chat.Store
-	Models    *models.Service
-	Catalog   *catalog.Service
-	Memory    *memory.Service
-	Tasks     *tasks.Service
-	Space     *space.Service
-	Sandboxes *space.Sandboxes
-	Services  *services.Service
-	Ledger    *ledger.Ledger
-	Signer    *jwt.Signer
-	S3        storage.Storage
-	Events    events.Publisher
-	Bus       kafka.Publisher
-	Adapters  map[string]channels.Adapter
+	Pods    *agentpods.Manager
+	Users   *users.Repo
+	Chat    *chat.Store
+	Models  *models.Service
+	Catalog *catalog.Service
+	Memory  *memory.Service
+	Tasks   *tasks.Service
+	// FTR.NAB.CMN-0003: the memory of communications — the store the digests
+	// read and the collector of «Сбор коммуникаций»; nil switches them off.
+	Comm      *comm.Service
+	Collector Collector
+	// MemoryOp is the pool of the collector agent (agent-memory, arch §3.4);
+	// nil runs it in Op.
+	MemoryOp   Operator
+	CollectCfg CollectConfig
+	Space      *space.Service
+	Sandboxes  *space.Sandboxes
+	Services   *services.Service
+	Ledger     *ledger.Ledger
+	Signer     *jwt.Signer
+	S3         storage.Storage
+	Events     events.Publisher
+	Bus        kafka.Publisher
+	Adapters   map[string]channels.Adapter
 	// FTR.NAB.CMN-0002: availability of channels, Telegram bindings, group
 	// agents and the mail channel.
 	Registry *channels.Registry
@@ -85,6 +95,9 @@ type Engine struct {
 	Connected func(ctx context.Context, workspaceID string) bool
 
 	locks sync.Map // conversation → *sync.Mutex
+
+	backfillRunning atomic.Int32  // batches of first collections running now
+	BackfillWait    time.Duration // how long a history batch waits before it is queued again (5s)
 }
 
 const tokenTTL = 24 * time.Hour
