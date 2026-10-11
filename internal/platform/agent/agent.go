@@ -251,6 +251,9 @@ type LLMCheckResult struct {
 	ErrorClass ErrorClass `json:"errorClass,omitempty"`
 	HTTPStatus int        `json:"httpStatus,omitempty"`
 	Message    string     `json:"message,omitempty"`
+	// Embeddings: the model does not chat but answers /embeddings — the core
+	// sets it, the operator never does.
+	Embeddings bool `json:"embeddings,omitempty"`
 }
 
 // LLMCheckResponse is the answer of POST /v1/checks/llm.

@@ -149,6 +149,10 @@ func newCore(ctx context.Context, cfg *config.Config) (*core, error) {
 		}
 		return &comm.Embedder{BaseURL: spec.BaseURL, Key: key, Model: spec.ModelID}
 	}
+	c.models.Embed = func(ctx context.Context, baseURL, key, model string) error {
+		_, err := (&comm.Embedder{BaseURL: baseURL, Key: key, Model: model}).Embed(ctx, []string{"ping"})
+		return err
+	}
 	c.comm.EnsureVectors(ctx)
 	c.catalog.SetUserEmail(c.userEmail)
 	c.catalog.MemoryRun = c.comm.ProxyGuard // FTR.NAB.CMN-0003 tech §6.4

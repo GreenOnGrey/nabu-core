@@ -89,6 +89,9 @@ type Service struct {
 	Box  *crypto.Box
 	// Check runs a check through the agent operator (nil: checks unavailable).
 	Check func(ctx context.Context, req agent.LLMCheckRequest) (*agent.LLMCheckResponse, error)
+	// Embed asks a model for one vector (nil: models of embeddings are not
+	// recognized by a check).
+	Embed func(ctx context.Context, baseURL, key, model string) error
 }
 
 const connSelect = `SELECT id, name, type, base_url, api, models, COALESCE(key_last4,''), enabled, status, status_reason, checked_at, created_at FROM model_connections`
@@ -265,6 +268,14 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, p Patch) (*Connectio
 		defs, err := in.Normalize()
 		if err != nil {
 			return nil, err
+		}
+		// a model that stays keeps its description (context window, thinking)
+		for i := range defs {
+			for _, old := range c.Models {
+				if old.ID == defs[i].ID {
+					defs[i] = old
+				}
+			}
 		}
 		models, _ = json.Marshal(defs)
 	}
@@ -562,7 +573,30 @@ func (s *Service) runCheck(ctx context.Context, spec agent.ModelSpec, key string
 		slog.WarnContext(ctx, "model check failed", "err", err)
 		return nil, apperr.Unavailable("agent_unavailable", "the agent operator is not reachable: "+err.Error())
 	}
+	s.checkEmbeddings(ctx, spec.BaseURL, key, res)
 	return res, nil
+}
+
+// checkEmbeddings gives a second chance to the models that failed the check by
+// a chat request: a model of embeddings refuses to chat (the provider answers
+// as if the key were wrong) but is a working model of a connection
+// (FTR.NAB.CMN-0003 R20).
+func (s *Service) checkEmbeddings(ctx context.Context, baseURL, key string, res *agent.LLMCheckResponse) {
+	if s.Embed == nil || res == nil {
+		return
+	}
+	for i, r := range res.Results {
+		if r.OK {
+			continue
+		}
+		cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		start := time.Now()
+		err := s.Embed(cctx, baseURL, key, r.Model)
+		cancel()
+		if err == nil {
+			res.Results[i] = agent.LLMCheckResult{Model: r.Model, OK: true, LatencyMs: time.Since(start).Milliseconds(), Embeddings: true}
+		}
+	}
 }
 
 // Bootstrap creates the first connection from the deployment's key when
