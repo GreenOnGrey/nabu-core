@@ -216,6 +216,23 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, in Input) (*Client, 
 	return s.Get(ctx, id)
 }
 
+// Delete removes a client that has never started a run (SVC-10). A client with runs stays:
+// the runs, the usage and the audit refer to it, so it can only be disabled (SVC-11).
+func (s *Service) Delete(ctx context.Context, id uuid.UUID) error {
+	tag, err := s.Pool.Exec(ctx, `DELETE FROM service_clients c WHERE c.id = $1
+		AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.client_id = c.id)`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() > 0 {
+		return nil
+	}
+	if _, err := s.Get(ctx, id); err != nil {
+		return err
+	}
+	return apperr.Conflict("client_has_runs", "the client has runs: disable it instead")
+}
+
 // Reissue issues a new secret; the old one works for 24 hours (SVC-09).
 func (s *Service) Reissue(ctx context.Context, id uuid.UUID) (*Created, error) {
 	secret := newSecret()
@@ -340,6 +357,17 @@ func (s *Service) AdminRoutes(r chi.Router) {
 			return err
 		}
 		httpx.JSON(w, 200, c)
+		return nil
+	}))
+	r.Delete("/clients/{id}", httpx.Handler(func(w http.ResponseWriter, r *http.Request) error {
+		id, err := httpx.ParamUUID(r, "id")
+		if err != nil {
+			return err
+		}
+		if err := s.Delete(r.Context(), id); err != nil {
+			return err
+		}
+		httpx.NoContent(w)
 		return nil
 	}))
 	r.Post("/clients/{id}/secret", httpx.Handler(func(w http.ResponseWriter, r *http.Request) error {

@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ory/dockertest/v4"
 
+	"github.com/GreenOnGrey/nabu-core/internal/apperr"
 	"github.com/GreenOnGrey/nabu-core/internal/catalog"
 	"github.com/GreenOnGrey/nabu-core/internal/channels"
 	"github.com/GreenOnGrey/nabu-core/internal/chat"
@@ -400,6 +401,34 @@ func TestClientsAndRuns(t *testing.T) {
 	}
 	if _, err := cs.Authenticate(ctx, "hammurapi", re.Secret); err != nil {
 		t.Fatal("new secret refused")
+	}
+	// SVC-10: the address of a client is changed, and a client without runs is deleted
+	spare, err := cs.Create(ctx, clients.Input{Name: "spare", URL: ptr("https://spare.example.org")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved, err := cs.Update(ctx, spare.ID, clients.Input{URL: ptr("https://moved.example.org")})
+	if err != nil || moved.URL != "https://moved.example.org" || moved.Name != "spare" || !moved.Enabled {
+		t.Fatalf("address %+v %v", moved, err)
+	}
+	if err := cs.Delete(ctx, spare.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cs.Authenticate(ctx, "spare", spare.Secret); err == nil {
+		t.Fatal("a deleted client is authenticated")
+	}
+	if e, ok := apperr.As(cs.Delete(ctx, spare.ID)); !ok || e.Code != "not_found" {
+		t.Fatalf("second delete: %v", e)
+	}
+	if again, err := cs.Create(ctx, clients.Input{Name: "spare"}); err != nil || again.ID == spare.ID {
+		t.Fatalf("the name of a deleted client is not free: %v", err)
+	}
+	// SVC-11: a client with runs stays, the history refers to it
+	if e, ok := apperr.As(cs.Delete(ctx, cl.ID)); !ok || e.Code != "client_has_runs" {
+		t.Fatalf("delete with runs: %v", e)
+	}
+	if kept, err := cs.Get(ctx, cl.ID); err != nil || !kept.Enabled {
+		t.Fatalf("a client with runs after delete: %+v %v", kept, err)
 	}
 	// catalog
 	cat := &catalog.Service{Pool: pool, Box: box, Signer: signer, InternalURL: "http://api:8081"}
