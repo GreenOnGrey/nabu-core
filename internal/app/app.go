@@ -69,25 +69,26 @@ import (
 
 // core holds the dependencies shared by api and worker.
 type core struct {
-	cfg      *config.Config
-	pool     *pgxpool.Pool
-	s3       storage.Storage
-	box      *crypto.Box
-	signer   *jwt.Signer
-	events   *events.PGPublisher
-	operator *agent.Client
-	users    *users.Repo
-	models   *models.Service
-	catalog  *catalog.Service
-	memory   *memory.Service
-	comm     *comm.Service
-	tasks    *tasks.Service
-	space    *space.Service
-	chat     *chat.Store
-	services *services.Service
-	ledger   *ledger.Ledger
-	clients  *clients.Service
-	producer *kafka.Producer
+	cfg       *config.Config
+	pool      *pgxpool.Pool
+	s3        storage.Storage
+	box       *crypto.Box
+	signer    *jwt.Signer
+	events    *events.PGPublisher
+	operator  *agent.Client
+	users     *users.Repo
+	models    *models.Service
+	catalog   *catalog.Service
+	memory    *memory.Service
+	comm      *comm.Service
+	tasks     *tasks.Service
+	space     *space.Service
+	snapshots *space.Snapshots
+	chat      *chat.Store
+	services  *services.Service
+	ledger    *ledger.Ledger
+	clients   *clients.Service
+	producer  *kafka.Producer
 	// FTR.NAB.CMN-0002: channels, group agents, accounts.
 	registry *channels.Registry
 	keys     *channels.Keys
@@ -167,6 +168,12 @@ func newCore(ctx context.Context, cfg *config.Config) (*core, error) {
 	}
 	c.space = &space.Service{Pool: pool, S3: s3, Signer: signer, Events: pub, Quota: cfg.SpaceQuota, MaxFile: cfg.UploadMaxBytes,
 		Enabled: cfg.SandboxExecutor == "k8s"}
+	// FTR.NAB.CMN-0006 R14: file arguments of catalog MCP servers
+	c.snapshots = &space.Snapshots{Space: c.space, Relay: &space.RelayStore{Pool: pool, Events: pub}}
+	if c.space.Enabled {
+		c.snapshots.RelayURL = cfg.RelayInternalURL
+	}
+	c.catalog.Files = c.snapshots.Snapshot
 	c.chat = &chat.Store{Pool: pool}
 	c.services = &services.Service{Pool: pool, Models: c.models, Signer: signer, Bus: producer, Events: pub,
 		RelayPublicURL: cfg.RelayPublicWSURL, PublicAPIURL: cfg.PublicAPIURL, WorkspaceTTL: 12 * time.Hour,
@@ -441,6 +448,23 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 	if err := c.catalog.StarterCatalog(ctx); err != nil {
 		slog.Error("starter catalog", "err", err)
 	}
+	// FTR.NAB.CMN-0006 tech §3.6: copies of files for MCP servers live an hour
+	go func() {
+		t := time.NewTicker(10 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if n, err := c.snapshots.Sweep(ctx); err != nil {
+					slog.Warn("sweep copies of space files", "err", err)
+				} else if n > 0 {
+					slog.Info("cleaned", "what", "copies of space files", "objects", n)
+				}
+			}
+		}
+	}()
 
 	var transcriber whisper.Transcriber
 	if cfg.WhisperURL != "" {

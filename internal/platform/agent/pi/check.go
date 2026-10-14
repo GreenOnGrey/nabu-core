@@ -231,6 +231,7 @@ func listTools(ctx context.Context, url string, headers map[string]string) ([]ag
 				ReadOnlyHint    *bool `json:"readOnlyHint"`
 				DestructiveHint *bool `json:"destructiveHint"`
 			} `json:"annotations"`
+			InputSchema json.RawMessage `json:"inputSchema"`
 		} `json:"tools"`
 	}
 	if err := json.Unmarshal(res, &tl); err != nil {
@@ -251,6 +252,7 @@ func listTools(ctx context.Context, url string, headers map[string]string) ([]ag
 		if mt.ReadOnly {
 			mt.Destructive = false
 		}
+		mt.StringArgs = agent.StringArgs(t.InputSchema)
 		out = append(out, mt)
 	}
 	return out, nil

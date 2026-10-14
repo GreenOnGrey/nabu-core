@@ -19,6 +19,7 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/platform/httpx"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/jwt"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/mcp"
+	"github.com/GreenOnGrey/nabu-core/internal/platform/metrics"
 )
 
 // DelegationHeader is the header with the email Nabu acts for.
@@ -116,15 +117,21 @@ func (s *Service) itemHeaders(ctx context.Context, it *Item, uid uuid.UUID) (map
 	if err != nil {
 		return nil, &proxyErr{http.StatusUnauthorized, "the personal access is missing or expired; connect the item again in Connections"}
 	}
+	return pa.tokenHeaders(tok), nil
+}
+
+// tokenHeaders place a personal token: Authorization: Bearer <token> by default.
+func (pa *PersonalAuth) tokenHeaders(tok string) map[string]string {
 	h, prefix := pa.Header, pa.Prefix
 	if h == "" {
 		h, prefix = "Authorization", "Bearer "
 	}
-	return map[string]string{h: prefix + tok}, nil
+	return map[string]string{h: prefix + tok}
 }
 
 // CallTool executes a confirmed call with the current credentials of the
-// user (tech §6: :approve).
+// user (tech §6: :approve). File arguments are replaced at the moment of the
+// call, not when the call waits for the confirmation (FIL-10).
 func (s *Service) CallTool(ctx context.Context, uid, itemID uuid.UUID, tool string, args json.RawMessage) (string, bool, error) {
 	it, err := s.Get(ctx, itemID)
 	if err != nil {
@@ -133,14 +140,78 @@ func (s *Service) CallTool(ctx context.Context, uid, itemID uuid.UUID, tool stri
 	if !it.Published || it.InDevelopment {
 		return "", true, ErrUnavailable()
 	}
-	if it.ReadOnly && !s.readOnlyTool(it, tool) {
-		return readOnlyRefusal(tool), true, nil
+	if !it.allowed(tool) {
+		observe(it, tool, "denied", 0)
+		return refusal(it, tool), true, nil
 	}
 	headers, perr := s.itemHeaders(ctx, it, uid)
 	if perr != nil {
+		observe(it, tool, "auth", 0)
 		return perr.msg, true, nil
 	}
-	return mcp.CallTool(ctx, it.Source.URL, headers, tool, args)
+	args, fr := s.rewriteFileArgs(ctx, it, uid, tool, args)
+	if fr != nil {
+		observe(it, tool, fr.result, 0)
+		return fr.text, true, nil
+	}
+	start := time.Now()
+	text, isErr, err := mcp.CallTool(ctx, it.Source.URL, headers, tool, args)
+	observe(it, tool, callResult(statusOf(err), isErr, err), time.Since(start))
+	return text, isErr, err
+}
+
+// refusal is the answer to a call of a tool the agent may not use.
+func refusal(it *Item, tool string) string {
+	if it.AllowedTools == nil && it.ReadOnly {
+		return readOnlyRefusal(tool)
+	}
+	return deniedRefusal(tool)
+}
+
+// callResult is the result label of a call (arch §4.3): a server that refused
+// the credentials (401, 403) is "auth", other failures to reach it —
+// "transport_error".
+func callResult(status int, isErr bool, err error) string {
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return "auth"
+	case err != nil || status >= 300:
+		return "transport_error"
+	case isErr:
+		return "tool_error"
+	}
+	return "ok"
+}
+
+// statusOf finds the HTTP status in an error of mcp.CallTool ("…: HTTP 401").
+func statusOf(err error) int {
+	if err == nil {
+		return 0
+	}
+	if i := strings.LastIndex(err.Error(), "HTTP "); i >= 0 {
+		var n int
+		if _, e := fmt.Sscanf(err.Error()[i:], "HTTP %d", &n); e == nil {
+			return n
+		}
+	}
+	return 0
+}
+
+// observe counts a call of a tool (FTR.NAB.CMN-0006 R15, OBS-01).
+func observe(it *Item, tool, result string, d time.Duration) {
+	name := it.metricTool(tool)
+	metrics.MCPProxyCalls.WithLabelValues(it.Name, name, result).Inc()
+	if d > 0 {
+		metrics.MCPProxyCallSeconds.WithLabelValues(it.Name, name).Observe(d.Seconds())
+	}
+}
+
+// toolError answers a tools/call with a result the agent reads as an error
+// of the tool.
+func toolError(w http.ResponseWriter, id json.RawMessage, text string) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": id, "result": map[string]any{
+		"isError": true, "content": []map[string]string{{"type": "text", "text": text}}}})
 }
 
 func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
@@ -160,32 +231,34 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 		return
 	}
 	uid, _ := uuid.Parse(c.User)
-	headers, perr := s.itemHeaders(r.Context(), it, uid)
-	if perr != nil {
-		rpcError(w, perr.status, perr.msg)
-		return
-	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
 	if err != nil {
 		rpcError(w, http.StatusBadRequest, "read error")
 		return
 	}
 	var call struct {
-		Method string `json:"method"`
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
 		Params struct {
-			Name string `json:"name"`
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
 		} `json:"params"`
 	}
 	_ = json.Unmarshal(body, &call)
-	// the read-only restriction of the item comes first: a refused call is never held for a confirmation
-	if it.ReadOnly && call.Method == "tools/call" && !s.readOnlyTool(it, call.Params.Name) {
-		var req struct {
-			ID json.RawMessage `json:"id"`
+	isCall := call.Method == "tools/call"
+	headers, perr := s.itemHeaders(r.Context(), it, uid)
+	if perr != nil {
+		if isCall {
+			observe(it, call.Params.Name, "auth", 0)
 		}
-		_ = json.Unmarshal(body, &req)
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{
-			"isError": true, "content": []map[string]string{{"type": "text", "text": readOnlyRefusal(call.Params.Name)}}}})
+		rpcError(w, perr.status, perr.msg)
+		return
+	}
+	// the tools the administrator allowed come first: a refused call is never
+	// held for a confirmation (CAT-02)
+	if isCall && !it.allowed(call.Params.Name) {
+		observe(it, call.Params.Name, "denied", 0)
+		toolError(w, call.ID, refusal(it, call.Params.Name))
 		return
 	}
 	// FTR.NAB.CMN-0003 tech §6.4: a run of the collector of communications
@@ -194,46 +267,39 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 	var only []string
 	if c.HasScope(mcp.ScopeMemoryRun) {
 		run, _ := uuid.Parse(c.Run)
-		var p struct {
-			ID     json.RawMessage `json:"id"`
-			Params struct {
-				Arguments json.RawMessage `json:"arguments"`
-			} `json:"params"`
-		}
-		_ = json.Unmarshal(body, &p)
 		if s.MemoryRun == nil {
 			rpcError(w, http.StatusForbidden, "collector runs are not enabled")
 			return
 		}
-		tools, reason := s.MemoryRun(r.Context(), uid, run, it.ID, call.Method, call.Params.Name, p.Params.Arguments)
+		tools, reason := s.MemoryRun(r.Context(), uid, run, it.ID, call.Method, call.Params.Name, call.Params.Arguments)
 		if reason != "" {
-			if call.Method != "tools/call" {
+			if !isCall {
 				rpcError(w, http.StatusForbidden, reason)
 				return
 			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": p.ID, "result": map[string]any{
-				"isError": true, "content": []map[string]string{{"type": "text", "text": reason}}}})
+			toolError(w, call.ID, reason)
 			return
 		}
 		only = tools
 	}
 	conv, _ := uuid.Parse(c.Conversation)
-	if hold != nil && conv != uuid.Nil && uid != uuid.Nil && call.Method == "tools/call" && !s.readOnlyTool(it, call.Params.Name) {
+	if hold != nil && conv != uuid.Nil && uid != uuid.Nil && isCall && !s.readOnlyTool(it, call.Params.Name) {
 		// R9: in a mail topic a call that changes data waits for the user (ML-17, ML-20)
-		var p struct {
-			ID     json.RawMessage `json:"id"`
-			Params struct {
-				Arguments json.RawMessage `json:"arguments"`
-			} `json:"params"`
-		}
-		_ = json.Unmarshal(body, &p)
-		if answer, held := hold(r.Context(), conv, uid, it.ID, it.Name, call.Params.Name, p.Params.Arguments); held {
+		if answer, held := hold(r.Context(), conv, uid, it.ID, it.Name, call.Params.Name, call.Params.Arguments); held {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": p.ID, "result": map[string]any{
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": call.ID, "result": map[string]any{
 				"isError": false, "content": []map[string]string{{"type": "text", "text": answer}}}})
 			return
 		}
+	}
+	if isCall && len(it.fileArgsOf(call.Params.Name)) > 0 {
+		args, fr := s.rewriteFileArgs(r.Context(), it, uid, call.Params.Name, call.Params.Arguments)
+		if fr != nil {
+			observe(it, call.Params.Name, fr.result, 0)
+			toolError(w, call.ID, fr.text)
+			return
+		}
+		body = withArguments(body, args)
 	}
 	up, err := http.NewRequestWithContext(r.Context(), r.Method, it.Source.URL, bytes.NewReader(body))
 	if err != nil {
@@ -248,9 +314,13 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 	for k, v := range headers {
 		up.Header.Set(k, v)
 	}
+	start := time.Now()
 	resp, err := http.DefaultClient.Do(up)
 	if err != nil {
 		slog.WarnContext(r.Context(), "mcp proxy", "item", it.Name, "err", err)
+		if isCall {
+			observe(it, call.Params.Name, "transport_error", time.Since(start))
+		}
 		rpcError(w, http.StatusBadGateway, "the MCP server is unreachable")
 		return
 	}
@@ -260,10 +330,12 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 			w.Header().Set(h, v)
 		}
 	}
-	filter := (it.ReadOnly || only != nil) && call.Method == "tools/list"
-	filterTools := func(raw []byte) []byte { return filterToolsBy(raw, only) }
+	filter := call.Method == "tools/list" && (it.AllowedTools != nil || it.ReadOnly || only != nil || len(it.FileArgs) > 0)
+	filterTools := func(raw []byte) []byte { return filterToolsList(raw, it, only) }
 	w.WriteHeader(resp.StatusCode)
 	if !filter {
+		// a call is streamed through; its last message tells the result (OBS-01)
+		var seen resultSniffer
 		fl, _ := w.(http.Flusher)
 		buf := make([]byte, 32<<10)
 		for {
@@ -273,11 +345,18 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 				if fl != nil {
 					fl.Flush()
 				}
+				if isCall {
+					seen.write(buf[:n])
+				}
 			}
 			if err != nil {
-				return
+				break
 			}
 		}
+		if isCall {
+			observe(it, call.Params.Name, callResult(resp.StatusCode, seen.isError(), nil), time.Since(start))
+		}
+		return
 	}
 	if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
 		sc := bufio.NewScanner(resp.Body)
@@ -295,6 +374,50 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 	_, _ = w.Write(filterTools(raw))
 }
 
+// withArguments replaces params.arguments of a JSON-RPC message.
+func withArguments(body []byte, args json.RawMessage) []byte {
+	var msg map[string]json.RawMessage
+	if json.Unmarshal(body, &msg) != nil {
+		return body
+	}
+	var params map[string]json.RawMessage
+	if json.Unmarshal(msg["params"], &params) != nil {
+		return body
+	}
+	params["arguments"] = args
+	msg["params"], _ = json.Marshal(params)
+	out, _ := json.Marshal(msg)
+	return out
+}
+
+// resultSniffer keeps the tail of an answer to find "isError": true in the
+// result of a call, plain JSON or the last event of a stream.
+type resultSniffer struct{ tail []byte }
+
+func (r *resultSniffer) write(p []byte) {
+	r.tail = append(r.tail, p...)
+	if len(r.tail) > 64<<10 {
+		r.tail = r.tail[len(r.tail)-64<<10:]
+	}
+}
+
+func (r *resultSniffer) isError() bool {
+	t := string(r.tail)
+	if i := strings.LastIndex(t, "data:"); i >= 0 {
+		t = t[i+len("data:"):]
+	}
+	var msg struct {
+		Error  json.RawMessage `json:"error"`
+		Result struct {
+			IsError bool `json:"isError"`
+		} `json:"result"`
+	}
+	if json.Unmarshal([]byte(strings.TrimSpace(t)), &msg) != nil {
+		return strings.Contains(t, `"isError":true`) || strings.Contains(t, `"isError": true`)
+	}
+	return msg.Result.IsError || len(msg.Error) > 0
+}
+
 func (s *Service) connected(ctx context.Context, uid, item uuid.UUID) bool {
 	var n int
 	_ = s.Pool.QueryRow(ctx, `SELECT count(*) FROM user_connections WHERE user_id = $1 AND item_id = $2`, uid, item).Scan(&n)
@@ -308,58 +431,8 @@ func readOnlyRefusal(tool string) string {
 // readOnlyTool reports whether the tool is marked read-only in the stored
 // list of the item's tools (the administrator's check).
 func (s *Service) readOnlyTool(it *Item, name string) bool {
-	for _, t := range it.Tools {
-		if t.Name == name {
-			return t.ReadOnly
-		}
-	}
-	return false
-}
-
-// filterTools keeps only tools with readOnlyHint in a tools/list result (CAT-04).
-// filterToolsBy keeps the tools of a tools/list answer: the read-only ones,
-// or — with names — only the named ones (a collector run, FTR.NAB.CMN-0003).
-func filterToolsBy(raw []byte, names []string) []byte {
-	var msg map[string]json.RawMessage
-	if json.Unmarshal(raw, &msg) != nil {
-		return raw
-	}
-	res, ok := msg["result"]
-	if !ok {
-		return raw
-	}
-	var r map[string]json.RawMessage
-	if json.Unmarshal(res, &r) != nil {
-		return raw
-	}
-	var tools []map[string]json.RawMessage
-	if json.Unmarshal(r["tools"], &tools) != nil {
-		return raw
-	}
-	kept := []map[string]json.RawMessage{}
-	for _, t := range tools {
-		var ann struct {
-			ReadOnlyHint *bool `json:"readOnlyHint"`
-		}
-		_ = json.Unmarshal(t["annotations"], &ann)
-		if names != nil {
-			var name string
-			_ = json.Unmarshal(t["name"], &name)
-			for _, n := range names {
-				if n == name {
-					kept = append(kept, t)
-				}
-			}
-			continue
-		}
-		if ann.ReadOnlyHint != nil && *ann.ReadOnlyHint {
-			kept = append(kept, t)
-		}
-	}
-	r["tools"], _ = json.Marshal(kept)
-	msg["result"], _ = json.Marshal(r)
-	out, _ := json.Marshal(msg)
-	return out
+	t, ok := it.tool(name)
+	return ok && t.ReadOnly
 }
 
 // ErrSourceAccess reports that the personal access of the user to the server
@@ -377,6 +450,10 @@ func (s *Service) CallSource(ctx context.Context, uid, itemID uuid.UUID, tool st
 	}
 	if !it.Published || it.InDevelopment {
 		return "", ErrUnavailable()
+	}
+	if !it.allowed(tool) {
+		// the adapter calls only the tools the administrator allowed (GML-09)
+		return "", fmt.Errorf("the tool %s is not allowed in the item %s", tool, it.Name)
 	}
 	headers, perr := s.itemHeaders(ctx, it, uid)
 	if perr != nil {

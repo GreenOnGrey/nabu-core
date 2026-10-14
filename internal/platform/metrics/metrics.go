@@ -165,3 +165,20 @@ func init() {
 		ChannelInbound, ChannelOutbound, EmailAuthRejected, IMAPConnected, VKTeamsPollLag, PendingConfirmations, Users, PurgeDeleted,
 		MemoryMaskedSecrets, MemoryDeniedTools, MemoryDigests, MemorySearch, MemoryCollect, MemoryCollectSeconds, MemoryEmbedPending)
 }
+
+// FTR.NAB.CMN-0006 tech §3.7: calls of tools of catalog MCP servers through
+// the proxy of api. tool is a name from the stored list of the item, else
+// "other": the labels do not grow with the names an agent sends.
+var (
+	MCPProxyCalls = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_mcp_proxy_calls_total", Help: "Calls of tools of catalog MCP servers through the proxy by item, tool and result.",
+	}, []string{"item", "tool", "result"})
+	MCPProxyCallSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "nabu_mcp_proxy_call_seconds", Help: "Duration of calls of tools of catalog MCP servers through the proxy.",
+		Buckets: []float64{.1, .25, .5, 1, 2.5, 5, 10, 30, 60, 120, 300},
+	}, []string{"item", "tool"})
+)
+
+func init() {
+	Registry.MustRegister(MCPProxyCalls, MCPProxyCallSeconds)
+}

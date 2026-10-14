@@ -76,10 +76,21 @@ type Item struct {
 	Status        *string           `json:"status"`
 	StatusReason  *string           `json:"statusReason"`
 	Tools         []agent.MCPTool   `json:"tools"`
-	Skills        []string          `json:"skills"`
-	SyncedAt      *time.Time        `json:"syncedAt"`
-	CreatedAt     time.Time         `json:"createdAt"`
-	snapshot      *string
+	// AllowedTools are the tools the agent sees (FTR.NAB.CMN-0006 R13); nil —
+	// the old rule of ReadOnly. With a list ReadOnly is computed: every
+	// allowed tool only reads.
+	AllowedTools []string  `json:"allowedTools"`
+	FileArgs     []FileArg `json:"fileArgs"`
+	FileMaxBytes int64     `json:"fileMaxBytes"`
+	// NewTools appeared at a check after the list was saved and are not
+	// allowed yet (FTR.NAB.CMN-0006 design §3).
+	NewTools []string `json:"newTools"`
+	// CheckedAt is the time of the last successful check.
+	CheckedAt *time.Time `json:"checkedAt"`
+	Skills    []string   `json:"skills"`
+	SyncedAt  *time.Time `json:"syncedAt"`
+	CreatedAt time.Time  `json:"createdAt"`
+	snapshot  *string
 }
 
 // Service is the catalog.
@@ -99,6 +110,9 @@ type Service struct {
 	GitToken string
 
 	userEmail UserEmail
+	// Files copies a file of the user's space for a file argument
+	// (FTR.NAB.CMN-0006 R14); nil — file arguments are refused.
+	Files FileSnapshot
 	// MemoryRun checks a call of a run of the collector of communications
 	// (FTR.NAB.CMN-0003 tech §6.4): it returns the tools the run may see, or
 	// the reason the call is refused.
@@ -108,16 +122,31 @@ type Service struct {
 var nameRe = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
 const itemCols = `id, type, name, COALESCE(title,''), COALESCE(description,''), source, mode, personal_auth, personal_auth_secret_enc IS NOT NULL,
-	platform_auth_enc, read_only, exposure, published, in_development, status, status_reason, tools, skills, skills_snapshot, synced_at, created_at`
+	platform_auth_enc, read_only, exposure, published, in_development, status, status_reason, tools, skills, skills_snapshot, synced_at, created_at,
+	allowed_tools, file_args, file_max_bytes, new_tools, checked_at`
 
 func (s *Service) scan(row pgx.Row) (*Item, error) {
 	var it Item
-	var src, pa, tools, skills []byte
+	var src, pa, tools, skills, allowed, fileArgs, newTools []byte
 	var hasSecret bool
 	var platEnc []byte
 	if err := row.Scan(&it.ID, &it.Type, &it.Name, &it.Title, &it.Description, &src, &it.Mode, &pa, &hasSecret, &platEnc, &it.ReadOnly,
-		&it.Exposure, &it.Published, &it.InDevelopment, &it.Status, &it.StatusReason, &tools, &skills, &it.snapshot, &it.SyncedAt, &it.CreatedAt); err != nil {
+		&it.Exposure, &it.Published, &it.InDevelopment, &it.Status, &it.StatusReason, &tools, &skills, &it.snapshot, &it.SyncedAt, &it.CreatedAt,
+		&allowed, &fileArgs, &it.FileMaxBytes, &newTools, &it.CheckedAt); err != nil {
 		return nil, err
+	}
+	if len(allowed) > 0 {
+		_ = json.Unmarshal(allowed, &it.AllowedTools)
+	}
+	if len(fileArgs) > 0 {
+		_ = json.Unmarshal(fileArgs, &it.FileArgs)
+	}
+	if it.FileArgs == nil {
+		it.FileArgs = []FileArg{}
+	}
+	_ = json.Unmarshal(newTools, &it.NewTools)
+	if it.NewTools == nil {
+		it.NewTools = []string{}
 	}
 	_ = json.Unmarshal(src, &it.Source)
 	if len(pa) > 0 {
@@ -215,6 +244,9 @@ type Input struct {
 	PersonalAuth  *PersonalAuth      `json:"personalAuth"`
 	PlatformAuth  *map[string]string `json:"platformAuth"` // header → value; "" keeps the stored value
 	ReadOnly      *bool              `json:"readOnly"`
+	AllowedTools  *[]string          `json:"allowedTools"`
+	FileArgs      *[]FileArg         `json:"fileArgs"`
+	FileMaxBytes  *int64             `json:"fileMaxBytes"`
 	Exposure      *string            `json:"exposure"`
 	Published     *bool              `json:"published"`
 	InDevelopment *bool              `json:"inDevelopment"`
@@ -278,7 +310,7 @@ func (s *Service) Save(ctx context.Context, id *uuid.UUID, in Input) (*Item, err
 	var platEnc []byte
 	var paSecret []byte
 	if id == nil {
-		it = &Item{Type: in.Type, Name: strings.TrimSpace(in.Name), ReadOnly: true, Exposure: "deferred"}
+		it = &Item{Type: in.Type, Name: strings.TrimSpace(in.Name), ReadOnly: true, Exposure: "deferred", FileMaxBytes: DefaultFileMaxBytes}
 	} else {
 		var err error
 		if it, err = s.Get(ctx, *id); err != nil {
@@ -314,12 +346,13 @@ func (s *Service) Save(ctx context.Context, id *uuid.UUID, in Input) (*Item, err
 		pa.ClientSecret, pa.HasSecret = "", false
 		it.PersonalAuth = &pa
 	}
-	if in.ReadOnly != nil {
-		it.ReadOnly = *in.ReadOnly
-	} else if id == nil && it.PersonalAuth != nil && it.PersonalAuth.Kind == "delegation" {
+	if in.ReadOnly == nil && in.AllowedTools == nil && id == nil && it.PersonalAuth != nil && it.PersonalAuth.Kind == "delegation" {
 		// A product reached by delegation applies the rights of the user itself
 		// (R23): by default the agent may use its tools that change data.
 		it.ReadOnly = false
+	}
+	if err := applyTools(it, in); err != nil {
+		return nil, err
 	}
 	if in.Exposure != nil {
 		it.Exposure = *in.Exposure
@@ -364,20 +397,36 @@ func (s *Service) Save(ctx context.Context, id *uuid.UUID, in Input) (*Item, err
 	if it.PersonalAuth != nil && it.Mode != nil && *it.Mode == "personal" {
 		pa, _ = json.Marshal(it.PersonalAuth)
 	}
+	var allowed []byte
+	if it.AllowedTools != nil {
+		allowed, _ = json.Marshal(it.AllowedTools)
+	}
+	fileArgs, _ := json.Marshal(it.FileArgs)
+	if in.AllowedTools != nil {
+		it.NewTools = []string{} // the administrator has seen the list
+	}
+	nt, _ := json.Marshal(it.NewTools)
+	if it.NewTools == nil {
+		nt = []byte("[]")
+	}
 	var err error
 	if id == nil {
 		var nid uuid.UUID
 		err = s.Pool.QueryRow(ctx, `INSERT INTO catalog_items (type, name, title, description, source, mode, personal_auth, personal_auth_secret_enc,
-			platform_auth_enc, read_only, exposure, published, in_development) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
-			it.Type, it.Name, it.Title, it.Description, src, it.Mode, pa, paSecret, platEnc, it.ReadOnly, it.Exposure, it.Published, it.InDevelopment).Scan(&nid)
+			platform_auth_enc, read_only, exposure, published, in_development, allowed_tools, file_args, file_max_bytes)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`,
+			it.Type, it.Name, it.Title, it.Description, src, it.Mode, pa, paSecret, platEnc, it.ReadOnly, it.Exposure, it.Published, it.InDevelopment,
+			allowed, fileArgs, it.FileMaxBytes).Scan(&nid)
 		if postgres.IsUniqueViolation(err) {
 			return nil, apperr.Conflict("name_taken", "an item with this name exists").With("field", "name")
 		}
 		id = &nid
 	} else {
 		_, err = s.Pool.Exec(ctx, `UPDATE catalog_items SET title = $2, description = $3, source = $4, mode = $5, personal_auth = $6,
-			personal_auth_secret_enc = $7, platform_auth_enc = $8, read_only = $9, exposure = $10, published = $11, in_development = $12, updated_at = now()
-			WHERE id = $1`, *id, it.Title, it.Description, src, it.Mode, pa, paSecret, platEnc, it.ReadOnly, it.Exposure, it.Published, it.InDevelopment)
+			personal_auth_secret_enc = $7, platform_auth_enc = $8, read_only = $9, exposure = $10, published = $11, in_development = $12,
+			allowed_tools = $13, file_args = $14, file_max_bytes = $15, new_tools = $16, updated_at = now()
+			WHERE id = $1`, *id, it.Title, it.Description, src, it.Mode, pa, paSecret, platEnc, it.ReadOnly, it.Exposure, it.Published, it.InDevelopment,
+			allowed, fileArgs, it.FileMaxBytes, nt)
 	}
 	if err != nil {
 		return nil, err
@@ -408,8 +457,13 @@ func (s *Service) changed(ctx context.Context) {
 // Check lists the tools of an MCP item through the operator with platform
 // credentials (or none) and stores them. A delegation item is checked on
 // behalf of the administrator (email): the product refuses calls without a
-// Nabu JWT.
-func (s *Service) Check(ctx context.Context, id uuid.UUID, email string) (*Item, error) {
+// Nabu JWT. A personal item with OAuth or a token is checked with the access
+// of the administrator (admin), who must have connected it: servers like
+// Gmail answer tools/list only with a token (FTR.NAB.CMN-0006 tech §3.4).
+//
+// The first check gives the item its list of allowed tools by the old rule
+// of ReadOnly; later checks never allow new tools by themselves (CAT-03).
+func (s *Service) Check(ctx context.Context, id uuid.UUID, email string, admin uuid.UUID) (*Item, error) {
 	it, err := s.Get(ctx, id)
 	if err != nil {
 		return nil, err
@@ -426,8 +480,22 @@ func (s *Service) Check(ctx context.Context, id uuid.UUID, email string) (*Item,
 	if err != nil {
 		return nil, err
 	}
-	if (it.Mode == nil || *it.Mode != "platform") && it.PersonalAuth != nil && it.PersonalAuth.Kind == "delegation" && email != "" {
-		headers = s.delegationHeaders(it, email)
+	needsConnection := false
+	if (it.Mode == nil || *it.Mode != "platform") && it.PersonalAuth != nil {
+		switch it.PersonalAuth.Kind {
+		case "delegation":
+			if email != "" {
+				headers = s.delegationHeaders(it, email)
+			}
+		case "oauth", "token":
+			tok, err := s.userToken(ctx, admin, it)
+			if admin == uuid.Nil || err != nil {
+				// as before: the server may list its tools without a token
+				needsConnection = true
+				break
+			}
+			headers = it.PersonalAuth.tokenHeaders(tok)
+		}
 	}
 	names := make([]string, 0, len(headers))
 	for k := range headers {
@@ -441,12 +509,36 @@ func (s *Service) Check(ctx context.Context, id uuid.UUID, email string) (*Item,
 	if !res.OK {
 		status, reason = "error", res.Error
 	}
+	if needsConnection && !res.OK {
+		return nil, apperr.Conflict("catalog_check_needs_connection",
+			"connect the item in Connections to check it: the server answers only with a personal access")
+	}
 	tools, _ := json.Marshal(res.Tools)
-	_, err = s.Pool.Exec(ctx, `UPDATE catalog_items SET status = $2, status_reason = NULLIF($3,''), tools = CASE WHEN $2 = 'ok' THEN $4 ELSE tools END, updated_at = now() WHERE id = $1`,
-		id, status, reason, tools)
+	if status != "ok" {
+		_, err = s.Pool.Exec(ctx, `UPDATE catalog_items SET status = $2, status_reason = NULLIF($3,''), updated_at = now() WHERE id = $1`, id, status, reason)
+		if err != nil {
+			return nil, err
+		}
+		return s.Get(ctx, id)
+	}
+	before := it.Tools
+	it.Tools = res.Tools
+	if it.AllowedTools == nil {
+		it.AllowedTools = presetTools(it.Tools, it.ReadOnly)
+	} else {
+		it.NewTools = newTools(before, it.Tools, it.AllowedTools, it.NewTools)
+	}
+	it.ReadOnly = allReadOnly(it.Tools, it.AllowedTools)
+	keepFileArgs(it)
+	allowed, _ := json.Marshal(it.AllowedTools)
+	fileArgs, _ := json.Marshal(it.FileArgs)
+	nt, _ := json.Marshal(it.NewTools)
+	_, err = s.Pool.Exec(ctx, `UPDATE catalog_items SET status = 'ok', status_reason = NULL, tools = $2, allowed_tools = $3, read_only = $4, file_args = $5,
+		new_tools = $6, checked_at = now(), updated_at = now() WHERE id = $1`, id, tools, allowed, it.ReadOnly, fileArgs, nt)
 	if err != nil {
 		return nil, err
 	}
+	s.changed(ctx)
 	return s.Get(ctx, id)
 }
 

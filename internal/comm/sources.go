@@ -3,6 +3,7 @@ package comm
 import (
 	"context"
 	"encoding/json"
+	"slices"
 
 	"github.com/google/uuid"
 
@@ -55,16 +56,21 @@ func (s *Service) SetSource(ctx context.Context, item uuid.UUID, adapter *string
 	}
 	if marked {
 		// SRC-03: the server must have the tools the adapter calls — by the list
-		// its last check stored; a server that was never checked passes.
-		var raw []byte
-		_ = s.Pool.QueryRow(ctx, `SELECT tools FROM catalog_items WHERE id = $1`, item).Scan(&raw)
+		// its last check stored; a server that was never checked passes. With a
+		// list of allowed tools only those count (FTR.NAB.CMN-0006 GML-09).
+		var raw, allowedRaw []byte
+		_ = s.Pool.QueryRow(ctx, `SELECT tools, allowed_tools FROM catalog_items WHERE id = $1`, item).Scan(&raw, &allowedRaw)
 		var tools []struct {
 			Name string `json:"name"`
 		}
+		var allowed []string
+		hasList := len(allowedRaw) > 0 && json.Unmarshal(allowedRaw, &allowed) == nil
 		if json.Unmarshal(raw, &tools) == nil && len(tools) > 0 {
-			names := make([]string, len(tools))
-			for i, t := range tools {
-				names[i] = t.Name
+			names := make([]string, 0, len(tools))
+			for _, t := range tools {
+				if !hasList || slices.Contains(allowed, t.Name) {
+					names = append(names, t.Name)
+				}
 			}
 			ad, _ := collect.Get(*cur)
 			if err := ad.CheckTools(names); err != nil {

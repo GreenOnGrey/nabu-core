@@ -8,6 +8,8 @@ package agent
 
 import (
 	"encoding/json"
+	"slices"
+	"sort"
 )
 
 // SessionKind separates the operator's capacity (tech spec §9):
@@ -273,6 +275,10 @@ type MCPTool struct {
 	Description string `json:"description,omitempty"`
 	ReadOnly    bool   `json:"readOnly"`
 	Destructive bool   `json:"destructive"`
+	// StringArgs are the properties of the input schema of type string: the
+	// arguments an administrator may mark as files of the space
+	// (FTR.NAB.CMN-0006 R14, tech §3.2).
+	StringArgs []string `json:"stringArgs,omitempty"`
 }
 
 // MCPCheckResponse is the answer of POST /v1/checks/mcp.
@@ -285,3 +291,29 @@ type MCPCheckResponse struct {
 // ConnectionProblem reports whether the class marks the connection as broken
 // (shown to administrators in the connection's state).
 func (c ErrorClass) ConnectionProblem() bool { return c == ErrInsufficientBalance || c == ErrAuth }
+
+// StringArgs lists the properties of a JSON schema of tool input whose type is
+// string, sorted (FTR.NAB.CMN-0006 CAT-15).
+func StringArgs(schema json.RawMessage) []string {
+	var s struct {
+		Properties map[string]struct {
+			Type json.RawMessage `json:"type"`
+		} `json:"properties"`
+	}
+	if json.Unmarshal(schema, &s) != nil {
+		return nil
+	}
+	var out []string
+	for name, p := range s.Properties {
+		var one string
+		var many []string
+		switch {
+		case json.Unmarshal(p.Type, &one) == nil && one == "string":
+			out = append(out, name)
+		case json.Unmarshal(p.Type, &many) == nil && slices.Contains(many, "string"):
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}

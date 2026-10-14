@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/url"
 	"time"
 
 	"github.com/minio/minio-go/v7"
@@ -94,6 +95,22 @@ func (s *S3) List(ctx context.Context, prefix string) ([]Object, error) {
 		out = append(out, Object{Key: o.Key, Size: o.Size, LastModified: o.LastModified})
 	}
 	return out, nil
+}
+
+// Presigner gives temporary links to objects; S3 implements it.
+type Presigner interface {
+	PresignGet(ctx context.Context, key string, ttl time.Duration) (string, error)
+}
+
+// PresignGet returns a GET URL of an object valid for ttl, signed for the
+// endpoint the store is configured with (FTR.NAB.CMN-0006 arch §4.2: the
+// pods of the stand reach the same endpoint).
+func (s *S3) PresignGet(ctx context.Context, key string, ttl time.Duration) (string, error) {
+	u, err := s.c.PresignedGetObject(ctx, s.bucket, key, ttl, url.Values{})
+	if err != nil {
+		return "", err
+	}
+	return u.String(), nil
 }
 
 // ReadAll reads a whole object (small objects only: snapshots, bundles).

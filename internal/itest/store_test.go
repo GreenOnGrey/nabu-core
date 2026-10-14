@@ -471,7 +471,7 @@ func TestClientsAndRuns(t *testing.T) {
 	if di.ReadOnly { // the product applies the rights of the user: its tools that change data are allowed by default
 		t.Fatal("a delegation item is read-only by default")
 	}
-	if di, err = cat.Check(ctx, di.ID, "admin@x.org"); err != nil || di.Status == nil || *di.Status != "ok" {
+	if di, err = cat.Check(ctx, di.ID, "admin@x.org", uuid.Nil); err != nil || di.Status == nil || *di.Status != "ok" {
 		t.Fatalf("%+v %v", di, err)
 	}
 	if c, err := signer.Verify(strings.TrimPrefix(sent["Authorization"], "Bearer "), "hammurapi"); err != nil || c.Email != "admin@x.org" || sent[catalog.DelegationHeader] != "admin@x.org" {
