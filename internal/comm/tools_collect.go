@@ -203,7 +203,11 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 				}
 				msgs := make([]Message, 0, len(t.Messages))
 				for _, m := range t.Messages {
-					msgs = append(msgs, Message{ID: m.ID, Author: m.Author, SentAt: m.SentAt, URL: ad.Link(b.Source, *t, m.ID)})
+					url := m.URL
+					if url == "" {
+						url = ad.Link(b.Source, *t, m.ID)
+					}
+					msgs = append(msgs, Message{ID: m.ID, Author: m.Author, SentAt: m.SentAt, URL: url})
 				}
 				info := UserInfo{}
 				if user != nil {

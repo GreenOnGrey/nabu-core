@@ -33,6 +33,9 @@ type Msg struct {
 	ID     string     `json:"id"`
 	Author string     `json:"author,omitempty"`
 	SentAt *time.Time `json:"sentAt,omitempty"`
+	// URL opens the message when the server gives the link itself
+	// (FTR.NAB.CMN-0006: the mail adapter); else Adapter.Link builds it.
+	URL string `json:"url,omitempty"`
 }
 
 // Thread is a mail thread or a chat for a day that changed.

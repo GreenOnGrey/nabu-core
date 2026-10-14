@@ -86,7 +86,8 @@ func (s *Service) SetSource(ctx context.Context, item uuid.UUID, adapter *string
 // catalog items marked by the administrator, with whether the user connected
 // the item.
 func (s *Service) Sources(ctx context.Context, uid uuid.UUID) ([]SourceState, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT c.id, COALESCE(c.adapter,''), EXISTS (SELECT 1 FROM user_connections uc WHERE uc.item_id = c.id AND uc.user_id = $1)
+	rows, err := s.Pool.Query(ctx, `SELECT c.id, COALESCE(c.adapter,''), COALESCE(NULLIF(c.title,''), c.name),
+		EXISTS (SELECT 1 FROM user_connections uc WHERE uc.item_id = c.id AND uc.user_id = $1)
 		FROM catalog_items c WHERE c.comm_source AND c.published AND c.type = 'mcp' ORDER BY c.name`, uid)
 	if err != nil {
 		return nil, err
@@ -95,14 +96,19 @@ func (s *Service) Sources(ctx context.Context, uid uuid.UUID) ([]SourceState, er
 	out := []SourceState{}
 	for rows.Next() {
 		var id uuid.UUID
-		var adapter string
+		var adapter, itemTitle string
 		var connected bool
-		if err := rows.Scan(&id, &adapter, &connected); err != nil {
+		if err := rows.Scan(&id, &adapter, &itemTitle, &connected); err != nil {
 			return nil, err
 		}
 		srcs, _ := adapterSources(adapter)
 		for _, src := range srcs {
-			out = append(out, SourceState{ItemID: id, Source: src.Key, Title: src.Title, Connected: connected})
+			// an adapter of any provider (mail) has no title of its own: the item names the mailbox
+			title := src.Title
+			if title == "" {
+				title = itemTitle
+			}
+			out = append(out, SourceState{ItemID: id, Source: src.Key, Title: title, Connected: connected})
 		}
 	}
 	return out, rows.Err()

@@ -1,6 +1,7 @@
 package comm
 
 import (
+	"cmp"
 	"net/http"
 	"time"
 
@@ -71,7 +72,12 @@ func (s *Service) AdminRoutes(r chi.Router) {
 			it.Sources = []Source{}
 			if it.Adapter != nil {
 				srcs, _ := adapterSources(*it.Adapter)
-				it.Sources = append(it.Sources, srcs...)
+				for _, src := range srcs {
+					if src.Title == "" { // the mail adapter: the item names the mailbox
+						src.Title = cmp.Or(it.Title, it.Name)
+					}
+					it.Sources = append(it.Sources, src)
+				}
 			}
 			items = append(items, it)
 		}

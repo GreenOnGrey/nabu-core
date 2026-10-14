@@ -505,6 +505,38 @@ func TestMCPProxyHoldAndMetrics(t *testing.T) {
 	if err := cs.SetSource(ctx, gi.ID, &adapter, &yes); err != nil {
 		t.Fatalf("GML-09: allowed: %v", err)
 	}
+
+	// YML-13: a mailbox over imap-mcp is a source through the adapter "mail";
+	// the source is named by the item
+	title := "Яндекс Почта"
+	yi, err := cat.Save(ctx, nil, catalog.Input{Type: "mcp", Name: "yandex-mail-src", Title: &title, Source: &catalog.Source{Kind: "url", URL: mcpSrv.URL},
+		Mode: &pmode, PersonalAuth: &catalog.PersonalAuth{Kind: "oauth", AuthorizeURL: "https://oauth.yandex.ru/authorize",
+			TokenURL: "https://oauth.yandex.ru/token", ClientID: "c"}, Published: ptr(true)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mailTools, _ := json.Marshal([]agent.MCPTool{{Name: "list_folders", ReadOnly: true}, {Name: "search_messages", ReadOnly: true},
+		{Name: "read_message", ReadOnly: true}, {Name: "read_thread", ReadOnly: true}})
+	if _, err := pool.Exec(ctx, `UPDATE catalog_items SET tools = $2 WHERE id = $1`, yi.ID, mailTools); err != nil {
+		t.Fatal(err)
+	}
+	mail := "mail"
+	if err := cs.SetSource(ctx, yi.ID, &mail, &yes); err != nil {
+		t.Fatalf("YML-13: %v", err)
+	}
+	srcs, err := cs.Sources(ctx, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, src := range srcs {
+		if src.ItemID == yi.ID {
+			found = src.Source == "mail" && src.Title == "Яндекс Почта"
+		}
+	}
+	if !found {
+		t.Fatalf("YML-13: sources %+v", srcs)
+	}
 }
 
 // proxyCalls sums nabu_mcp_proxy_calls_total of an item; tool and result
