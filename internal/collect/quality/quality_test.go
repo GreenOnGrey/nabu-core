@@ -1,6 +1,8 @@
 package quality
 
 import (
+	"maps"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -68,10 +70,13 @@ func TestCorpusAndScore(t *testing.T) {
 		t.Fatalf("a perfect run fails: %v — %s", f, good.Summary())
 	}
 
-	// QLT-01: a third of the commitments is missed.
+	// QLT-01: a third of the commitments is missed. The threads are walked in
+	// a fixed order: over a map the share of the missed ones changed from run
+	// to run, and the recall sometimes stayed above MinRecall.
 	bad := perfect(c)
 	n := 0
-	for id, res := range bad.Threads {
+	for _, id := range slices.Sorted(maps.Keys(bad.Threads)) {
+		res := bad.Threads[id]
 		if len(res.Commitments) > 0 && n%3 == 0 {
 			res.Commitments = nil
 			bad.Threads[id] = res
