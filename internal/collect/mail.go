@@ -45,9 +45,20 @@ func (m *Mail) Sources() []Source { return []Source{{Key: mailSource, Title: ""}
 // ReadTools: the thread with its bodies.
 func (m *Mail) ReadTools() []string { return []string{mailThread} }
 
-// ReadCall reads the whole thread.
+// ReadCall reads the whole thread; since — the day before its first known
+// message: a server without search by headers (Yandex) reads from that day.
 func (m *Mail) ReadCall(_ string, t Thread) ToolCall {
-	return ToolCall{Tool: mailThread, Args: map[string]any{"thread_id": t.Key}}
+	args := map[string]any{"thread_id": t.Key}
+	var first *time.Time
+	for _, msg := range t.Messages {
+		if msg.SentAt != nil && (first == nil || msg.SentAt.Before(*first)) {
+			first = msg.SentAt
+		}
+	}
+	if first != nil {
+		args["since"] = first.UTC().AddDate(0, 0, -1).Format("2006-01-02")
+	}
+	return ToolCall{Tool: mailThread, Args: args}
 }
 
 // ThreadOf reads thread_id of a read_thread call.

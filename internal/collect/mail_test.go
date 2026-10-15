@@ -122,7 +122,11 @@ func TestMailPages(t *testing.T) {
 // YML-15: the collector agent reads a thread of its batch with read_thread.
 func TestMailReadCall(t *testing.T) {
 	m := &Mail{}
-	c := m.ReadCall(mailSource, Thread{Key: "<m1@x>"})
+	d1, d2 := time.Date(2026, 10, 12, 1, 0, 0, 0, time.UTC), time.Date(2026, 10, 13, 9, 0, 0, 0, time.UTC)
+	c := m.ReadCall(mailSource, Thread{Key: "<m1@x>", Messages: []Msg{{ID: "<m2@x>", SentAt: &d2}, {ID: "<m1@x>", SentAt: &d1}}})
+	if c.Args["since"] != "2026-10-11" {
+		t.Fatalf("since: %v", c.Args)
+	}
 	args, _ := json.Marshal(c.Args)
 	if key, ok := m.ThreadOf(c.Tool, args); !ok || key != "<m1@x>" {
 		t.Fatalf("%v %s", ok, key)
