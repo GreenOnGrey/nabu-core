@@ -630,6 +630,19 @@ func TestMemoryTasks(t *testing.T) {
 	if !found {
 		t.Fatalf("sources: %+v", l0)
 	}
+	// TASK-02: a source the administrator unmarked is skipped, as the collection
+	// skips it (the user no longer sees it to switch it off); alone it is no source.
+	var gone uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO catalog_items (type, name, title, source, mode, published) VALUES ('mcp', $1, 'Old', '{}', 'personal', true) RETURNING id`,
+		"old-"+uuid.NewString()[:6]).Scan(&gone); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := enable("collect", fmt.Sprintf(`{"sources":[{"itemId":%q,"source":"gmail"}]}`, gone)); !isCode(err, "comm_source_not_connected") {
+		t.Fatalf("collection from an unmarked source only: %v", err)
+	}
+	if col, err := enable("collect", fmt.Sprintf(`{"sources":[{"itemId":%q,"source":"gmail"},{"itemId":%q,"source":"gmail"}]}`, gone, item)); err != nil || !col.Enabled {
+		t.Fatalf("collection with an unmarked source next to a connected one: %+v %v", col, err)
+	}
 	col, err := enable("collect", src)
 	if err != nil || !col.Enabled || col.Status != "active" || col.NextRunAt == nil || col.TaskID == nil {
 		t.Fatalf("%+v %v", col, err)

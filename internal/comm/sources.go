@@ -137,16 +137,21 @@ func (s *Service) CheckCollect(ctx context.Context, uid uuid.UUID, settings []by
 	if err != nil {
 		return err
 	}
+	offered := 0
 	for _, want := range set.Sources {
-		ok := false
-		for _, a := range avail {
-			if a.ItemID == want.ItemID && a.Source == want.Source && a.Connected {
-				ok = true
-			}
+		i := slices.IndexFunc(avail, func(a SourceState) bool { return a.ItemID == want.ItemID && a.Source == want.Source })
+		if i < 0 {
+			// the administrator unmarked the source: the collection skips it, and the
+			// user no longer sees it to switch it off
+			continue
 		}
-		if !ok {
+		if !avail[i].Connected {
 			return apperr.Conflict("comm_source_not_connected", "the source "+want.Source+" is not connected: connect it in Connections")
 		}
+		offered++
+	}
+	if offered == 0 {
+		return apperr.Conflict("comm_source_not_connected", "choose at least one connected source")
 	}
 	return nil
 }
