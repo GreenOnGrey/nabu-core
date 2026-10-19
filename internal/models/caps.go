@@ -145,6 +145,11 @@ func build(typ, id string, info *providerInfo, old *agent.ModelDef) agent.ModelD
 			d.Tools = false
 		}
 	}
+	// a model of vectors the catalog does not know is told by its name
+	if !inCatalog && agent.EmbeddingsName(id) {
+		d.Embeddings, d.Tools = true, false
+		d.Sources[FTools] = SrcCatalog
+	}
 	switch {
 	case info != nil:
 		if info.Name != "" && !inCatalog {
@@ -265,6 +270,19 @@ func edit(typ string, d agent.ModelDef, p *CapsPatch) agent.ModelDef {
 // Usable reports whether a personal agent may run on the model (R8): it calls
 // tools, chats and the provider still lists it.
 func Usable(d agent.ModelDef) bool { return d.Tools && !d.Embeddings && !d.Gone }
+
+// embeddingsByName marks a model of vectors stored before its kind was known
+// (FTR.NAB.CHAT-0001 R8): an administrator who switched tools on by hand keeps it.
+func embeddingsByName(d *agent.ModelDef) {
+	if d.Embeddings || !agent.EmbeddingsName(d.ID) || slices.Contains(d.Overrides, FTools) {
+		return
+	}
+	d.Embeddings, d.Tools = true, false
+	if d.Sources == nil {
+		d.Sources = map[string]string{}
+	}
+	d.Sources[FTools] = SrcCatalog
+}
 
 // normalizeID trims a model id.
 func normalizeID(id string) string { return strings.TrimSpace(id) }

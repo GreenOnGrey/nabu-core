@@ -184,3 +184,28 @@ func TestZAIEndpoint(t *testing.T) {
 		t.Fatalf("other: %v", err)
 	}
 }
+
+// R8: a model of vectors is told by its name when the provider does not say it,
+// also in a record stored before; a chat model is not.
+func TestEmbeddingsByName(t *testing.T) {
+	for id, want := range map[string]bool{"text-embedding-3-small": true, "nomic-embed-text": true, "BAAI/bge-m3": true, "multilingual-e5-large": true,
+		"gpt-5.1": false, "deepseek-v4.1-flash": false, "glm-4.6": false} {
+		if got := agent.EmbeddingsName(id); got != want {
+			t.Errorf("%s: %v", id, got)
+		}
+	}
+	d := build(TypeOpenAICompatible, "text-embedding-3-small", nil, nil)
+	if !d.Embeddings || d.Tools || Usable(d) {
+		t.Fatalf("built: %+v", d)
+	}
+	old := agent.ModelDef{ID: "text-embedding-3-small", Tools: true, Sources: map[string]string{}}
+	embeddingsByName(&old)
+	if !old.Embeddings || old.Tools {
+		t.Fatalf("stored: %+v", old)
+	}
+	kept := agent.ModelDef{ID: "my-embed-chat", Tools: true, Overrides: []string{FTools}}
+	embeddingsByName(&kept)
+	if kept.Embeddings || !kept.Tools {
+		t.Fatalf("an administrator's choice is kept: %+v", kept)
+	}
+}

@@ -136,6 +136,9 @@ func scanConn(row pgx.Row) (*Connection, error) {
 	if err := json.Unmarshal(models, &c.Models); err != nil {
 		return nil, err
 	}
+	for i := range c.Models {
+		embeddingsByName(&c.Models[i])
+	}
 	_ = json.Unmarshal(opts, &c.Options)
 	_ = json.Unmarshal(disc, &c.Discovered)
 	if c.Options == nil {

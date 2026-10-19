@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"slices"
 	"sort"
+	"strings"
 )
 
 // SessionKind separates the operator's capacity (tech spec §9):
@@ -74,6 +75,24 @@ type ModelDef struct {
 	Sources   map[string]string `json:"sources,omitempty"`
 	Overrides []string          `json:"overrides,omitempty"`
 	Gone      bool              `json:"gone,omitempty"`
+}
+
+// EmbeddingsName reports a model that only gives vectors by its id
+// (FTR.NAB.CHAT-0001 R8): text-embedding-3-small, nomic-embed-text, bge-m3,
+// multilingual-e5-large. A provider that lists models without their kind
+// (OpenAI, DeepSeek) gives nothing else to tell them by.
+func EmbeddingsName(id string) bool {
+	id = strings.ToLower(id)
+	if strings.Contains(id, "embed") {
+		return true
+	}
+	base := id[strings.LastIndex(id, "/")+1:]
+	for _, p := range []string{"bge-", "e5-", "gte-", "multilingual-e5", "jina-embeddings"} {
+		if strings.HasPrefix(base, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // HasInput reports whether the model takes the kind of input (text, image).

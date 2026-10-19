@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/GreenOnGrey/nabu-core/internal/platform/agent"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/events"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/postgres"
 )
@@ -146,15 +147,17 @@ func loadResources(ctx context.Context, q Querier) (*resources, error) {
 			return nil, err
 		}
 		var ms []struct {
-			ID         string `json:"id"`
-			Name       string `json:"name"`
-			Tools      *bool  `json:"tools"`
-			Embeddings bool   `json:"embeddings"`
-			Gone       bool   `json:"gone"`
+			ID         string   `json:"id"`
+			Name       string   `json:"name"`
+			Tools      *bool    `json:"tools"`
+			Embeddings bool     `json:"embeddings"`
+			Gone       bool     `json:"gone"`
+			Overrides  []string `json:"overrides"`
 		}
 		_ = json.Unmarshal(raw, &ms)
 		for _, m := range ms {
-			if (m.Tools != nil && !*m.Tools) || m.Embeddings || m.Gone { // FTR.NAB.CHAT-0001 R8
+			byName := agent.EmbeddingsName(m.ID) && !slices.Contains(m.Overrides, "tools") // stored before its kind was known
+			if (m.Tools != nil && !*m.Tools) || m.Embeddings || byName || m.Gone {         // FTR.NAB.CHAT-0001 R8
 				continue
 			}
 			nm := m.Name

@@ -436,13 +436,15 @@ func (c *core) provider() auth.Provider {
 
 // PublicConfig is GET /api/v1/config.
 type PublicConfig struct {
-	AuthProvider    string          `json:"authProvider"`
-	ProviderLabel   string          `json:"providerLabel"`
-	AllowedOrg      string          `json:"allowedOrg,omitempty"`
-	Languages       []string        `json:"languages"`
-	DefaultLanguage string          `json:"defaultLanguage"`
-	UploadMaxBytes  int64           `json:"uploadMaxBytes"`
-	Voice           bool            `json:"voice"`
+	AuthProvider    string   `json:"authProvider"`
+	ProviderLabel   string   `json:"providerLabel"`
+	AllowedOrg      string   `json:"allowedOrg,omitempty"`
+	Languages       []string `json:"languages"`
+	DefaultLanguage string   `json:"defaultLanguage"`
+	UploadMaxBytes  int64    `json:"uploadMaxBytes"`
+	Voice           bool     `json:"voice"`
+	// VoiceMaxSeconds bounds a recording of the site (FTR.NAB.CHAT-0001 R20).
+	VoiceMaxSeconds int             `json:"voiceMaxSeconds"`
 	Spaces          bool            `json:"spaces"`
 	Channels        map[string]bool `json:"channels"`
 	Version         string          `json:"version"`
@@ -520,7 +522,8 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 			}
 		}}
 	pubCfg := PublicConfig{AuthProvider: prov.Kind(), ProviderLabel: prov.Label(), AllowedOrg: cfg.GitHubAllowedOrg, Languages: domain.Languages,
-		DefaultLanguage: cfg.DefaultLanguage, UploadMaxBytes: cfg.UploadMaxBytes, Voice: c.chatAPI.Whisper != nil, Spaces: c.space.Enabled,
+		DefaultLanguage: cfg.DefaultLanguage, UploadMaxBytes: cfg.UploadMaxBytes, Voice: c.chatAPI.Whisper != nil,
+		VoiceMaxSeconds: c.chatAPI.MaxVoiceSeconds, Spaces: c.space.Enabled,
 		Version: version, BootstrapAdminsConfigured: len(cfg.BootstrapAdmins) > 0}
 	if prov.Kind() == "oidc" {
 		pubCfg.AllowedOrg = ""
