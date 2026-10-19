@@ -26,6 +26,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/GreenOnGrey/nabu-core/internal/access"
 	"github.com/GreenOnGrey/nabu-core/internal/accounts"
 	"github.com/GreenOnGrey/nabu-core/internal/admin"
 	"github.com/GreenOnGrey/nabu-core/internal/agentpods"
@@ -47,6 +48,7 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/ledger"
 	"github.com/GreenOnGrey/nabu-core/internal/memory"
 	"github.com/GreenOnGrey/nabu-core/internal/models"
+	"github.com/GreenOnGrey/nabu-core/internal/models/gigachat"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/agent"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/agent/operator"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/crypto"
@@ -91,6 +93,7 @@ type core struct {
 	producer  *kafka.Producer
 	// FTR.NAB.CMN-0002: channels, group agents, accounts.
 	registry *channels.Registry
+	access   *access.Service
 	keys     *channels.Keys
 	chanAPI  *channels.API
 	tg       *channels.Telegram
@@ -125,7 +128,13 @@ func newCore(ctx context.Context, cfg *config.Config) (*core, error) {
 	c.models = &models.Service{Pool: pool, Box: box, Check: func(ctx context.Context, req agent.LLMCheckRequest) (*agent.LLMCheckResponse, error) {
 		r, err := op.CheckLLM(ctx, req)
 		return &r, err
-	}}
+	}, Signer: signer, InternalURL: cfg.InternalURL, AutoRefresh: true}
+	// FTR.NAB.CHAT-0001 R13: GigaChat through the bridge of api
+	if gc, err := gigachat.New(cfg.GigaChatCAFile); err != nil {
+		return nil, err
+	} else {
+		c.models.GigaChat = gc
+	}
 	c.catalog = &catalog.Service{Pool: pool, Box: box, S3: s3, Signer: signer, Events: pub, InternalURL: cfg.InternalURL,
 		PublicAPIURL: cfg.PublicAPIURL, WebURL: cfg.PublicWebURL, GitToken: os.Getenv("SKILLS_GIT_TOKEN"),
 		CheckMCP: func(ctx context.Context, req agent.MCPCheckRequest) (*agent.MCPCheckResponse, error) {
@@ -186,12 +195,30 @@ func newCore(ctx context.Context, cfg *config.Config) (*core, error) {
 		pepper = channels.DerivePepper(cfg.SecretsKey)
 	}
 	c.registry = &channels.Registry{Pool: pool, Box: box, Events: pub}
+	// FTR.NAB.CMN-0007: the access of users by groups
+	c.access = &access.Service{Pool: pool, Events: pub}
+	c.registry.Granted = c.access.Channels
+	c.models.Access = c.access.Effective
+	c.catalog.Access = c.access
 	c.registry.Changed = c.configureChannel
 	c.keys = &channels.Keys{Pool: pool, Pepper: pepper, Events: pub}
 	c.tg = channels.NewTelegram(cfg.TelegramAPIURL, "", "")
 	c.tg.TableMaxCols = cfg.TGTableMaxCols
 	c.vk = channels.NewVKTeams()
-	c.chatAPI = &chat.API{Store: c.chat, Pool: pool, Users: c.users, Models: c.models, Bus: producer, Events: pub, S3: s3, MaxFile: cfg.UploadMaxBytes}
+	c.chatAPI = &chat.API{Store: c.chat, Pool: pool, Users: c.users, Models: c.models, Bus: producer, Events: pub, S3: s3, MaxFile: cfg.UploadMaxBytes,
+		// FTR.NAB.CHAT-0001 R20: 5 minutes of opus at up to 192 kbit/s
+		MaxVoice: int64(cfg.TranscribeMaxSeconds) * 24 << 10}
+	if cfg.WhisperURL != "" { // the site (api) and the voice messages of messengers (api, worker)
+		c.chatAPI.Whisper = whisper.New(cfg.WhisperURL)
+	}
+	c.chatAPI.Skills = func(ctx context.Context, uid uuid.UUID) ([]chat.Skill, error) {
+		list, err := c.catalog.SkillsFor(ctx, uid)
+		out := make([]chat.Skill, 0, len(list))
+		for _, s := range list {
+			out = append(out, chat.Skill(s))
+		}
+		return out, err
+	}
 	c.accounts = &accounts.Service{Pool: pool, S3: s3, Events: pub, Ledger: c.ledger}
 	c.groups = &groups.Service{Pool: pool, Registry: c.registry, Users: c.users, Inbox: c.chatAPI,
 		RetentionDays: c.accounts.Retention, DeleteData: c.accounts.DeleteUserData}
@@ -466,12 +493,7 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 		}
 	}()
 
-	var transcriber whisper.Transcriber
-	if cfg.WhisperURL != "" {
-		transcriber = whisper.New(cfg.WhisperURL)
-	}
 	chatAPI := c.chatAPI
-	chatAPI.Whisper = transcriber
 	allowedModel := func(ctx context.Context, m groups.ModelChoice) bool {
 		avail, err := c.models.AvailableForUsers(ctx)
 		if err != nil {
@@ -502,14 +524,21 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 			}
 		}}
 	pubCfg := PublicConfig{AuthProvider: prov.Kind(), ProviderLabel: prov.Label(), AllowedOrg: cfg.GitHubAllowedOrg, Languages: domain.Languages,
-		DefaultLanguage: cfg.DefaultLanguage, UploadMaxBytes: cfg.UploadMaxBytes, Voice: transcriber != nil, Spaces: c.space.Enabled,
+		DefaultLanguage: cfg.DefaultLanguage, UploadMaxBytes: cfg.UploadMaxBytes, Voice: c.chatAPI.Whisper != nil, Spaces: c.space.Enabled,
 		Version: version, BootstrapAdminsConfigured: len(cfg.BootstrapAdmins) > 0}
 	if prov.Kind() == "oidc" {
 		pubCfg.AllowedOrg = ""
 	}
+	actorOf := func(ctx context.Context, uid uuid.UUID) access.Actor {
+		email, _ := c.userEmail(ctx, uid)
+		return access.Actor{ID: uid, Email: email}
+	}
 	adminUsers := &admin.Users{Repo: c.users,
 		Channels:    func(ctx context.Context, uid uuid.UUID) (any, error) { return c.registry.OfUser(ctx, uid) },
-		GroupAgents: func(ctx context.Context, uid uuid.UUID) (any, error) { return c.groups.List(ctx, "", &uid) }}
+		GroupAgents: func(ctx context.Context, uid uuid.UUID) (any, error) { return c.groups.List(ctx, "", &uid) },
+		AdminChanged: func(ctx context.Context, actor, uid uuid.UUID, admin bool) {
+			c.access.AdminChanged(ctx, actorOf(ctx, actor), uid, admin)
+		}}
 	builtin := mcp.NewServer(c.signer)
 	confirms := &confirm.Service{Pool: c.pool, Box: c.box, Events: c.events, TTL: cfg.ConfirmationTTL,
 		Execute: func(ctx context.Context, p *confirm.Pending, args json.RawMessage) (string, bool, error) {
@@ -570,6 +599,29 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 		r.Use(authH.Authenticate, auth.RequireSession, auth.RequireAdmin)
 		adminUsers.Routes(r)
 		c.models.AdminRoutes(r)
+		c.access.Routes(r, func(r *http.Request) access.Actor { // FTR.NAB.CMN-0007 tech §2
+			p, _ := httpx.MustPrincipal(r)
+			if p == nil {
+				return access.Actor{}
+			}
+			return actorOf(r.Context(), p.UserID)
+		}, c.models.ModelInfo)
+		// FTR.NAB.CHAT-0001 R22: the state of the recognizer of speech
+		r.Get("/voice", httpx.Handler(func(w http.ResponseWriter, r *http.Request) error {
+			out := map[string]any{"configured": cfg.WhisperURL != "", "ok": false}
+			if wc, ok := c.chatAPI.Whisper.(*whisper.Client); ok && wc != nil {
+				out["url"] = cfg.WhisperURL
+				pctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+				defer cancel()
+				if err := wc.Ping(pctx); err != nil {
+					out["error"] = err.Error()
+				} else {
+					out["ok"] = true
+				}
+			}
+			httpx.JSON(w, 200, out)
+			return nil
+		}))
 		c.catalog.AdminRoutes(r, cfg.SecretsKey)
 		c.services.AdminRoutes(r)
 		c.clients.AdminRoutes(r)
@@ -632,6 +684,7 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 	internal := chi.NewRouter()
 	internal.Use(httpx.Observe)
 	internal.Handle("/internal/v1/mcp", builtin)
+	(&gigachat.Bridge{Client: c.models.GigaChat, Lookup: c.models.BridgeConn, Verify: c.models.VerifyBridge}).Routes(internal)
 	c.catalog.ProxyRoutes(internal, c.userEmail, func(ctx context.Context, conv, uid, item uuid.UUID, server, tool string, args json.RawMessage) (string, bool) {
 		return confirms.Hold(ctx, conv, uid, &item, server, tool, args)
 	})
@@ -712,6 +765,7 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 	g.Go(func() error { vkPoller.Run(gctx); return nil })       // one VK Teams poller per instance
 	g.Go(func() error { c.accounts.RunJobs(gctx); return nil }) // the steps of archiving
 	g.Go(func() error { return runPurge(gctx, cfg, c.accounts) })
+	g.Go(func() error { return runModelsRefresh(gctx, cfg, c.models) })
 	g.Go(func() error {
 		return kafka.ConsumeParallel(gctx, cfg.KafkaBrokers, "nabu-worker", kafka.TopicInbound, cfg.InboundWorkers, eng.HandleInbound)
 	})
@@ -833,6 +887,24 @@ func runPurge(ctx context.Context, cfg *config.Config, acc *accounts.Service) er
 			continue
 		}
 		slog.Info("purge finished", "accounts", n)
+	}
+}
+
+// runModelsRefresh asks the providers for their models by MODELS_REFRESH_CRON
+// (FTR.NAB.CHAT-0001 R10): new models are marked, gone ones too.
+func runModelsRefresh(ctx context.Context, cfg *config.Config, ms *models.Service) error {
+	sched, err := cron.ParseStandard(cfg.ModelsRefreshCron)
+	if err != nil {
+		return fmt.Errorf("MODELS_REFRESH_CRON: %w", err)
+	}
+	for {
+		next := sched.Next(time.Now())
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(time.Until(next)):
+		}
+		ms.RefreshAll(ctx)
 	}
 }
 

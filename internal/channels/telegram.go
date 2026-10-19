@@ -155,8 +155,36 @@ func (t *Telegram) Setup(ctx context.Context, publicAPIURL string) error {
 		return err
 	}
 	_, secret := t.creds()
-	return t.call(ctx, "setWebhook", map[string]any{"url": publicAPIURL + "/hooks/v1/telegram/" + secret, "secret_token": secret,
-		"allowed_updates": []string{"message", "my_chat_member"}}, nil)
+	if err := t.call(ctx, "setWebhook", map[string]any{"url": publicAPIURL + "/hooks/v1/telegram/" + secret, "secret_token": secret,
+		"allowed_updates": []string{"message", "my_chat_member"}}, nil); err != nil {
+		return err
+	}
+	t.setCommands(ctx)
+	return nil
+}
+
+// botCommands are the commands of the conversation in the menu of the bot
+// (FTR.NAB.CHAT-0001 R6, SKL-10), by language; "" is the default.
+var botCommands = map[string][][2]string{
+	"":   {{"new", "Start with a clean context"}, {"compact", "Compact the context"}, {"skills", "My skills"}, {"skill", "Call a skill: /skill <name> <task>"}},
+	"ru": {{"new", "Начать с чистого контекста"}, {"compact", "Сжать контекст"}, {"skills", "Мои скиллы"}, {"skill", "Вызвать скилл: /skill <имя> <задача>"}},
+}
+
+// setCommands registers the commands; a failure only costs the menu.
+func (t *Telegram) setCommands(ctx context.Context) {
+	for lang, cmds := range botCommands {
+		list := make([]map[string]string, 0, len(cmds))
+		for _, c := range cmds {
+			list = append(list, map[string]string{"command": c[0], "description": c[1]})
+		}
+		body := map[string]any{"commands": list}
+		if lang != "" {
+			body["language_code"] = lang
+		}
+		if err := t.call(ctx, "setMyCommands", body, nil); err != nil {
+			slog.WarnContext(ctx, "telegram commands", "language", lang, "err", err)
+		}
+	}
 }
 
 // Username is the bot's username after Setup.

@@ -3,9 +3,13 @@ package pi
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"net/http"
 	"os"
@@ -29,6 +33,13 @@ func CheckLLM(ctx context.Context, rt Runtime, root string, req agent.LLMCheckRe
 	}
 	sreq := agent.SessionRequest{Kind: agent.KindChat, Model: req.Model, Secrets: agent.Secrets{LLMKey: req.Secrets.LLMKey}}
 	sreq.Model.ModelID, sreq.Model.Thinking = req.Model.Models[0].ID, "off"
+	probes := map[string]bool{}
+	for _, p := range req.Probes {
+		probes[p] = true
+	}
+	if probes[agent.ProbeTools] {
+		sreq = sreq.WithProbeTools()
+	}
 	s, err := Start(ctx, rt, root, sreq)
 	if err != nil {
 		for _, m := range req.Model.Models {
@@ -38,9 +49,73 @@ func CheckLLM(ctx context.Context, rt Runtime, root string, req agent.LLMCheckRe
 	}
 	defer s.Close()
 	for _, m := range req.Model.Models {
-		out.Results = append(out.Results, checkModel(ctx, s, m.ID))
+		r := checkModel(ctx, s, m.ID)
+		if r.OK && len(probes) > 0 {
+			r.Caps = map[string]string{}
+			if probes[agent.ProbeImage] {
+				r.Caps[agent.ProbeImage] = agent.ProbeSkipped
+				if m.HasInput("image") {
+					r.Caps[agent.ProbeImage] = probeImage(ctx, s)
+				}
+			}
+			if probes[agent.ProbeTools] {
+				r.Caps[agent.ProbeTools] = probeTools(ctx, s)
+			}
+		}
+		out.Results = append(out.Results, r)
 	}
 	return out
+}
+
+// redSquare is a PNG of 32×32 red pixels: the image probe asks for its colour.
+var redSquare = func() string {
+	img := image.NewRGBA(image.Rect(0, 0, 32, 32))
+	for x := 0; x < 32; x++ {
+		for y := 0; y < 32; y++ {
+			img.Set(x, y, color.RGBA{R: 220, A: 255})
+		}
+	}
+	var b bytes.Buffer
+	_ = png.Encode(&b, img)
+	return base64.StdEncoding.EncodeToString(b.Bytes())
+}()
+
+// probeImage confirms that the model sees images (FTR.NAB.CHAT-0001 R9).
+func probeImage(ctx context.Context, s *Session) string {
+	cctx, cancel := context.WithTimeout(ctx, CheckTimeout)
+	defer cancel()
+	text, failed := "", false
+	err := s.Prompt(cctx, agent.PromptRequest{Text: "What colour is the square in the picture? Answer with one word.",
+		Images: []agent.Image{{MimeType: "image/png", Data: redSquare}}}, func(e agent.Event) {
+		switch e.Type {
+		case agent.EventError:
+			failed = true
+		case agent.EventTextDelta:
+			text += e.Delta
+		}
+	})
+	t := strings.ToLower(text)
+	if err == nil && !failed && (strings.Contains(t, "red") || strings.Contains(t, "красн")) {
+		return agent.ProbeConfirmed
+	}
+	return agent.ProbeUnconfirmed
+}
+
+// probeTools confirms that the model calls tools: the check session has Pi's
+// ls in an empty directory.
+func probeTools(ctx context.Context, s *Session) string {
+	cctx, cancel := context.WithTimeout(ctx, CheckTimeout)
+	defer cancel()
+	called := false
+	_ = s.Prompt(cctx, agent.PromptRequest{Text: "Call the ls tool once to list the current directory, then reply with one word: done"}, func(e agent.Event) {
+		if e.Type == agent.EventToolCall && e.Name == "ls" {
+			called = true
+		}
+	})
+	if called {
+		return agent.ProbeConfirmed
+	}
+	return agent.ProbeUnconfirmed
 }
 
 func checkModel(ctx context.Context, s *Session, modelID string) agent.LLMCheckResult {

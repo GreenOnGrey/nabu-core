@@ -134,7 +134,7 @@ func (e *Engine) personalRequest(ctx context.Context, u *users.User, conv uuid.U
 	if err != nil {
 		return nil, err
 	}
-	model, key, err := e.Models.ResolvePersonal(ctx, ag.ConnectionID, ag.Model)
+	model, key, err := e.Models.ResolveUser(ctx, u.ID, ag.ConnectionID, ag.Model) // FTR.NAB.CMN-0007 R8
 	if err != nil {
 		return nil, err
 	}
@@ -167,13 +167,7 @@ func (e *Engine) personalRequest(ctx context.Context, u *users.User, conv uuid.U
 		secrets = append(secrets, strings.TrimPrefix(cat.Headers[s.Name]["Authorization"], "Bearer "))
 		titles = append(titles, s.Description)
 	}
-	if len(cat.Skills) > 0 {
-		var hash string
-		for _, h := range cat.SkillSnapshots {
-			hash = h // one skills source per session (the latest)
-		}
-		req.Skills = &agent.Skills{Hash: hash, Names: cat.Skills}
-	}
+	req.Skills = e.sessionSkills(ctx, cat)
 	if e.Space.Enabled {
 		wsID := space.WorkspaceID(u.ID)
 		call := e.Signer.Issue(jwt.Claims{Audience: jwt.AudCall, Workspace: wsID}, tokenTTL)
@@ -216,6 +210,8 @@ type convSession struct {
 	Model       string
 	OpenedAt    time.Time
 	Generation  int64
+	// ContextTokens of ContextWindow: the fill after the last run (R3).
+	ContextTokens, ContextWindow int64
 	// Fresh: the session was opened for this turn (the first-token metric).
 	Fresh bool
 }
@@ -225,8 +221,10 @@ func snapshotKey(conv uuid.UUID) string { return "sessions/" + conv.String() + "
 func (e *Engine) loadSession(ctx context.Context, conv uuid.UUID) (*convSession, error) {
 	var s convSession
 	var model *string
-	err := e.Pool.QueryRow(ctx, `SELECT id, COALESCE(operator_session,''), COALESCE(persona_hash,''), model, last_active_at, COALESCE(pod_generation, 0)
-		FROM harness_sessions WHERE conversation_id = $1 AND closed_at IS NULL`, conv).Scan(&s.ID, &s.OpSession, &s.PersonaHash, &model, &s.OpenedAt, &s.Generation)
+	err := e.Pool.QueryRow(ctx, `SELECT id, COALESCE(operator_session,''), COALESCE(persona_hash,''), model, last_active_at, COALESCE(pod_generation, 0),
+		context_tokens, context_window
+		FROM harness_sessions WHERE conversation_id = $1 AND closed_at IS NULL`, conv).Scan(&s.ID, &s.OpSession, &s.PersonaHash, &model, &s.OpenedAt, &s.Generation,
+		&s.ContextTokens, &s.ContextWindow)
 	if postgres.IsNoRows(err) {
 		return nil, nil
 	}
@@ -254,6 +252,10 @@ func (e *Engine) ensureSession(ctx context.Context, lease *agentpods.Lease, conv
 			_ = op.Close(ctx, cur.OpSession)
 		}
 		_, _ = e.Pool.Exec(ctx, `UPDATE harness_sessions SET closed_at = now() WHERE id = $1`, cur.ID)
+	}
+	var carried ContextCarry
+	if cur != nil {
+		carried = ContextCarry{cur.ContextTokens, cur.ContextWindow}
 	}
 	req := b.req
 	if snap, err := storage.ReadAll(ctx, e.S3, snapshotKey(conv)); err == nil && len(snap) > 0 {
@@ -284,12 +286,15 @@ func (e *Engine) ensureSession(ctx context.Context, lease *agentpods.Lease, conv
 	}
 	s := &convSession{OpSession: resp.SessionID, PersonaHash: b.persona.Hash(), Model: b.model.ConnectionID + "/" + b.model.ModelID + "/" + b.model.Thinking,
 		OpenedAt: time.Now(), Generation: lease.Generation(), Fresh: true}
-	const ins = `INSERT INTO harness_sessions (conversation_id, harness, operator_session, persona_hash, model, snapshot_key, pod_generation)
-		VALUES ($1,'pi',$2,$3,$4,$5,$6) RETURNING id`
-	err = e.Pool.QueryRow(ctx, ins, conv, s.OpSession, s.PersonaHash, s.Model, snapshotKey(conv), s.Generation).Scan(&s.ID)
+	if req.Snapshot != nil { // the restored session has the context of the closed one
+		s.ContextTokens, s.ContextWindow = carried.Tokens, carried.Window
+	}
+	const ins = `INSERT INTO harness_sessions (conversation_id, harness, operator_session, persona_hash, model, snapshot_key, pod_generation, context_tokens, context_window)
+		VALUES ($1,'pi',$2,$3,$4,$5,$6,$7,$8) RETURNING id`
+	err = e.Pool.QueryRow(ctx, ins, conv, s.OpSession, s.PersonaHash, s.Model, snapshotKey(conv), s.Generation, s.ContextTokens, s.ContextWindow).Scan(&s.ID)
 	if postgres.IsUniqueViolation(err) {
 		_, _ = e.Pool.Exec(ctx, `UPDATE harness_sessions SET closed_at = now() WHERE conversation_id = $1 AND closed_at IS NULL`, conv)
-		err = e.Pool.QueryRow(ctx, ins, conv, s.OpSession, s.PersonaHash, s.Model, snapshotKey(conv), s.Generation).Scan(&s.ID)
+		err = e.Pool.QueryRow(ctx, ins, conv, s.OpSession, s.PersonaHash, s.Model, snapshotKey(conv), s.Generation, s.ContextTokens, s.ContextWindow).Scan(&s.ID)
 	}
 	return s, err
 }
@@ -304,6 +309,10 @@ func (e *Engine) saveSnapshot(ctx context.Context, op Operator, conv uuid.UUID, 
 	}
 	_, _ = e.Pool.Exec(ctx, `UPDATE harness_sessions SET last_active_at = now() WHERE conversation_id = $1 AND closed_at IS NULL`, conv)
 }
+
+// ContextCarry is the fill of a closed session carried to the session
+// restored from its snapshot.
+type ContextCarry struct{ Tokens, Window int64 }
 
 // ─── the stream of a turn ───────────────────────────────────────────
 
@@ -326,7 +335,11 @@ type collector struct {
 	args     map[string]string
 	failure  *agent.Event
 	total    agent.Usage
-	onEvent  func(agent.Event)
+	// FTR.NAB.CHAT-0001 R2, R3: compactions the harness made in the run and
+	// the fill of the context after it.
+	compactions                  []agent.Event
+	contextTokens, contextWindow int64
+	onEvent                      func(agent.Event)
 	// first is called once, with the first piece of the answer.
 	first func()
 }
@@ -408,6 +421,10 @@ func (c *collector) handle(ev agent.Event) {
 	case agent.EventError:
 		ev := ev
 		c.failure = &ev
+	case agent.EventCompaction:
+		c.compactions = append(c.compactions, ev)
+	case agent.EventContext:
+		c.contextTokens, c.contextWindow = ev.ContextTokens, ev.ContextWindow
 	}
 }
 
@@ -443,6 +460,9 @@ func (e *Engine) HandleInbound(ctx context.Context, key, value []byte) error {
 	}
 	if u == nil {
 		return nil
+	}
+	if in.Command != "" { // FTR.NAB.CHAT-0001 R1, R2
+		return e.handleCommand(ctx, key, value, in, u)
 	}
 	turn := agentpods.Turn{Kind: agentpods.KindMessage, Ref: "m:" + in.MessageID.String(), Topic: kafka.TopicInbound, Key: string(key),
 		Value: value, ConversationID: in.ConversationID, MessageID: in.MessageID, Channel: in.Channel}
@@ -532,7 +552,11 @@ func (e *Engine) HandleInbound(ctx context.Context, key, value []byte) error {
 	if mctx.Group != nil && mctx.Group.AuthorID != uuid.Nil {
 		author = &mctx.Group.AuthorID
 	}
-	res := e.personalTurn(ctx, lease, asked, u, in.ConversationID, asst.ID, in.Channel, in.ClientID, text, images, author, draft)
+	skill := ""
+	if userMsg.Skill != nil {
+		skill = *userMsg.Skill
+	}
+	res := e.personalTurn(ctx, lease, asked, u, in.ConversationID, asst.ID, in.Channel, in.ClientID, text, images, author, draft, skill)
 	if res.podLost {
 		// R5, LC-04: the pod went away before the answer began — the turn goes
 		// back to the queue and continues this answer in a new pod.
@@ -685,10 +709,13 @@ func (e *Engine) podLost(lease *agentpods.Lease, err error) bool {
 }
 
 func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked time.Time, u *users.User, conv, msgID uuid.UUID, ch string, clientID *uuid.UUID, text string, images []agent.Image,
-	author *uuid.UUID, draft *drafter) turnResult {
+	author *uuid.UUID, draft *drafter, skill string) turnResult {
 	b, err := e.personalRequest(ctx, u, conv, nil, "conv "+conv.String()[:8])
 	if err != nil {
 		var class = "agent_not_configured"
+		if strings.Contains(err.Error(), "no_models_granted") { // FTR.NAB.CMN-0007 RES-03
+			return turnResult{errClass: "no_models_granted", errText: err.Error()}
+		}
 		if !strings.Contains(err.Error(), "agent_not_configured") {
 			class = string(agent.ErrAgentCrashed)
 			slog.ErrorContext(ctx, "build session", "err", err)
@@ -715,6 +742,12 @@ func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked
 		col.onEvent = func(ev agent.Event) { draft.event(ctx, ev) }
 	}
 	op := lease.Operator()
+	images, text = imagesFor(b.model, images, text, e.Space.Enabled)
+	if d := modelDef(b.model); d != nil && d.Name != "" { // R18: the answer names its model
+		e.Chat.SetModel(ctx, msgID, d.Name)
+	} else {
+		e.Chat.SetModel(ctx, msgID, b.model.ModelID)
+	}
 	var sess *convSession
 	for attempt := 0; attempt < 2; attempt++ {
 		sess, err = e.ensureSession(ctx, lease, conv, b, attempt > 0)
@@ -744,6 +777,15 @@ func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked
 				continue // another connection: a new session (from the snapshot)
 			}
 		}
+		// R17, CTX-11: a context too large for the model of the turn is compacted first
+		if w := modelWindow(b.model); w > 0 && float64(sess.ContextTokens) > autoCompactShare*float64(w) {
+			if _, cerr := e.compact(ctx, op, u, b, conv, sess, "", true, ch); cerr != nil {
+				slog.WarnContext(ctx, "compaction before the turn", "conversation", conv, "err", cerr)
+			}
+		}
+		if skill != "" { // R5: the skill's instructions come into the context with the request
+			prompt = skillPrompt(b.req.Skills, skill, prompt)
+		}
 		err = op.Prompt(ctx, sess.OpSession, agent.PromptRequest{Text: prompt, Images: images}, col.handle)
 		if errors.Is(err, agent.ErrSessionGone) || errors.Is(err, agent.ErrStreamBroken) {
 			_, _ = e.Pool.Exec(ctx, `UPDATE harness_sessions SET closed_at = now() WHERE id = $1`, sess.ID)
@@ -754,6 +796,15 @@ func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked
 		break
 	}
 	col.flush()
+	if sess != nil {
+		for _, c := range col.compactions { // R2: compactions the harness made itself
+			c.Auto = true
+			if _, cerr := e.compactionEvent(ctx, u, conv, ch, c, modelWindow(b.model)); cerr != nil {
+				slog.WarnContext(ctx, "compaction event", "err", cerr)
+			}
+		}
+		e.recordContext(ctx, u.ID, conv, sess.ID, col.contextTokens, col.contextWindow)
+	}
 	if err == nil && sess != nil {
 		e.saveSnapshot(context.WithoutCancel(ctx), op, conv, sess.OpSession)
 	}
@@ -861,6 +912,7 @@ var errorTexts = map[string]map[string]string{
 		"queue_busy":           "The agent is busy, I will answer as soon as a place is free.",
 		"agent_not_configured": "The agent is not configured yet: an administrator has to add a model connection.",
 		"user_blocked":         "Access to the agent is closed for your account.",
+		"no_models_granted":    "No model is available to you — ask an administrator.",
 	},
 	"ru": {
 		"insufficient_balance": "У провайдера моделей закончился баланс. Его должен пополнить администратор.",
@@ -874,6 +926,7 @@ var errorTexts = map[string]map[string]string{
 		"queue_busy":           "Агент занят, отвечу, как только освободится место.",
 		"agent_not_configured": "Агент ещё не настроен: администратор должен добавить подключение к моделям.",
 		"user_blocked":         "Доступ к агенту для вашей учётной записи закрыт.",
+		"no_models_granted":    "Вам не доступна ни одна модель — обратитесь к администратору.",
 	},
 }
 

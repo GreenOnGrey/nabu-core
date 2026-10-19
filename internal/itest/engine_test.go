@@ -116,7 +116,7 @@ func TestEngineWithPi(t *testing.T) {
 	defer osrv.Close()
 
 	ms := &models.Service{Pool: pool, Box: box}
-	conn, err := ms.Create(ctx, models.Input{Type: models.TypeOpenAICompatible, Name: "Fake", BaseURL: lsrv.URL, APIKey: "sk-fake-0001", Models: []string{"fake-1"}})
+	conn, err := ms.Create(ctx, models.Input{Type: models.TypeOpenAICompatible, Name: "Fake", BaseURL: lsrv.URL, APIKey: "sk-fake-0001", Models: models.Refs("fake-1")})
 	if err != nil {
 		t.Fatal(err)
 	}

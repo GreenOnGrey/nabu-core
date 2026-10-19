@@ -156,7 +156,7 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 				return string(raw), nil
 			}),
 		tool("comm_note_save", "Save the note of a thread of the batch: what was discussed, what was decided, what stays open. Never copy passwords, keys or tokens. "+
-			"Choose topics from the batch's list when one fits; create a new one only when none does.",
+			"Choose topics from the batch's list when one fits; create a new one only when none does; give none when the thread has no project or matter.",
 			mcp.Schema(map[string]any{
 				"threadKey": map[string]any{"type": "string"},
 				"dayKey":    map[string]any{"type": "string", "description": "As given in the batch; empty for mail"},
@@ -164,7 +164,7 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 				"summary":   map[string]any{"type": "string", "description": "Up to 4000 characters, in the language of the conversation"},
 				"people": map[string]any{"type": "array", "description": "The participants other than the user", "items": map[string]any{"type": "object",
 					"properties": map[string]any{"email": map[string]any{"type": "string"}, "name": map[string]any{"type": "string"}}, "required": []string{"email"}}},
-				"topics": map[string]any{"type": "array", "description": "From 1 to 5 topics", "items": map[string]any{"type": "string"}},
+				"topics": map[string]any{"type": "array", "description": "From 0 to 5 topics; empty for automated notices and one-off messages", "items": map[string]any{"type": "string"}},
 			}, "threadKey", "title", "summary", "topics"),
 			func(ctx context.Context, g mcp.Grant, b *Batch, ad collect.Adapter, args json.RawMessage) (string, error) {
 				var in struct {

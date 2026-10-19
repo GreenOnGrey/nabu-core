@@ -303,13 +303,7 @@ func (e *Engine) serviceTurn(ctx context.Context, runID uuid.UUID, ag *services.
 		req.MCP = append(req.MCP, agent.MCPServer{Name: c.Name, URL: c.URL, HeaderNames: names, Exposure: "direct", Description: clientName + " tools of this run"})
 		req.Secrets.MCPHeaders[c.Name] = c.Headers
 	}
-	if len(cat.Skills) > 0 {
-		var hash string
-		for _, h := range cat.SkillSnapshots {
-			hash = h
-		}
-		req.Skills = &agent.Skills{Hash: hash, Names: cat.Skills}
-	}
+	req.Skills = e.sessionSkills(ctx, cat)
 	switch ag.Workspace {
 	case services.WorkspaceExternal:
 		wsID := services.WorkspaceID(runID)

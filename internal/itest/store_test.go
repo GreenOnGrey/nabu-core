@@ -352,7 +352,7 @@ func TestClientsAndRuns(t *testing.T) {
 	box, _ := crypto.NewBox(key)
 	signer := jwt.NewSigner("https://n", key)
 	ms := &models.Service{Pool: pool, Box: box}
-	conn, err := ms.Create(ctx, models.Input{Type: models.TypeOpenAICompatible, Name: "LiteLLM", BaseURL: "http://litellm:4000", APIKey: "sk-123456789", Models: []string{"gpt-x"}})
+	conn, err := ms.Create(ctx, models.Input{Type: models.TypeOpenAICompatible, Name: "LiteLLM", BaseURL: "http://litellm:4000", APIKey: "sk-123456789", Models: models.Refs("gpt-x")})
 	if err != nil {
 		t.Fatal(err)
 	}

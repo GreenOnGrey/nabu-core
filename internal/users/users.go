@@ -374,6 +374,12 @@ func (r *Repo) SetAgent(ctx context.Context, userID uuid.UUID, name, tone *strin
 	return err
 }
 
+// ClearModel returns the agent to the default model (FTR.NAB.CHAT-0001 R16).
+func (r *Repo) ClearModel(ctx context.Context, userID uuid.UUID) error {
+	_, err := r.Pool.Exec(ctx, `UPDATE agent_profiles SET model_connection_id = NULL, model = NULL, updated_at = now() WHERE user_id = $1`, userID)
+	return err
+}
+
 // ─── administration ─────────────────────────────────────────────────
 
 // AdminUser is a row of Administration → Users.
@@ -444,6 +450,16 @@ func (r *Repo) AdminPatch(ctx context.Context, actor, id uuid.UUID, isAdmin, blo
 	admin := u.IsAdmin
 	if isAdmin != nil {
 		admin = *isAdmin
+	}
+	// FTR.NAB.CMN-0007 R3, ADM-03: the group «admins» never empties
+	if u.IsAdmin && (!admin || status == "blocked") {
+		var others int
+		if err := r.Pool.QueryRow(ctx, `SELECT count(*) FROM users WHERE is_admin AND status = 'active' AND id <> $1`, id).Scan(&others); err != nil {
+			return nil, err
+		}
+		if others == 0 {
+			return nil, apperr.Conflict("last_admin", "the last administrator cannot lose the role")
+		}
 	}
 	if _, err := r.Pool.Exec(ctx, `UPDATE users SET is_admin = $2, status = $3 WHERE id = $1`, id, admin, status); err != nil {
 		return nil, err

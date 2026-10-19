@@ -33,6 +33,8 @@ type Operator interface {
 	Patch(ctx context.Context, sessionID string, p agent.PatchRequest) error
 	Snapshot(ctx context.Context, sessionID string) ([]byte, error)
 	Close(ctx context.Context, sessionID string) error
+	// Compact compacts the context of a session (FTR.NAB.CHAT-0001 R2).
+	Compact(ctx context.Context, sessionID, instructions string) (agent.CompactResponse, error)
 }
 
 // Kube is the part of the Kubernetes API the manager uses.

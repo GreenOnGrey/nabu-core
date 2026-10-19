@@ -29,6 +29,7 @@ const (
 	AudSandbox   = "nabu:sandbox"   // a sandbox syncing its files through the api
 	AudMCP       = "nabu:mcp"       // the built-in MCP of a session
 	AudAgent     = "nabu:agent"     // the worker calling the agent pod of one owner
+	AudLLMBridge = "nabu:llm"       // an agent calling the model bridge of one connection (FTR.NAB.CHAT-0001 tech §2.4)
 )
 
 // Claims are the claims Nabu uses.

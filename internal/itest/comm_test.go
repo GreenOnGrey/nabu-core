@@ -208,12 +208,16 @@ func TestCommNotes(t *testing.T) {
 		t.Fatalf("notes counter %d", st.Notes)
 	}
 
-	// NOTE-11: none or more than five topics are refused.
-	for _, topics := range [][]string{nil, {"a", "b", "c", "d", "e", "f"}} {
-		_, err := s.SaveNote(ctx, u, comm.SaveNote{ItemID: commItem, Source: "gmail", ThreadKey: "x", Title: "t", Summary: "s", Topics: topics})
-		if !isCode(err, "invalid_topics") {
-			t.Fatalf("topics %v: %v", topics, err)
-		}
+	// NOTE-11: more than five topics are refused; a note without topics is saved (R8 v1.5).
+	if _, err := s.SaveNote(ctx, u, comm.SaveNote{ItemID: commItem, Source: "gmail", ThreadKey: "x", Title: "t", Summary: "s", Topics: []string{"a", "b", "c", "d", "e", "f"}}); !isCode(err, "invalid_topics") {
+		t.Fatalf("six topics: %v", err)
+	}
+	if bare, err := s.SaveNote(ctx, u, comm.SaveNote{ItemID: commItem, Source: "gmail", ThreadKey: "notice", Title: "Подтверждение регистрации", Summary: "Автоматическое письмо", Topics: nil}); err != nil {
+		t.Fatalf("no topics: %v", err)
+	} else if n, _ := s.Get(ctx, u, bare.ID); len(n.Topics) != 0 {
+		t.Fatalf("topics of a bare note: %+v", n.Topics)
+	} else if err := s.Delete(ctx, u, bare.ID); err != nil {
+		t.Fatalf("delete the bare note: %v", err)
 	}
 
 	// NOTE-07, NOTE-08: a secret the model carried over is masked by the handler.
@@ -1006,7 +1010,8 @@ func TestCommRetention(t *testing.T) {
 	if _, err := s.SaveSettings(ctx, comm.SettingsPatch{RetentionDays: &days}); err != nil {
 		t.Fatal(err)
 	}
-	if p, _ = s.Purge(ctx); p.Notes != 1 || titles() != "" {
+	// the purge is global: with five days it also takes the old notes of other tests
+	if p, _ = s.Purge(ctx); p.Notes < 1 || titles() != "" {
 		t.Fatalf("after shortening the retention: %+v %s", p, titles())
 	}
 	def := comm.DefaultRetentionDays

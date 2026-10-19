@@ -47,7 +47,8 @@ The note:
 - title: a short name of the conversation, not the subject line with "Re:".
 - summary: what was discussed, what was decided, what stays open. A few short lines, in the language of the conversation. When the batch gives a previous note, write the summary of the whole thread, not only of the news.
 - people: the participants other than the user, with their names when the messages give them.
-- topics: one to five. Take a topic from the batch's list when it fits — the same subject in other words is the same topic. Create a new one only when none fits; name it by the project, product or matter, two or three words.
+- topics: zero to five. Take a topic from the batch's list when it fits — the same subject in other words is the same topic. Create a new one only when none fits; name it by the project, product or matter, two or three words.
+  Give no topic to a thread without a project or matter: automated notices (registrations, confirmations, codes, receipts, security alerts, delivery) and one-off messages. Never give a topic only because the list has nothing better: an unrelated topic is worse than none.
 
 Commitments:
 - A commitment is a promise or a request with a clear action: "I will send the report by Friday", "please return the contract". A wish, a question or a plan without an owner is not one.

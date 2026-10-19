@@ -8,6 +8,7 @@ package chat
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -65,13 +66,21 @@ type Message struct {
 	Context        json.RawMessage `json:"context,omitempty"`
 	// Card is the structured part of a message the web chat draws instead of
 	// the text: the digest of commitments (FTR.NAB.CMN-0003 tech §3.5).
-	Card       json.RawMessage `json:"card,omitempty"`
-	Model      *string         `json:"model"`
-	ErrorClass *string         `json:"errorClass"`
-	ErrorText  *string         `json:"errorText"`
-	Retryable  bool            `json:"retryable,omitempty"`
-	ReplyTo    *uuid.UUID      `json:"replyTo"`
-	CreatedAt  time.Time       `json:"createdAt"`
+	Card json.RawMessage `json:"card,omitempty"`
+	// Event is an event of the conversation shown as a divider (role
+	// "event"): a reset, a compaction, a change of the model
+	// (FTR.NAB.CHAT-0001 R1, R2, R16).
+	Event json.RawMessage `json:"event,omitempty"`
+	// Skill is the skill the user called with the message (R5).
+	Skill *string `json:"skill"`
+	// Voice: the text was recognized from a voice message (R21).
+	Voice      bool       `json:"voice,omitempty"`
+	Model      *string    `json:"model"`
+	ErrorClass *string    `json:"errorClass"`
+	ErrorText  *string    `json:"errorText"`
+	Retryable  bool       `json:"retryable,omitempty"`
+	ReplyTo    *uuid.UUID `json:"replyTo"`
+	CreatedAt  time.Time  `json:"createdAt"`
 }
 
 // Store is the conversation repository.
@@ -184,17 +193,20 @@ func (s *Store) ArchiveIdle(ctx context.Context, after time.Duration) ([]uuid.UU
 }
 
 const msgCols = `m.id, m.conversation_id, m.role, m.text, m.channel, m.status, m.attachments, m.tool_steps, m.context, m.model,
-	m.error_class, m.error_text, m.reply_to, m.created_at, m.card`
+	m.error_class, m.error_text, m.reply_to, m.created_at, m.card, m.event, m.skill, m.voice`
 
 func scanMsg(row pgx.Row) (*Message, error) {
 	var m Message
-	var atts, steps, ctxb, card []byte
+	var atts, steps, ctxb, card, ev []byte
 	if err := row.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Text, &m.Channel, &m.Status, &atts, &steps, &ctxb, &m.Model,
-		&m.ErrorClass, &m.ErrorText, &m.ReplyTo, &m.CreatedAt, &card); err != nil {
+		&m.ErrorClass, &m.ErrorText, &m.ReplyTo, &m.CreatedAt, &card, &ev, &m.Skill, &m.Voice); err != nil {
 		return nil, err
 	}
 	if len(card) > 0 {
 		m.Card = card
+	}
+	if len(ev) > 0 {
+		m.Event = ev
 	}
 	_ = json.Unmarshal(atts, &m.Attachments)
 	_ = json.Unmarshal(steps, &m.ToolSteps)
@@ -247,13 +259,27 @@ func (s *Store) Message(ctx context.Context, uid, id uuid.UUID) (*Message, error
 
 // AddUser stores a user message.
 func (s *Store) AddUser(ctx context.Context, conv uuid.UUID, text, channel string, atts []Attachment, msgCtx json.RawMessage) (*Message, error) {
-	ab, _ := json.Marshal(atts)
+	return s.AddUserMessage(ctx, conv, UserMessage{Text: text, Channel: channel, Attachments: atts, Context: msgCtx})
+}
+
+// UserMessage is a user message to store.
+type UserMessage struct {
+	Text, Channel string
+	Attachments   []Attachment
+	Context       json.RawMessage
+	Skill         string // FTR.NAB.CHAT-0001 R5
+	Voice         bool   // R21
+}
+
+// AddUserMessage stores a user message with its skill and voice mark.
+func (s *Store) AddUserMessage(ctx context.Context, conv uuid.UUID, u UserMessage) (*Message, error) {
+	ab, _ := json.Marshal(u.Attachments)
 	var c any
-	if len(msgCtx) > 0 {
-		c = []byte(msgCtx)
+	if len(u.Context) > 0 {
+		c = []byte(u.Context)
 	}
-	m, err := scanMsg(s.Pool.QueryRow(ctx, `WITH m AS (INSERT INTO messages (conversation_id, role, text, channel, attachments, context)
-		VALUES ($1,'user',$2,$3,$4,$5) RETURNING *) SELECT `+msgCols+` FROM m`, conv, text, channel, ab, c))
+	m, err := scanMsg(s.Pool.QueryRow(ctx, `WITH m AS (INSERT INTO messages (conversation_id, role, text, channel, attachments, context, skill, voice)
+		VALUES ($1,'user',$2,$3,$4,$5,NULLIF($6,''),$7) RETURNING *) SELECT `+msgCols+` FROM m`, conv, u.Text, u.Channel, ab, c, u.Skill, u.Voice))
 	if err == nil {
 		_, _ = s.Pool.Exec(ctx, `UPDATE conversations SET last_message_at = now() WHERE id = $1`, conv)
 	}
@@ -278,23 +304,90 @@ func (s *Store) Finish(ctx context.Context, id uuid.UUID, text, status string, s
 	return m, err
 }
 
+// SetModel records the model that writes an answer (FTR.NAB.CHAT-0001 R18).
+func (s *Store) SetModel(ctx context.Context, id uuid.UUID, model string) {
+	_, _ = s.Pool.Exec(ctx, `UPDATE messages SET model = NULLIF($2,'') WHERE id = $1`, id, model)
+}
+
 // SetCard attaches a card to a message (the digest of commitments).
 func (s *Store) SetCard(ctx context.Context, id uuid.UUID, card json.RawMessage) error {
 	_, err := s.Pool.Exec(ctx, `UPDATE messages SET card = $2 WHERE id = $1`, id, []byte(card))
 	return err
 }
 
-// History returns the latest messages of a conversation, oldest first.
+// History returns the latest messages of a conversation that the agent
+// knows, oldest first: the messages of the user and the answers after the
+// last reset of the context (FTR.NAB.CHAT-0001 R1); events are not history.
 func (s *Store) History(ctx context.Context, conv uuid.UUID, n int) ([]Message, error) {
-	l, err := s.Messages(ctx, conv, httpx.Page{Limit: n})
+	rows, err := s.Pool.Query(ctx, `SELECT `+msgCols+` FROM messages m WHERE m.conversation_id = $1 AND m.role IN ('user','assistant')
+		AND m.created_at > COALESCE((SELECT max(e.created_at) FROM messages e WHERE e.conversation_id = $1 AND e.role = 'event'
+			AND e.event->>'kind' = 'reset'), '-infinity'::timestamptz)
+		ORDER BY m.created_at DESC, m.id DESC LIMIT $2`, conv, n)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]Message, 0, len(l.Items))
-	for i := len(l.Items) - 1; i >= 0; i-- {
-		out = append(out, l.Items[i])
+	defer rows.Close()
+	var out []Message
+	for rows.Next() {
+		m, err := scanMsg(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *m)
 	}
-	return out, nil
+	slices.Reverse(out)
+	return out, rows.Err()
+}
+
+// Event kinds of a conversation (FTR.NAB.CHAT-0001 tech §3).
+const (
+	EventReset   = "reset"
+	EventCompact = "compact"
+	EventModel   = "model"
+)
+
+// Event is the payload of an event message.
+type Event struct {
+	Kind         string     `json:"kind"`
+	Auto         bool       `json:"auto,omitempty"`
+	TokensBefore int64      `json:"tokensBefore,omitempty"`
+	TokensAfter  int64      `json:"tokensAfter,omitempty"`
+	Summary      string     `json:"summary,omitempty"`
+	ConnectionID *uuid.UUID `json:"connectionId,omitempty"`
+	Model        string     `json:"model,omitempty"`
+	Name         string     `json:"name,omitempty"`
+}
+
+// AddEvent stores an event of a conversation.
+func (s *Store) AddEvent(ctx context.Context, conv uuid.UUID, channel string, ev Event) (*Message, error) {
+	b, _ := json.Marshal(ev)
+	return scanMsg(s.Pool.QueryRow(ctx, `WITH m AS (INSERT INTO messages (conversation_id, role, text, channel, event)
+		VALUES ($1,'event','',$2,$3) RETURNING *) SELECT `+msgCols+` FROM m`, conv, channel, b))
+}
+
+// Busy reports whether an answer is being written in the conversation (R1:
+// a reset waits for it). An answer left streaming for longer than stale is
+// not counted.
+func (s *Store) Busy(ctx context.Context, conv uuid.UUID, stale time.Duration) bool {
+	var busy bool
+	_ = s.Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM messages WHERE conversation_id = $1 AND role = 'assistant'
+		AND status IN ('pending','streaming') AND created_at > now() - make_interval(secs => $2))`, conv, stale.Seconds()).Scan(&busy)
+	return busy
+}
+
+// ContextFill is the fill of the context window of a conversation (R3).
+type ContextFill struct {
+	Tokens int64 `json:"tokens"`
+	Window int64 `json:"window"`
+}
+
+// Context returns the fill of the open session of a conversation; a
+// conversation without a session (new, or after a reset) is empty.
+func (s *Store) Context(ctx context.Context, conv uuid.UUID) ContextFill {
+	var f ContextFill
+	_ = s.Pool.QueryRow(ctx, `SELECT context_tokens, context_window FROM harness_sessions WHERE conversation_id = $1 AND closed_at IS NULL`, conv).
+		Scan(&f.Tokens, &f.Window)
+	return f
 }
 
 // LastUserChannel is the channel of the latest user message (the default

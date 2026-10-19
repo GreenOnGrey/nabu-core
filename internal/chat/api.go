@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
@@ -22,6 +23,7 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/platform/events"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/httpx"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/kafka"
+	"github.com/GreenOnGrey/nabu-core/internal/platform/metrics"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/storage"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/whisper"
 	"github.com/GreenOnGrey/nabu-core/internal/users"
@@ -39,6 +41,25 @@ type Inbound struct {
 	ClientID       *uuid.UUID      `json:"clientId,omitempty"`
 	Context        json.RawMessage `json:"context,omitempty"`
 	RetryOf        *uuid.UUID      `json:"retryOf,omitempty"`
+	// Command is a command of the conversation instead of a message
+	// (FTR.NAB.CHAT-0001 R1, R2, tech §2.1): reset or compact. MessageID is
+	// then the id of the job; Instructions guide a compaction.
+	Command      string `json:"command,omitempty"`
+	Instructions string `json:"instructions,omitempty"`
+}
+
+// Commands of a conversation.
+const (
+	CommandReset   = "reset"
+	CommandCompact = "compact"
+)
+
+// Skill is a skill the user may call (FTR.NAB.CHAT-0001 R4).
+type Skill struct {
+	Name        string    `json:"name"`
+	Description string    `json:"description"`
+	ItemID      uuid.UUID `json:"itemId"`
+	ItemTitle   string    `json:"itemTitle"`
 }
 
 // API serves the site's (and the delegated clients') conversation endpoints.
@@ -54,7 +75,17 @@ type API struct {
 	S3       storage.Storage
 	Whisper  whisper.Transcriber
 	MaxFile  int64
+	// Skills lists the skills the user may call (FTR.NAB.CHAT-0001 R4); nil: none.
+	Skills func(ctx context.Context, uid uuid.UUID) ([]Skill, error)
+	// MaxVoice bounds a voice recording in bytes (R20: five minutes).
+	MaxVoice int64
 }
+
+// staleTurn: an answer streaming for longer is not a running turn (R1).
+const staleTurn = 15 * time.Minute
+
+// minCompact: a shorter context is not compacted (R2).
+const minCompact = 2000
 
 // ─── attachments ────────────────────────────────────────────────────
 
@@ -121,8 +152,47 @@ func (a *API) attachments(ctx context.Context, uid uuid.UUID, ids []uuid.UUID) (
 // Post stores a user message and queues the answer (R4: one main
 // conversation for every channel). conv nil means the main conversation.
 func (a *API) Post(ctx context.Context, uid uuid.UUID, conv *uuid.UUID, text, channel string, clientID *uuid.UUID, attIDs []uuid.UUID, msgCtx json.RawMessage) (*Message, error) {
-	text = strings.TrimSpace(text)
-	if text == "" && len(attIDs) == 0 {
+	return a.PostMessage(ctx, uid, conv, PostInput{Text: text, Channel: channel, ClientID: clientID, Attachments: attIDs, Context: msgCtx})
+}
+
+// PostInput is a user message with its skill and voice mark.
+type PostInput struct {
+	Text, Channel string
+	ClientID      *uuid.UUID
+	Attachments   []uuid.UUID
+	Context       json.RawMessage
+	Skill         string // FTR.NAB.CHAT-0001 R5
+	Voice         bool   // R21
+}
+
+// skill checks that the user may call the skill (R5, SKL-04).
+func (a *API) skill(ctx context.Context, uid uuid.UUID, name string) error {
+	if name == "" {
+		return nil
+	}
+	if a.Skills != nil {
+		list, err := a.Skills(ctx, uid)
+		if err != nil {
+			return err
+		}
+		for _, s := range list {
+			if s.Name == name {
+				metrics.SkillInvocations.WithLabelValues("ok").Inc()
+				return nil
+			}
+		}
+	}
+	metrics.SkillInvocations.WithLabelValues("unavailable").Inc()
+	return apperr.Unprocessable("skill_unavailable", "the skill is not available").With("skill", name)
+}
+
+// PostMessage stores a user message and queues the answer.
+func (a *API) PostMessage(ctx context.Context, uid uuid.UUID, conv *uuid.UUID, in PostInput) (*Message, error) {
+	text, channel, clientID, attIDs, msgCtx := strings.TrimSpace(in.Text), in.Channel, in.ClientID, in.Attachments, in.Context
+	if err := a.skill(ctx, uid, in.Skill); err != nil {
+		return nil, err
+	}
+	if text == "" && len(attIDs) == 0 && in.Skill == "" {
 		return nil, apperr.Unprocessable("empty_message", "the message is empty").With("field", "text")
 	}
 	if utf8.RuneCountInString(text) > MaxText {
@@ -148,7 +218,7 @@ func (a *API) Post(ctx context.Context, uid uuid.UUID, conv *uuid.UUID, text, ch
 	if err != nil {
 		return nil, err
 	}
-	m, err := a.Store.AddUser(ctx, c.ID, text, channel, atts, msgCtx)
+	m, err := a.Store.AddUserMessage(ctx, c.ID, UserMessage{Text: text, Channel: channel, Attachments: atts, Context: msgCtx, Skill: in.Skill, Voice: in.Voice})
 	if err != nil {
 		return nil, err
 	}
@@ -169,9 +239,22 @@ func (a *API) enqueue(ctx context.Context, in Inbound) error {
 }
 
 // Receive implements channels.Inbox: messenger messages go to the main
-// conversation, letters to their topic (FTR.NAB.CMN-0002 R3).
+// conversation, letters to their topic (FTR.NAB.CMN-0002 R3). In messengers
+// the commands of the conversation are taken here (FTR.NAB.CHAT-0001 R6) and
+// a voice message becomes its text (R21).
 func (a *API) Receive(ctx context.Context, in channels.Inbound) error {
-	_, err := a.Post(ctx, in.UserID, in.Conversation, in.Text, in.Channel, nil, in.Attachments, in.Context)
+	if domain.Messenger(in.Channel) && in.Conversation == nil {
+		if done, err := a.command(ctx, in); done {
+			return err
+		}
+	}
+	pi := PostInput{Text: in.Text, Channel: in.Channel, Attachments: in.Attachments, Context: in.Context}
+	if strings.TrimSpace(in.Text) == "" && len(in.Attachments) == 1 && domain.Messenger(in.Channel) {
+		if text, ok := a.voice(ctx, in.UserID, in.Channel, in.Attachments[0]); ok {
+			pi.Text, pi.Voice = text, true
+		}
+	}
+	_, err := a.PostMessage(ctx, in.UserID, in.Conversation, pi)
 	return err
 }
 
@@ -207,12 +290,17 @@ type Me struct {
 	Channels []channels.MyChannel `json:"channels"`
 }
 
-// AgentView is GET /agent.
+// AgentView is GET /agent (FTR.NAB.CHAT-0001 tech §2.2): the model in use,
+// the default one, the selectable ones with their capabilities and the fill
+// of the context of the main conversation.
 type AgentView struct {
 	Name            string                  `json:"name"`
 	Tone            string                  `json:"tone"`
 	Model           *models.AvailableModel  `json:"model"`
+	DefaultModel    *models.AvailableModel  `json:"defaultModel"`
+	Chosen          bool                    `json:"chosen"` // the user chose the model; false — the default
 	AvailableModels []models.AvailableModel `json:"availableModels"`
+	Context         ContextFill             `json:"context"`
 }
 
 func (a *API) agentView(ctx context.Context, uid uuid.UUID) (*AgentView, error) {
@@ -220,30 +308,33 @@ func (a *API) agentView(ctx context.Context, uid uuid.UUID) (*AgentView, error) 
 	if err != nil {
 		return nil, err
 	}
-	avail, err := a.Models.AvailableForUsers(ctx)
+	avail, err := a.Models.AvailableFor(ctx, uid)
 	if err != nil {
 		return nil, err
 	}
 	v := &AgentView{Name: ag.Name, Tone: ag.Tone, AvailableModels: avail}
-	pm, _ := a.Models.Personal(ctx)
 	for i, m := range avail {
 		if ag.ConnectionID != nil && ag.Model != nil && m.ConnectionID == *ag.ConnectionID && m.Model == *ag.Model {
-			v.Model = &avail[i]
+			v.Model, v.Chosen = &avail[i], true
 		}
 	}
-	if v.Model == nil && pm.Default != nil {
-		for i, m := range avail {
-			if m.ConnectionID == pm.Default.ConnectionID && m.Model == pm.Default.Model {
-				v.Model = &avail[i]
-			}
-		}
+	// the model the agent runs on when the user did not choose (FTR.NAB.CMN-0007 R8)
+	if v.DefaultModel, err = a.Models.DefaultFor(ctx, uid); err != nil {
+		return nil, err
+	}
+	if v.Model == nil {
+		v.Model = v.DefaultModel
+	}
+	if main, err := a.Store.Main(ctx, uid); err == nil {
+		v.Context = a.Store.Context(ctx, main.ID)
 	}
 	return v, nil
 }
 
 // PatchAgent changes name, tone and model; open sessions get them with the
-// next message (R3).
-func (a *API) PatchAgent(ctx context.Context, uid uuid.UUID, name, tone *string, model *models.Choice) (*AgentView, error) {
+// next message (R3). clearModel returns to the default model
+// (FTR.NAB.CHAT-0001 R16).
+func (a *API) PatchAgent(ctx context.Context, uid uuid.UUID, name, tone *string, model *models.Choice, clearModel ...bool) (*AgentView, error) {
 	if name != nil {
 		n := strings.TrimSpace(*name)
 		if n == "" || utf8.RuneCountInString(n) > 40 {
@@ -257,7 +348,7 @@ func (a *API) PatchAgent(ctx context.Context, uid uuid.UUID, name, tone *string,
 	var conn *uuid.UUID
 	var mid *string
 	if model != nil {
-		avail, err := a.Models.AvailableForUsers(ctx)
+		avail, err := a.Models.AvailableFor(ctx, uid)
 		if err != nil {
 			return nil, err
 		}
@@ -267,19 +358,35 @@ func (a *API) PatchAgent(ctx context.Context, uid uuid.UUID, name, tone *string,
 				ok = true
 			}
 		}
-		if !ok { // MOD-03
-			return nil, apperr.Unprocessable("model_not_available", "the model is not in the list of available models").With("field", "model")
+		if !ok { // MOD-03, SEL-02
+			return nil, apperr.Unprocessable("model_not_granted", "the model is not granted to you").With("field", "model")
 		}
 		conn, mid = &model.ConnectionID, &model.Model
 	}
+	before, _ := a.agentView(ctx, uid)
 	if err := a.Users.SetAgent(ctx, uid, name, tone, conn, mid); err != nil {
 		return nil, err
 	}
-	v, err := a.agentView(ctx, uid)
-	if err == nil {
-		a.Events.Publish(ctx, events.Event{Type: events.AgentUpdated, UserID: &uid, Data: v})
+	if len(clearModel) > 0 && clearModel[0] {
+		if err := a.Users.ClearModel(ctx, uid); err != nil {
+			return nil, err
+		}
 	}
-	return v, err
+	v, err := a.agentView(ctx, uid)
+	if err != nil {
+		return nil, err
+	}
+	a.Events.Publish(ctx, events.Event{Type: events.AgentUpdated, UserID: &uid, Data: v})
+	// R16: the change of the model is an event of the main conversation
+	if before != nil && v.Model != nil && (before.Model == nil || before.Model.ConnectionID != v.Model.ConnectionID || before.Model.Model != v.Model.Model) {
+		if main, err := a.Store.Main(ctx, uid); err == nil {
+			cid := v.Model.ConnectionID
+			if ev, err := a.Store.AddEvent(ctx, main.ID, domain.ChannelWeb, Event{Kind: EventModel, ConnectionID: &cid, Model: v.Model.Model, Name: v.Model.Name}); err == nil {
+				a.Events.Publish(ctx, events.Event{Type: events.MessageCreated, UserID: &uid, Data: ev})
+			}
+		}
+	}
+	return v, nil
 }
 
 // ─── HTTP ───────────────────────────────────────────────────────────
@@ -324,20 +431,23 @@ func (a *API) Routes(r chi.Router, site bool) {
 			return nil
 		}))
 		r.Post("/transcribe", h(func(w http.ResponseWriter, r *http.Request) error {
+			p, err := httpx.MustPrincipal(r)
+			if err != nil {
+				return err
+			}
 			if a.Whisper == nil {
 				return apperr.Unavailable("transcription_unavailable", "voice input is not configured")
 			}
-			f, hdr, err := formFile(r, 25<<20)
+			f, hdr, err := formFile(r, a.maxVoice())
 			if err != nil {
 				return err
 			}
 			defer f.Close()
-			text, err := a.Whisper.Transcribe(r.Context(), f, hdr)
+			text, err := a.transcribe(r.Context(), p.UserID, f, hdr)
 			if err != nil {
-				slog.WarnContext(r.Context(), "transcription failed", "err", err)
-				return apperr.Unavailable("transcription_failed", "the voice message could not be recognized")
+				return err
 			}
-			httpx.JSON(w, 200, map[string]string{"text": strings.TrimSpace(text)})
+			httpx.JSON(w, 200, map[string]string{"text": text})
 			return nil
 		}))
 	}
@@ -359,14 +469,22 @@ func (a *API) Routes(r chi.Router, site bool) {
 			return err
 		}
 		var in struct {
-			Name  *string        `json:"name"`
-			Tone  *string        `json:"tone"`
-			Model *models.Choice `json:"model"`
+			Name  *string         `json:"name"`
+			Tone  *string         `json:"tone"`
+			Model json.RawMessage `json:"model"`
 		}
 		if err := httpx.Decode(r, &in); err != nil {
 			return err
 		}
-		v, err := a.PatchAgent(r.Context(), p.UserID, in.Name, in.Tone, in.Model)
+		var model *models.Choice
+		clear := string(in.Model) == "null" // R16: «По умолчанию»
+		if len(in.Model) > 0 && !clear {
+			model = &models.Choice{}
+			if err := json.Unmarshal(in.Model, model); err != nil {
+				return apperr.Unprocessable("invalid_model", "the model is {connectionId, model} or null").With("field", "model")
+			}
+		}
+		v, err := a.PatchAgent(r.Context(), p.UserID, in.Name, in.Tone, model, clear)
 		if err != nil {
 			return err
 		}
@@ -383,6 +501,79 @@ func (a *API) Routes(r chi.Router, site bool) {
 			return err
 		}
 		httpx.JSON(w, 200, map[string]any{"items": l})
+		return nil
+	}))
+	r.Get("/skills", h(func(w http.ResponseWriter, r *http.Request) error {
+		p, err := httpx.MustPrincipal(r)
+		if err != nil {
+			return err
+		}
+		list := []Skill{}
+		if a.Skills != nil {
+			if list, err = a.Skills(r.Context(), p.UserID); err != nil {
+				return err
+			}
+		}
+		httpx.JSON(w, 200, map[string]any{"items": list})
+		return nil
+	}))
+	r.Get("/conversations/{id}", h(func(w http.ResponseWriter, r *http.Request) error {
+		p, err := httpx.MustPrincipal(r)
+		if err != nil {
+			return err
+		}
+		id, err := convID(r, a, p)
+		if err != nil {
+			return err
+		}
+		c, err := a.Store.Get(r.Context(), p.UserID, id)
+		if err != nil {
+			return err
+		}
+		httpx.JSON(w, 200, struct {
+			*Conversation
+			Context ContextFill `json:"context"`
+		}{c, a.Store.Context(r.Context(), id)})
+		return nil
+	}))
+	r.Post("/conversations/{id}/context:reset", h(func(w http.ResponseWriter, r *http.Request) error {
+		p, err := httpx.MustPrincipal(r)
+		if err != nil {
+			return err
+		}
+		id, err := convID(r, a, p)
+		if err != nil {
+			return err
+		}
+		job, err := a.Reset(r.Context(), p.UserID, &id, p.Channel())
+		if err != nil {
+			return err
+		}
+		httpx.JSON(w, http.StatusAccepted, map[string]any{"jobId": job})
+		return nil
+	}))
+	r.Post("/conversations/{id}/context:compact", h(func(w http.ResponseWriter, r *http.Request) error {
+		p, err := httpx.MustPrincipal(r)
+		if err != nil {
+			return err
+		}
+		id, err := convID(r, a, p)
+		if err != nil {
+			return err
+		}
+		var in struct {
+			Instructions string `json:"instructions"`
+		}
+		if r.ContentLength != 0 {
+			if err := httpx.Decode(r, &in); err != nil {
+				return err
+			}
+		}
+		job, err := a.Compact(r.Context(), p.UserID, &id, p.Channel(), in.Instructions)
+		if err != nil {
+			return err
+		}
+		httpx.JSON(w, http.StatusAccepted, map[string]any{"jobId": job})
 		return nil
 	}))
 	r.Post("/conversations", h(func(w http.ResponseWriter, r *http.Request) error {
@@ -486,6 +677,7 @@ func (a *API) Routes(r chi.Router, site bool) {
 			Text          string          `json:"text"`
 			AttachmentIDs []uuid.UUID     `json:"attachmentIds"`
 			Context       json.RawMessage `json:"context"`
+			Skill         string          `json:"skill"`
 		}
 		if err := httpx.DecodeMax(r, &in, 256<<10); err != nil {
 			return err
@@ -493,7 +685,8 @@ func (a *API) Routes(r chi.Router, site bool) {
 		if p.ClientID == nil {
 			in.Context = nil // the screen context comes from products only (R30)
 		}
-		m, err := a.Post(r.Context(), p.UserID, &id, in.Text, p.Channel(), p.ClientID, in.AttachmentIDs, in.Context)
+		m, err := a.PostMessage(r.Context(), p.UserID, &id, PostInput{Text: in.Text, Channel: p.Channel(), ClientID: p.ClientID,
+			Attachments: in.AttachmentIDs, Context: in.Context, Skill: strings.TrimSpace(in.Skill)})
 		if err != nil {
 			return err
 		}

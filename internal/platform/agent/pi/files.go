@@ -190,6 +190,8 @@ func SettingsJSON(req agent.SessionRequest, extensionDir string) map[string]any 
 		if extensionDir != "" {
 			s["extensions"] = []string{extensionDir}
 		}
+	} else if req.ProbeTools() {
+		s["defaultTools"] = []string{"ls"} // the tool probe of a check: the empty working directory
 	} else {
 		s["defaultTools"] = []string{} // no read, bash, edit, write, grep, find, ls (SVC-05)
 	}

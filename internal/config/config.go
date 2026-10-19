@@ -135,6 +135,12 @@ type Config struct {
 	UploadMaxBytes   int64
 	WhisperURL       string
 	PiVersion        string
+	// FTR.NAB.CHAT-0001: the longest voice recording (R20), the extra root
+	// of GigaChat's certificates (R13) and the schedule of the refresh of the
+	// models of connections (R10).
+	TranscribeMaxSeconds int
+	GigaChatCAFile       string
+	ModelsRefreshCron    string
 
 	// BootstrapLLM: an OpenAI-compatible connection created on the first
 	// start when there is none (the stand gets its DeepSeek key this way).
@@ -317,6 +323,8 @@ func Load() (*Config, error) {
 
 		RunWorkspaceWait: p.dur("RUN_WORKSPACE_WAIT", "120s"), UploadMaxBytes: p.bytes("UPLOAD_MAX_BYTES", "50MB"),
 		WhisperURL: os.Getenv("WHISPER_URL"), PiVersion: env("PI_VERSION", "dev"),
+		TranscribeMaxSeconds: p.int("TRANSCRIBE_MAX_SECONDS", 300), GigaChatCAFile: os.Getenv("GIGACHAT_CA_FILE"),
+		ModelsRefreshCron: env("MODELS_REFRESH_CRON", "17 4 * * *"),
 
 		BootstrapLLMKey: os.Getenv("BOOTSTRAP_LLM_API_KEY"), BootstrapLLMURL: env("BOOTSTRAP_LLM_BASE_URL", "https://api.deepseek.com"),
 		BootstrapLLMType: env("BOOTSTRAP_LLM_TYPE", "deepseek"),

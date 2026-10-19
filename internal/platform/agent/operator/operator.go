@@ -140,6 +140,7 @@ func (o *Operator) Handler() http.Handler {
 			r.With(o.sessionOrService).Delete("/", o.close)
 			r.With(o.service).Patch("/", o.patch)
 			r.With(o.service).Get("/snapshot", o.snapshot)
+			r.With(o.service).Post("/compact", o.compact)
 		})
 		if o.cfg.Mode == ModeOwner {
 			r.With(o.service).Get("/status", o.status)
@@ -434,6 +435,35 @@ func (o *Operator) patch(w http.ResponseWriter, r *http.Request) {
 	}
 	m, t := e.s.Model()
 	writeJSON(w, http.StatusOK, map[string]string{"model": m, "thinking": t})
+}
+
+// compact compacts the context of a session (FTR.NAB.CHAT-0001 R2); it waits
+// for a running prompt like a prompt does not: a busy session is refused.
+func (o *Operator) compact(w http.ResponseWriter, r *http.Request) {
+	e := o.get(chi.URLParam(r, "id"))
+	if e == nil {
+		writeErr(w, http.StatusNotFound, "session_not_found", "no such session")
+		return
+	}
+	var req agent.CompactRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	if !e.run.TryLock() {
+		writeErr(w, http.StatusConflict, "session_busy", "the session is running a prompt")
+		return
+	}
+	defer e.run.Unlock()
+	e.touch(true)
+	defer e.touch(false)
+	res, err := e.s.Compact(r.Context(), req.Instructions)
+	if err != nil {
+		cl := agent.Classify(err.Error())
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "compact_failed", "message": err.Error(), "errorClass": cl.Class})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 func (o *Operator) snapshot(w http.ResponseWriter, r *http.Request) {

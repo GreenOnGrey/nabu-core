@@ -199,6 +199,9 @@ func (f *fakeCollector) Abort(context.Context, string) error                    
 func (f *fakeCollector) Patch(context.Context, string, agent.PatchRequest) error { return nil }
 func (f *fakeCollector) Snapshot(context.Context, string) ([]byte, error)        { return nil, nil }
 func (f *fakeCollector) Close(context.Context, string) error                     { return nil }
+func (f *fakeCollector) Compact(context.Context, string, string) (agent.CompactResponse, error) {
+	return agent.CompactResponse{}, nil
+}
 func (f *fakeCollector) toolList(ctx context.Context, s agent.MCPServer, h map[string]string) []string {
 	b, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
 	r, _ := http.NewRequestWithContext(ctx, http.MethodPost, s.URL, strings.NewReader(string(b)))
@@ -258,7 +261,7 @@ func TestCollect(t *testing.T) {
 	box, _ := crypto.NewBox(key)
 	signer := jwt.NewSigner("https://nabu.test", key)
 	ms := &models.Service{Pool: pool, Box: box}
-	conn, err := ms.Create(ctx, models.Input{Type: models.TypeOpenAICompatible, Name: "Collect " + uuid.NewString()[:6], BaseURL: "http://llm.invalid", APIKey: "sk-fake-0002", Models: []string{"fake-1"}})
+	conn, err := ms.Create(ctx, models.Input{Type: models.TypeOpenAICompatible, Name: "Collect " + uuid.NewString()[:6], BaseURL: "http://llm.invalid", APIKey: "sk-fake-0002", Models: models.Refs("fake-1")})
 	if err != nil {
 		t.Fatal(err)
 	}

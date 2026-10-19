@@ -231,6 +231,12 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 		return
 	}
 	uid, _ := uuid.Parse(c.User)
+	// FTR.NAB.CMN-0007 R10, RES-08: the access is checked on every call, so a
+	// taken access closes the tools of a running turn at once
+	if s.Access != nil && uid != uuid.Nil && !s.Access.ItemGranted(r.Context(), uid, itemID) {
+		rpcError(w, http.StatusForbidden, "access_denied_item: the item is no longer granted to you")
+		return
+	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
 	if err != nil {
 		rpcError(w, http.StatusBadRequest, "read error")

@@ -37,6 +37,9 @@ const (
 	CommCollect        = "comm.collect"
 	AgentUpdated       = "agent.updated"
 	ConnectionsChanged = "connections.changed"
+	// ConversationContext: the fill of the context window of a conversation
+	// changed (FTR.NAB.CHAT-0001 R3).
+	ConversationContext = "conversation.context"
 	// RunEvent carries one event of a service agent run (client API §5).
 	RunEvent = "run.event"
 )

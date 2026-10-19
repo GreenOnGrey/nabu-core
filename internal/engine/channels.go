@@ -144,7 +144,16 @@ func (d *drafter) event(ctx context.Context, ev agent.Event) {
 // the agent, the memory and the space of the group, platform MCP servers
 // and the skills chosen by the owner; no personal access of members.
 func (e *Engine) groupRequest(ctx context.Context, u *users.User, ga *groups.Agent, conv uuid.UUID, label string) (*built, error) {
-	model, key, err := e.Models.ResolvePersonal(ctx, ga.ConnectionID, ga.Model)
+	// FTR.NAB.CMN-0007 R12: a group agent has the access of its owner
+	resolve := func() (agent.ModelSpec, string, error) {
+		return e.Models.ResolvePersonal(ctx, ga.ConnectionID, ga.Model)
+	}
+	if ga.OwnerID != nil {
+		resolve = func() (agent.ModelSpec, string, error) {
+			return e.Models.ResolveUser(ctx, *ga.OwnerID, ga.ConnectionID, ga.Model)
+		}
+	}
+	model, key, err := resolve()
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +166,11 @@ func (e *Engine) groupRequest(ctx context.Context, u *users.User, ga *groups.Age
 		convStr = conv.String()
 	}
 	var cat *catalog.SessionMCP
-	if cat, err = e.Catalog.ForGroup(ctx, ga.ID, ga.Skills, convStr, tokenTTL); err != nil {
+	var owners []uuid.UUID
+	if ga.OwnerID != nil {
+		owners = append(owners, *ga.OwnerID)
+	}
+	if cat, err = e.Catalog.ForGroup(ctx, ga.ID, ga.Skills, convStr, tokenTTL, owners...); err != nil {
 		return nil, err
 	}
 	builtinTok := e.Signer.Issue(jwt.Claims{Audience: jwt.AudMCP, Subject: "builtin", User: u.ID.String(), Conversation: convStr}, tokenTTL)
@@ -173,13 +186,7 @@ func (e *Engine) groupRequest(ctx context.Context, u *users.User, ga *groups.Age
 		secrets = append(secrets, strings.TrimPrefix(cat.Headers[s.Name]["Authorization"], "Bearer "))
 		titles = append(titles, s.Description)
 	}
-	if len(cat.Skills) > 0 {
-		var hash string
-		for _, h := range cat.SkillSnapshots {
-			hash = h
-		}
-		req.Skills = &agent.Skills{Hash: hash, Names: cat.Skills}
-	}
+	req.Skills = e.sessionSkills(ctx, cat)
 	if e.Space.Enabled {
 		wsID := space.WorkspaceID(u.ID)
 		call := e.Signer.Issue(jwt.Claims{Audience: jwt.AudCall, Workspace: wsID}, tokenTTL)

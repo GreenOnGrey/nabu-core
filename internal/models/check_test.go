@@ -32,7 +32,7 @@ func TestCheckEmbeddings(t *testing.T) {
 			return errors.New("embeddings: HTTP 401")
 		},
 	}
-	res, err := s.runCheck(context.Background(), agent.ModelSpec{BaseURL: "https://llm.test/v1"}, "k")
+	res, err := s.runCheck(context.Background(), agent.ModelSpec{BaseURL: "https://llm.test/v1"}, "k", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

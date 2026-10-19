@@ -59,7 +59,7 @@ func TestCollectQuality(t *testing.T) {
 	box, _ := crypto.NewBox(key)
 	signer := jwt.NewSigner("https://nabu.test", key)
 	ms := &models.Service{Pool: pool, Box: box}
-	conn, err := ms.Create(ctx, models.Input{Type: models.TypeOpenAICompatible, Name: "Quality " + uuid.NewString()[:6], BaseURL: url, APIKey: apiKey, Models: []string{model}})
+	conn, err := ms.Create(ctx, models.Input{Type: models.TypeOpenAICompatible, Name: "Quality " + uuid.NewString()[:6], BaseURL: url, APIKey: apiKey, Models: models.Refs(model)})
 	if err != nil {
 		t.Fatal(err)
 	}

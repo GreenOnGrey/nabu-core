@@ -61,7 +61,23 @@ type ModelDef struct {
 	ThinkingLevelMap map[string]*string `json:"thinkingLevelMap,omitempty"`
 	Cost             Cost               `json:"cost"`
 	Compat           map[string]any     `json:"compat,omitempty"`
+	// FTR.NAB.CHAT-0001 R8: the capabilities Nabu keeps next to what Pi needs.
+	// Tools: the model calls tools (a personal agent needs it). Embeddings:
+	// the model only answers /embeddings. Aliases: other ids of the provider
+	// for the same model.
+	Tools      bool     `json:"tools"`
+	Embeddings bool     `json:"embeddings,omitempty"`
+	Aliases    []string `json:"aliases,omitempty"`
+	// Sources: where each capability came from — provider, catalog, probe,
+	// manual or default (R7). Overrides: the fields an administrator set by
+	// hand; a refresh keeps them. Gone: the provider no longer lists the model.
+	Sources   map[string]string `json:"sources,omitempty"`
+	Overrides []string          `json:"overrides,omitempty"`
+	Gone      bool              `json:"gone,omitempty"`
 }
+
+// HasInput reports whether the model takes the kind of input (text, image).
+func (m ModelDef) HasInput(kind string) bool { return slices.Contains(m.Input, kind) }
 
 // ThinkingLevels lists the levels offered for the model.
 func (m ModelDef) ThinkingLevels() []string {
@@ -152,7 +168,17 @@ type SessionRequest struct {
 	Workspace    *Workspace       `json:"workspace,omitempty"`
 	// Label is a short description for the operator's logs (never secrets).
 	Label string `json:"label,omitempty"`
+	// probeTools gives a check session Pi's ls in the empty working
+	// directory, to see whether the model calls tools (FTR.NAB.CHAT-0001 R9).
+	// It is set only inside the operator, never from a request.
+	probeTools bool
 }
+
+// WithProbeTools returns the request with the tool probe switched on.
+func (r SessionRequest) WithProbeTools() SessionRequest { r.probeTools = true; return r }
+
+// ProbeTools reports whether the request is a check that probes tools.
+func (r SessionRequest) ProbeTools() bool { return r.probeTools }
 
 // SessionResponse is the answer of POST /v1/sessions.
 type SessionResponse struct {
@@ -187,10 +213,13 @@ const (
 	EventToolCall      = "tool_call"
 	EventToolResult    = "tool_result"
 	EventCompaction    = "compaction"
-	EventRetry         = "retry"
-	EventUsage         = "usage"
-	EventError         = "error"
-	EventSettled       = "settled"
+	// EventContext reports the fill of the context window after a run or a
+	// compaction (FTR.NAB.CHAT-0001 R3): ContextTokens of ContextWindow.
+	EventContext = "context"
+	EventRetry   = "retry"
+	EventUsage   = "usage"
+	EventError   = "error"
+	EventSettled = "settled"
 )
 
 // Event is one record of the prompt stream.
@@ -210,6 +239,10 @@ type Event struct {
 	Message      string          `json:"message,omitempty"`
 	// Aborted marks a settled run stopped by abort: the stream still ends normally.
 	Aborted bool `json:"aborted,omitempty"`
+	// Auto marks a compaction the harness made itself (FTR.NAB.CHAT-0001 R2).
+	Auto          bool  `json:"auto,omitempty"`
+	ContextTokens int64 `json:"contextTokens,omitempty"`
+	ContextWindow int64 `json:"contextWindow,omitempty"`
 	Usage
 }
 
@@ -239,10 +272,41 @@ func (u Usage) IsZero() bool {
 // Total is all tokens of the usage.
 func (u Usage) Total() int64 { return u.TokensIn + u.TokensOut + u.CacheRead + u.CacheWrite }
 
+// Probes of a check (FTR.NAB.CHAT-0001 R9): image sends a small picture and
+// asks for its colour, tools offers a tool and expects the call.
+const (
+	ProbeImage = "image"
+	ProbeTools = "tools"
+)
+
+// Results of a probe.
+const (
+	ProbeConfirmed   = "confirmed"
+	ProbeUnconfirmed = "unconfirmed"
+	ProbeSkipped     = "skipped"
+)
+
 // LLMCheckRequest is the body of POST /v1/checks/llm.
 type LLMCheckRequest struct {
 	Model   ModelSpec `json:"model"`
 	Secrets Secrets   `json:"secrets"`
+	// Probes are run on every model that answered: image only on models
+	// that declare images, tools on every model.
+	Probes []string `json:"probes,omitempty"`
+}
+
+// CompactRequest is the body of POST /v1/sessions/{id}/compact.
+type CompactRequest struct {
+	Instructions string `json:"instructions,omitempty"`
+}
+
+// CompactResponse is the answer of a compaction.
+type CompactResponse struct {
+	Summary       string `json:"summary"`
+	TokensBefore  int64  `json:"tokensBefore"`
+	TokensAfter   int64  `json:"tokensAfter"`
+	ContextWindow int64  `json:"contextWindow"`
+	Usage         Usage  `json:"usage"`
 }
 
 // LLMCheckResult is the result for one model.
@@ -256,6 +320,9 @@ type LLMCheckResult struct {
 	// Embeddings: the model does not chat but answers /embeddings — the core
 	// sets it, the operator never does.
 	Embeddings bool `json:"embeddings,omitempty"`
+	// Caps are the results of the probes: capability → confirmed |
+	// unconfirmed | skipped.
+	Caps map[string]string `json:"caps,omitempty"`
 }
 
 // LLMCheckResponse is the answer of POST /v1/checks/llm.

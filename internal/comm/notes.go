@@ -380,9 +380,10 @@ func (s *Service) SaveNote(ctx context.Context, uid uuid.UUID, in SaveNote) (*Sa
 	if len([]rune(in.Summary)) > MaxSummary {
 		return nil, apperr.Unprocessable("invalid_note", fmt.Sprintf("the summary is longer than %d characters", MaxSummary))
 	}
+	// FTR.NAB.CMN-0003 R8 (v1.5): an automated notice or a one-off message has no topic
 	topics := uniqueTopics(in.Topics)
-	if len(topics) == 0 || len(topics) > MaxTopics {
-		return nil, apperr.Unprocessable("invalid_topics", fmt.Sprintf("give from 1 to %d topics", MaxTopics))
+	if len(topics) > MaxTopics {
+		return nil, apperr.Unprocessable("invalid_topics", fmt.Sprintf("give at most %d topics", MaxTopics))
 	}
 	if in.TimePrecision != "day" {
 		in.TimePrecision = "minute"

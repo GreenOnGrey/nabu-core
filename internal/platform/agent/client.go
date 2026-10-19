@@ -193,6 +193,16 @@ func (c *Client) Patch(ctx context.Context, sessionID string, p PatchRequest) er
 	return nil
 }
 
+// Compact compacts the context of a session (FTR.NAB.CHAT-0001 R2).
+func (c *Client) Compact(ctx context.Context, sessionID string, instructions string) (CompactResponse, error) {
+	var out CompactResponse
+	resp, err := c.do(ctx, http.MethodPost, "/v1/sessions/"+sessionID+"/compact", CompactRequest{Instructions: instructions}, 10*time.Minute)
+	if err != nil {
+		return out, err
+	}
+	return out, decodeBody(resp, &out)
+}
+
 // Snapshot returns the Pi session file of a session.
 func (c *Client) Snapshot(ctx context.Context, sessionID string) ([]byte, error) {
 	resp, err := c.do(ctx, http.MethodGet, "/v1/sessions/"+sessionID+"/snapshot", nil, time.Minute)

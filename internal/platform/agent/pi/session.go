@@ -175,13 +175,14 @@ func (s *Session) Prompt(ctx context.Context, p agent.PromptRequest, emit func(a
 		}
 		s.usage(ctx, emit)
 		if res.err == nil {
+			s.contextFill(ctx, emit)
 			emit(agent.Event{Type: agent.EventSettled})
 			return nil
 		}
 		if res.err.Class == agent.ErrContextOverflow && !compacted {
 			compacted = true
 			if cr, cerr := s.cl().Compact(ctx, ""); cerr == nil {
-				emit(agent.Event{Type: agent.EventCompaction, TokensBefore: cr.TokensBefore, TokensAfter: cr.EstimatedTokensAfter})
+				emit(agent.Event{Type: agent.EventCompaction, Auto: true, Summary: clip(cr.Summary, maxSummaryBytes), TokensBefore: cr.TokensBefore, TokensAfter: cr.EstimatedTokensAfter})
 				s.usage(ctx, emit)
 				continue
 			}
@@ -251,7 +252,7 @@ func (s *Session) run(ctx context.Context, p pirpc.PromptParams, emit func(agent
 		case pirpc.EventCompactionEnd:
 			var c pirpc.Compaction
 			if e.Decode(&c) == nil && c.Result != nil {
-				emit(agent.Event{Type: agent.EventCompaction, TokensBefore: c.Result.TokensBefore, TokensAfter: c.Result.EstimatedTokensAfter})
+				emit(agent.Event{Type: agent.EventCompaction, Auto: true, Summary: clip(c.Result.Summary, maxSummaryBytes), TokensBefore: c.Result.TokensBefore, TokensAfter: c.Result.EstimatedTokensAfter})
 			}
 		}
 	})
@@ -294,6 +295,38 @@ func (s *Session) usage(ctx context.Context, emit func(agent.Event)) {
 	if !u.IsZero() {
 		emit(agent.Event{Type: agent.EventUsage, Usage: u})
 	}
+}
+
+// maxSummaryBytes bounds the summary of a compaction in the stream and in the
+// event of the conversation (FTR.NAB.CHAT-0001 R2).
+const maxSummaryBytes = 16 << 10
+
+// contextFill emits the fill of the context window (FTR.NAB.CHAT-0001 R3).
+// Right after a compaction Pi has no exact count until the next answer: the
+// event is not sent then.
+func (s *Session) contextFill(ctx context.Context, emit func(agent.Event)) {
+	st, err := s.cl().GetSessionStats(ctx)
+	if err != nil || st.ContextUsage == nil || st.ContextUsage.Tokens == nil {
+		return
+	}
+	emit(agent.Event{Type: agent.EventContext, ContextTokens: *st.ContextUsage.Tokens, ContextWindow: st.ContextUsage.ContextWindow})
+}
+
+// Compact compacts the context with the user's instructions
+// (FTR.NAB.CHAT-0001 R2). The usage of the summary is returned as the
+// difference of the totals, as for prompts.
+func (s *Session) Compact(ctx context.Context, instructions string) (agent.CompactResponse, error) {
+	c := s.cl()
+	cr, err := c.Compact(ctx, instructions)
+	if err != nil {
+		return agent.CompactResponse{}, err
+	}
+	out := agent.CompactResponse{Summary: clip(cr.Summary, maxSummaryBytes), TokensBefore: cr.TokensBefore, TokensAfter: cr.EstimatedTokensAfter}
+	s.usage(ctx, func(e agent.Event) { out.Usage = e.Usage })
+	if st, err := c.GetSessionStats(ctx); err == nil && st.ContextUsage != nil {
+		out.ContextWindow = st.ContextUsage.ContextWindow
+	}
+	return out, nil
 }
 
 // restart replaces a crashed process, resuming the session file Pi wrote.

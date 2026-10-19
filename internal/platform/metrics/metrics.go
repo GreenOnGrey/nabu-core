@@ -182,3 +182,38 @@ var (
 func init() {
 	Registry.MustRegister(MCPProxyCalls, MCPProxyCallSeconds)
 }
+
+// FTR.NAB.CHAT-0001 arch §7: the context of conversations, skills, images,
+// models of connections, the GigaChat bridge and voice.
+var (
+	ContextEvents = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_context_events_total", Help: "Resets and compactions of the context of conversations by kind and auto.",
+	}, []string{"kind", "auto"})
+	SkillInvocations = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_skill_invocations_total", Help: "Explicit calls of skills by result (ok, unavailable).",
+	}, []string{"result"})
+	PromptImages = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_prompt_images_total", Help: "Images of user messages by where they went (model, space).",
+	}, []string{"delivered"})
+	ModelsRefresh = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_models_refresh_total", Help: "Refreshes of the models of connections by type and result.",
+	}, []string{"type", "result"})
+	GigaChatBridge = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_gigachat_bridge_requests_total", Help: "Requests through the GigaChat bridge by status.",
+	}, []string{"status"})
+	GigaChatTokens = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_gigachat_token_refresh_total", Help: "Access tokens of GigaChat obtained by result.",
+	}, []string{"result"})
+	Transcriptions = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_transcriptions_total", Help: "Voice recognitions by channel and result.",
+	}, []string{"channel", "result"})
+	TranscriptionSeconds = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name: "nabu_transcription_seconds", Help: "Duration of a voice recognition.",
+		Buckets: []float64{0.5, 1, 2, 3, 5, 8, 12, 20, 30, 60, 120},
+	})
+)
+
+func init() {
+	Registry.MustRegister(ContextEvents, SkillInvocations, PromptImages, ModelsRefresh, GigaChatBridge, GigaChatTokens,
+		Transcriptions, TranscriptionSeconds)
+}

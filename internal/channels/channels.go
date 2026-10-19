@@ -93,6 +93,9 @@ type Registry struct {
 	Events events.Publisher
 	// Changed is called after the settings of a channel change (adapters re-read them).
 	Changed func(ctx context.Context, kind string)
+	// Granted are the channels the groups of a user grant (FTR.NAB.CMN-0007
+	// R9); with it «all users» and the personal access are not read.
+	Granted func(ctx context.Context, uid uuid.UUID) (map[string]bool, error)
 
 	mu      sync.Mutex
 	loaded  time.Time
@@ -109,6 +112,7 @@ type userAccess struct {
 	at       time.Time
 	status   string
 	explicit map[string]bool
+	granted  map[string]bool // FTR.NAB.CMN-0007: nil without groups
 }
 
 func (r *Registry) now() time.Time {
@@ -204,15 +208,26 @@ func (r *Registry) userAccess(ctx context.Context, uid uuid.UUID) (userAccess, e
 		}
 		return a, err
 	}
-	q, err := r.Pool.Query(ctx, `SELECT channel FROM channel_user_access WHERE user_id = $1`, uid)
-	if err != nil {
-		return a, err
-	}
-	defer q.Close()
-	for q.Next() {
-		var k string
-		if q.Scan(&k) == nil {
-			a.explicit[k] = true
+	if r.Granted != nil {
+		g, err := r.Granted(ctx, uid)
+		if err != nil {
+			return a, err
+		}
+		a.granted = g
+	} else {
+		q, err := r.Pool.Query(ctx, `SELECT channel FROM channel_user_access WHERE user_id = $1`, uid)
+		if err != nil {
+			return a, err
+		}
+		for q.Next() {
+			var k string
+			if q.Scan(&k) == nil {
+				a.explicit[k] = true
+			}
+		}
+		q.Close()
+		if err := q.Err(); err != nil {
+			return a, err
 		}
 	}
 	r.mu.Lock()
@@ -221,7 +236,7 @@ func (r *Registry) userAccess(ctx context.Context, uid uuid.UUID) (userAccess, e
 	}
 	r.access[uid] = a
 	r.mu.Unlock()
-	return a, q.Err()
+	return a, nil
 }
 
 // Reasons of availability (tech §2.2).
@@ -229,6 +244,7 @@ const (
 	ReasonAlways   = "always"
 	ReasonAllUsers = "all_users"
 	ReasonUser     = "user"
+	ReasonGroup    = "group" // FTR.NAB.CMN-0007 R9
 	ReasonDisabled = "disabled"
 )
 
@@ -252,6 +268,11 @@ func (r *Registry) Available(ctx context.Context, uid uuid.UUID, kind string) (b
 	case !ok || !ch.enabled:
 		return false, ReasonDisabled, nil
 	case a.status != "active":
+		return false, ReasonDisabled, nil
+	case a.granted != nil:
+		if a.granted[kind] {
+			return true, ReasonGroup, nil
+		}
 		return false, ReasonDisabled, nil
 	case ch.allUsers:
 		return true, ReasonAllUsers, nil
@@ -397,6 +418,9 @@ type Validator func(settings json.RawMessage) (json.RawMessage, error)
 
 // Update applies a patch (CH-01: the web cannot be switched off).
 func (r *Registry) Update(ctx context.Context, kind string, p Patch, validate Validator) (*Channel, error) {
+	if r.Granted != nil {
+		p.AllUsers = nil // FTR.NAB.CMN-0007: «all users» is the group «all»
+	}
 	if kind == domain.ChannelWeb {
 		return nil, apperr.Conflict("channel_locked", "the web application is always available")
 	}
@@ -498,6 +522,9 @@ func (r *Registry) Users(ctx context.Context, kind string) ([]UserRef, error) {
 
 // SetUsers adds and removes explicit access.
 func (r *Registry) SetUsers(ctx context.Context, kind string, add, remove []uuid.UUID) error {
+	if r.Granted != nil {
+		return ErrUseGroups()
+	}
 	if kind == domain.ChannelWeb {
 		return apperr.Conflict("channel_locked", "the web application is always available")
 	}
@@ -566,8 +593,17 @@ func (r *Registry) OfUser(ctx context.Context, uid uuid.UUID) ([]UserChannel, er
 	return out, nil
 }
 
+// ErrUseGroups refuses the personal access of channels once groups grant them
+// (FTR.NAB.CMN-0007 R5, OLD-01).
+func ErrUseGroups() error {
+	return apperr.Gone("use_groups", "channels are granted to groups in Administration → Groups")
+}
+
 // SetUserChannels switches channels of a user that are not open to all users.
 func (r *Registry) SetUserChannels(ctx context.Context, uid uuid.UUID, set map[string]bool) error {
+	if r.Granted != nil {
+		return ErrUseGroups()
+	}
 	rows, err := r.loadRows(ctx)
 	if err != nil {
 		return err

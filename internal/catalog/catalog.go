@@ -93,6 +93,20 @@ type Item struct {
 	snapshot  *string
 }
 
+// Access answers which items a user may use (FTR.NAB.CMN-0007).
+type Access interface {
+	Items(ctx context.Context, uid uuid.UUID) (map[uuid.UUID]bool, error)
+	ItemGranted(ctx context.Context, uid, item uuid.UUID) bool
+}
+
+// granted returns the items of the user's access; nil — every item.
+func (s *Service) granted(ctx context.Context, uid uuid.UUID) (map[uuid.UUID]bool, error) {
+	if s.Access == nil || uid == uuid.Nil {
+		return nil, nil
+	}
+	return s.Access.Items(ctx, uid)
+}
+
 // Service is the catalog.
 type Service struct {
 	Pool   *pgxpool.Pool
@@ -117,6 +131,9 @@ type Service struct {
 	// (FTR.NAB.CMN-0003 tech §6.4): it returns the tools the run may see, or
 	// the reason the call is refused.
 	MemoryRun func(ctx context.Context, uid, run, item uuid.UUID, method, tool string, args json.RawMessage) (tools []string, refusal string)
+	// Access is the access of users by groups (FTR.NAB.CMN-0007 R10, R11);
+	// nil — every published item is open to every user.
+	Access Access
 }
 
 var nameRe = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
@@ -589,7 +606,26 @@ func (s *Service) ForUser(ctx context.Context, uid uuid.UUID) ([]UserItem, error
 		}
 		out = append(out, u)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// FTR.NAB.CMN-0007 R10: only the items of the user's access
+	g, err := s.granted(ctx, uid)
+	if err != nil || g == nil {
+		return out, err
+	}
+	shown := out[:0]
+	for _, u := range out {
+		if g[u.ID] {
+			shown = append(shown, u)
+		}
+	}
+	return shown, nil
+}
+
+// ErrNoAccess is access_denied_item (FTR.NAB.CMN-0007 R10).
+func ErrNoAccess(title string) error {
+	return apperr.Forbidden("access_denied_item", "the item is not granted to you").With("item", title)
 }
 
 // ErrUnavailable is catalog_item_unavailable (CAT-08).
@@ -612,6 +648,9 @@ func (s *Service) Connect(ctx context.Context, uid, id uuid.UUID, token string) 
 	}
 	if !it.Published || it.InDevelopment {
 		return nil, ErrUnavailable()
+	}
+	if s.Access != nil && !s.Access.ItemGranted(ctx, uid, id) { // FTR.NAB.CMN-0007 R10
+		return nil, ErrNoAccess(it.Title)
 	}
 	if it.Type == "mcp" && it.Mode != nil && *it.Mode == "personal" {
 		switch it.PersonalAuth.Kind {
@@ -675,7 +714,15 @@ type SessionMCP struct {
 // (FTR.NAB.CMN-0002 R16, GR-07): only published platform items, no personal
 // access of the members; skills — those chosen by the owner. The proxy
 // tokens carry no user: platform credentials only.
-func (s *Service) ForGroup(ctx context.Context, groupID uuid.UUID, skills []string, conv string, ttl time.Duration) (*SessionMCP, error) {
+func (s *Service) ForGroup(ctx context.Context, groupID uuid.UUID, skills []string, conv string, ttl time.Duration, owner ...uuid.UUID) (*SessionMCP, error) {
+	// FTR.NAB.CMN-0007 R12: a group agent has the access of its owner
+	var g map[uuid.UUID]bool
+	if len(owner) > 0 {
+		var err error
+		if g, err = s.granted(ctx, owner[0]); err != nil {
+			return nil, err
+		}
+	}
 	rows, err := s.Pool.Query(ctx, `SELECT c.id, c.type, c.name, COALESCE(c.title,''), COALESCE(c.description,''), c.exposure, c.skills, c.skills_snapshot
 		FROM catalog_items c WHERE c.published AND NOT c.in_development AND (c.type = 'skill' OR c.mode = 'platform') ORDER BY c.name`)
 	if err != nil {
@@ -694,6 +741,9 @@ func (s *Service) ForGroup(ctx context.Context, groupID uuid.UUID, skills []stri
 		var snap *string
 		if err := rows.Scan(&id, &typ, &name, &title, &desc, &exposure, &raw, &snap); err != nil {
 			return nil, err
+		}
+		if g != nil && !g[id] {
+			continue
 		}
 		if typ == "mcp" {
 			d := title
@@ -735,6 +785,10 @@ func (s *Service) ForSession(ctx context.Context, uid uuid.UUID, ch, conv string
 	}
 	defer rows.Close()
 	out := &SessionMCP{Headers: map[string]map[string]string{}, SkillSnapshots: map[string]string{}}
+	g, err := s.granted(ctx, uid)
+	if err != nil {
+		return nil, err
+	}
 	for rows.Next() {
 		var id uuid.UUID
 		var typ, name, title, desc, exposure string
@@ -742,6 +796,9 @@ func (s *Service) ForSession(ctx context.Context, uid uuid.UUID, ch, conv string
 		var snap *string
 		if err := rows.Scan(&id, &typ, &name, &title, &desc, &exposure, &skills, &snap); err != nil {
 			return nil, err
+		}
+		if g != nil && !g[id] { // FTR.NAB.CMN-0007 R10, R11: connected, but no longer granted
+			continue
 		}
 		if typ == "mcp" {
 			d := title
