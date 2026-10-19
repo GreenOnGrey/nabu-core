@@ -30,6 +30,7 @@ var texts = map[string]map[string]string{
 		"mail.unavailable":    "The channel is not available for your account. Contact your administrator.",
 		"mail.open":           "Open the conversation in Nabu",
 		"mail.confirm":        "Confirm in Nabu",
+		"mail.more_files":     "More files are in the conversation in Nabu:",
 		// FTR.NAB.CHAT-0001 R6, R21: the commands of the conversation and voice messages
 		"cmd.reset":             "— Context reset —",
 		"cmd.compacted":         "— Context compacted: %s → %s tokens —",
@@ -61,6 +62,7 @@ var texts = map[string]map[string]string{
 		"mail.unavailable":      "Канал недоступен для вашей учётной записи, обратитесь к администратору.",
 		"mail.open":             "Открыть разговор в Nabu",
 		"mail.confirm":          "Подтвердить в Nabu",
+		"mail.more_files":       "Остальные файлы — в разговоре в Nabu:",
 		"cmd.reset":             "— Контекст сброшен —",
 		"cmd.compacted":         "— Контекст сжат: %s → %s токенов —",
 		"cmd.compact_failed":    "Не удалось сжать контекст: %s",

@@ -293,6 +293,99 @@ func (s *Store) AddAssistant(ctx context.Context, conv uuid.UUID, channel string
 		VALUES ($1,'assistant','',$2,'streaming',$3,NULLIF($4,''),$5) RETURNING *) SELECT `+msgCols+` FROM m`, conv, channel, replyTo, model, retryOf))
 }
 
+// MaxAgentFiles bounds the files the agent sends with one answer or run
+// (FTR.NAB.CHAT-0001 R33).
+const MaxAgentFiles = 10
+
+// Errors of the files of the agent.
+var (
+	ErrNoAnswer       = errors.New("no answer is being written in the conversation")
+	ErrTooManyFiles   = errors.New("the answer already has the most files")
+	ErrAttachmentGone = errors.New("the attachment is gone")
+)
+
+// AttachToAnswer adds a file the agent sends to the answer being written in
+// the conversation (FTR.NAB.CHAT-0001 R33).
+func (s *Store) AttachToAnswer(ctx context.Context, conv uuid.UUID, at Attachment) error {
+	return s.appendFile(ctx, at, `SELECT id, jsonb_array_length(attachments) FROM messages
+		WHERE conversation_id = $1 AND role = 'assistant' AND status = 'streaming'
+		ORDER BY created_at DESC LIMIT 1 FOR UPDATE`, conv, `UPDATE messages SET attachments = attachments || $2::jsonb WHERE id = $1`)
+}
+
+// AttachToRun adds a file the agent sends during a run of a task; the file
+// waits for the result of the run (FTR.NAB.CHAT-0001 R33).
+func (s *Store) AttachToRun(ctx context.Context, task uuid.UUID, at Attachment) error {
+	return s.appendFile(ctx, at, `SELECT id, jsonb_array_length(attachments) FROM task_runs
+		WHERE task_id = $1 AND status = 'running' ORDER BY started_at DESC LIMIT 1 FOR UPDATE`, task,
+		`UPDATE task_runs SET attachments = attachments || $2::jsonb WHERE id = $1`)
+}
+
+// appendFile locks the row that collects the files, checks their number and
+// appends the file.
+func (s *Store) appendFile(ctx context.Context, at Attachment, lock string, key uuid.UUID, update string) error {
+	return postgres.InTx(ctx, s.Pool, func(tx pgx.Tx) error {
+		var id uuid.UUID
+		var n int
+		if err := tx.QueryRow(ctx, lock, key).Scan(&id, &n); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrNoAnswer
+			}
+			return err
+		}
+		if n >= MaxAgentFiles {
+			return ErrTooManyFiles
+		}
+		b, _ := json.Marshal([]Attachment{at})
+		_, err := tx.Exec(ctx, update, id, b)
+		return err
+	})
+}
+
+// TakeRunFiles returns the files of a run and forgets them: they go to its
+// result, or are dropped when the run fails or starts again (FTR.NAB.CHAT-0001 R33).
+func (s *Store) TakeRunFiles(ctx context.Context, run uuid.UUID) ([]Attachment, error) {
+	var b []byte
+	err := s.Pool.QueryRow(ctx, `UPDATE task_runs r SET attachments = '[]' FROM task_runs o
+		WHERE r.id = $1 AND o.id = r.id RETURNING o.attachments`, run).Scan(&b)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	var out []Attachment
+	_ = json.Unmarshal(b, &out)
+	return out, err
+}
+
+// SetAttachments sets the files of a message (the result of a task, FTR.NAB.CHAT-0001 R33).
+func (s *Store) SetAttachments(ctx context.Context, id uuid.UUID, atts []Attachment) error {
+	b, _ := json.Marshal(atts)
+	_, err := s.Pool.Exec(ctx, `UPDATE messages SET attachments = $2 WHERE id = $1`, id, b)
+	return err
+}
+
+// Attachment reads an attachment of the user and the S3 key of its content;
+// a missing one is ErrAttachmentGone.
+func (s *Store) Attachment(ctx context.Context, uid, id uuid.UUID) (Attachment, string, error) {
+	a := Attachment{ID: id}
+	var key string
+	err := s.Pool.QueryRow(ctx, `SELECT file_name, mime_type, size_bytes, s3_key FROM attachments WHERE id = $1 AND user_id = $2`, id, uid).
+		Scan(&a.FileName, &a.MimeType, &a.Size, &key)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return a, "", ErrAttachmentGone
+	}
+	return a, key, err
+}
+
+// DeleteAttachment removes the row of an attachment that reached no message
+// and returns the S3 key of its content for the caller to delete.
+func (s *Store) DeleteAttachment(ctx context.Context, uid, id uuid.UUID) (string, error) {
+	var key string
+	err := s.Pool.QueryRow(ctx, `DELETE FROM attachments WHERE id = $1 AND user_id = $2 RETURNING s3_key`, id, uid).Scan(&key)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrAttachmentGone
+	}
+	return key, err
+}
+
 // Finish stores the final state of an answer.
 func (s *Store) Finish(ctx context.Context, id uuid.UUID, text, status string, steps []ToolStep, errClass, errText string) (*Message, error) {
 	sb, _ := json.Marshal(steps)

@@ -7,6 +7,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -184,6 +186,46 @@ func (v *VKTeams) FetchFile(ctx context.Context, fileID string) (io.ReadCloser, 
 		return nil, "", fmt.Errorf("vkteams file: %d", resp.StatusCode)
 	}
 	return resp.Body, f.Name, nil
+}
+
+// SendFile implements FileSender: messages/sendFile (FTR.NAB.CHAT-0001 R33).
+// The library uploads an *os.File under its base name, so the file goes
+// through a temporary directory.
+func (v *VKTeams) SendFile(ctx context.Context, chatID string, of OutFile) error {
+	c, _, _ := v.get()
+	if c == nil {
+		return errVKNotConfigured
+	}
+	r, err := of.Open(ctx)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	name := of.Name
+	dir, err := os.MkdirTemp("", "nabu-vk-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	f, err := os.Create(filepath.Join(dir, filepath.Base(name)))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := io.Copy(f, r); err != nil {
+		return err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	m := &botgolang.Message{Chat: botgolang.Chat{ID: chatID}}
+	m.AttachNewFile(f)
+	if err := c.UploadFile(m); err != nil {
+		metrics.ChannelOutbound.WithLabelValues("vkteams", "error").Inc()
+		return v.scrub(err)
+	}
+	metrics.ChannelOutbound.WithLabelValues("vkteams", "ok").Inc()
+	return nil
 }
 
 // Events reads events after lastID with long polling.

@@ -59,10 +59,7 @@ func (s *Snapshots) Snapshot(ctx context.Context, uid uuid.UUID, p string, max i
 	if !ok {
 		return "", errors.New("the object store gives no links")
 	}
-	data, err := s.fromSandbox(ctx, uid, p, max)
-	if errors.Is(err, errNoSandbox) {
-		data, err = s.fromSpace(ctx, uid, p, max)
-	}
+	data, err := s.read(ctx, uid, p, max)
 	if err != nil {
 		return "", err
 	}
@@ -71,6 +68,25 @@ func (s *Snapshots) Snapshot(ctx context.Context, uid uuid.UUID, p string, max i
 		return "", err
 	}
 	return pre.PresignGet(ctx, key, SnapshotTTL)
+}
+
+// Read reads the current version of a file of the space: the working copy of
+// the running sandbox, or S3 when the sandbox does not answer
+// (FTR.NAB.CHAT-0001 R33: a file the agent has just written).
+func (s *Snapshots) Read(ctx context.Context, uid uuid.UUID, p string, max int64) ([]byte, error) {
+	p, err := CleanPath(p)
+	if err != nil {
+		return nil, catalog.ErrFileInvalid
+	}
+	return s.read(ctx, uid, p, max)
+}
+
+func (s *Snapshots) read(ctx context.Context, uid uuid.UUID, p string, max int64) ([]byte, error) {
+	data, err := s.fromSandbox(ctx, uid, p, max)
+	if errors.Is(err, errNoSandbox) {
+		data, err = s.fromSpace(ctx, uid, p, max)
+	}
+	return data, err
 }
 
 var errNoSandbox = errors.New("the sandbox does not answer")

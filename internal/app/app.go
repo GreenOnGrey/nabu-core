@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -221,7 +220,6 @@ func newCore(ctx context.Context, cfg *config.Config) (*core, error) {
 	c.accounts.Groups = c.groups
 	c.mail = &email.Mail{Pool: pool, Registry: c.registry, Inbox: c.chatAPI, Attachments: c.chatAPI.Attachments(), Events: pub,
 		WebURL: cfg.PublicWebURL, ReplyLimit: cfg.EmailReplyLimit, AttachMax: cfg.EmailAttachMax, InboundMax: cfg.EmailInboundMax,
-		Space: mailSpace{pool: pool, space: c.space},
 		Accounts: func(ctx context.Context, addr string) (*email.Account, error) {
 			u, err := c.users.ByEmail(ctx, addr)
 			if err != nil || u == nil {
@@ -241,37 +239,6 @@ func newCore(ctx context.Context, cfg *config.Config) (*core, error) {
 	// results of tasks go only to channels that can deliver now (R5)
 	c.tasks.Deliverable = (&engine.Engine{Pool: pool, Users: c.users, Registry: c.registry, Keys: c.keys, Groups: c.groups}).Deliverable
 	return c, nil
-}
-
-// mailSpace gives the mail channel the files the agent created in a turn.
-type mailSpace struct {
-	pool  *pgxpool.Pool
-	space *space.Service
-}
-
-func (m mailSpace) AgentFiles(ctx context.Context, uid uuid.UUID, since time.Time) ([]email.SpaceFile, error) {
-	rows, err := m.pool.Query(ctx, `SELECT path, size FROM space_files WHERE user_id = $1 AND modified_by = 'agent' AND modified_at >= $2 ORDER BY size`, uid, since)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []email.SpaceFile
-	for rows.Next() {
-		var f email.SpaceFile
-		if err := rows.Scan(&f.Path, &f.Size); err != nil {
-			return nil, err
-		}
-		out = append(out, f)
-	}
-	return out, rows.Err()
-}
-
-func (m mailSpace) Open(ctx context.Context, uid uuid.UUID, path string) (io.ReadCloser, int64, error) {
-	rc, f, err := m.space.Open(ctx, uid, path)
-	if err != nil {
-		return nil, 0, err
-	}
-	return rc, f.Size, nil
 }
 
 // seedChannels moves the Telegram configuration of FTR.NAB.CMN-0001 from the
@@ -653,6 +620,16 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 
 	builtin.Register(c.memory.Tools()...)
 	builtin.Register(c.space.Tool())
+	builtin.Register(chatAPI.AttachTool(func(ctx context.Context, uid uuid.UUID, p string, max int64) ([]byte, error) {
+		data, err := c.snapshots.Read(ctx, uid, p, max)
+		switch {
+		case errors.Is(err, catalog.ErrFileNotFound), errors.Is(err, catalog.ErrFileInvalid):
+			return nil, &mcp.ToolError{Msg: "no such file in your space: " + p}
+		case errors.Is(err, catalog.ErrFileTooLarge):
+			return nil, &mcp.ToolError{Msg: fmt.Sprintf("the file is larger than %d MB", max>>20)}
+		}
+		return data, err
+	}))
 	builtin.Register(c.tasks.Tools()...)
 	builtin.Register(c.comm.Tools(func(id uuid.UUID) string {
 		return strings.TrimRight(cfg.PublicWebURL, "/") + "/memory?tab=comm&note=" + id.String()

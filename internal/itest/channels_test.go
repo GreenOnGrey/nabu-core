@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"mime/quotedprintable"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -864,9 +865,8 @@ func TestMail(t *testing.T) {
 	s3 := &mem{m: map[string][]byte{}}
 	api := &chat.API{Store: &chat.Store{Pool: pool}, Pool: pool, Users: repo(), Bus: &bus{}, Events: hub, S3: s3, MaxFile: 1 << 20}
 	var sent []string
-	files := &spaceFiles{}
 	m := &email.Mail{Pool: pool, Registry: r, Inbox: api, Attachments: api.Attachments(), Events: hub, WebURL: "https://nabu.company.ru",
-		ReplyLimit: 2, AttachMax: 10, InboundMax: 1 << 20, Space: files,
+		ReplyLimit: 2, AttachMax: 10, InboundMax: 1 << 20,
 		Accounts: func(ctx context.Context, addr string) (*email.Account, error) {
 			u, err := repo().ByEmail(ctx, addr)
 			if err != nil || u == nil {
@@ -918,7 +918,7 @@ func TestMail(t *testing.T) {
 		t.Fatalf("ML-02: %d messages in the topic", len(msgs))
 	}
 	since := time.Now().Add(-time.Minute)
-	if err := m.Reply(ctx, uid, topic.ID, "Готово.", since); err != nil || len(sent) != 0 {
+	if err := m.Reply(ctx, uid, topic.ID, "Готово.", nil, since); err != nil || len(sent) != 0 {
 		t.Fatalf("ML-11: a letter was sent: %v %d", err, len(sent))
 	}
 	cv, _ := store.Get(ctx, uid, topic.ID)
@@ -934,23 +934,43 @@ func TestMail(t *testing.T) {
 	if res := m.Process(ctx, c, third, "uid:1/3"); res != email.Accepted {
 		t.Fatal(res)
 	}
-	files.list = []email.SpaceFile{{Path: "reports/small.csv", Size: 4}, {Path: "reports/big.bin", Size: 15}}
-	if err := m.Reply(ctx, uid, topic.ID, "| a | b |\n|---|---|\n| 1 | 2 |", since); err != nil || len(sent) != 1 {
+	// FTR.NAB.CHAT-0001 R33: the files the agent sent, in order while they fit EMAIL_ATTACH_MAX; the rest are named
+	out := func(name string, size int) channels.OutFile {
+		return channels.OutFile{Name: name, MimeType: "text/csv", Size: int64(size),
+			Open: func(context.Context) (io.ReadCloser, error) { return io.NopCloser(strings.NewReader("1,2\n")), nil }}
+	}
+	if err := m.Reply(ctx, uid, topic.ID, "| a | b |\n|---|---|\n| 1 | 2 |", []channels.OutFile{out("small.csv", 4), out("big.bin", 15)}, since); err != nil || len(sent) != 1 {
 		t.Fatalf("ML-10: %v %d", err, len(sent))
 	}
 	letter := strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(sent[0], "=\r\n", ""), "=\n", ""), "=3D", "=") // quoted-printable
 	for _, want := range []string{"ivan@company.ru\n", "In-Reply-To: <m3@company.ru>", "<m1@company.ru>", "Subject: =?utf-8?q?Re:", "<table",
-		"https://nabu.company.ru/chat/" + topic.ID.String(), "small.csv", "space?path=reports%2Fbig.bin", "text/plain"} {
+		"https://nabu.company.ru/chat/" + topic.ID.String(), `filename=small.csv`, "big.bin", "text/plain"} {
 		if !strings.Contains(letter, want) {
 			t.Fatalf("ML-10/14/16: %q is not in the letter:\n%s", want, letter)
 		}
 	}
+	if strings.Contains(letter, "filename=big.bin") {
+		t.Fatal("ML-14: a file over EMAIL_ATTACH_MAX is attached")
+	}
+	// ATT-15: the files over the limit are named under «More files» with the link to the topic
+	plain, _ := io.ReadAll(quotedprintable.NewReader(strings.NewReader(sent[0])))
+	if !strings.Contains(string(plain), "Остальные файлы — в разговоре в Nabu:") && !strings.Contains(string(plain), "More files are in the conversation in Nabu:") {
+		t.Fatalf("ATT-15: no line of the other files:\n%s", plain)
+	}
+	// ATT-15: the letter of a task carries the files the agent sent
+	if ok, err := m.SendTask(ctx, "task-"+uuid.NewString()[:6]+"@company.ru", "Отчёт", "Готово", "ru", []channels.OutFile{out("small.csv", 4)}); err != nil || !ok {
+		t.Fatalf("ATT-15: task letter %v %v", ok, err)
+	}
+	if last := sent[len(sent)-1]; !strings.Contains(last, "filename=small.csv") {
+		t.Fatalf("ATT-15: the task letter has no file:\n%s", last)
+	}
+	sent = sent[:1]
 	if strings.Contains(letter, "petr@company.ru") {
 		t.Fatal("ML-10: the answer went to a colleague")
 	}
 	// ML-15: the limit of letters to an address per hour
-	_ = m.Reply(ctx, uid, topic.ID, "ещё", since)
-	_ = m.Reply(ctx, uid, topic.ID, "и ещё", since)
+	_ = m.Reply(ctx, uid, topic.ID, "ещё", nil, since)
+	_ = m.Reply(ctx, uid, topic.ID, "и ещё", nil, since)
 	cv, _ = store.Get(ctx, uid, topic.ID)
 	if len(sent) != 2 || cv.UnreadCount != 1 {
 		t.Fatalf("ML-15: %d letters, unread %d", len(sent), cv.UnreadCount)
@@ -1007,16 +1027,6 @@ func TestMail(t *testing.T) {
 		t.Fatal("telegram without a binding")
 	}
 	_ = box
-}
-
-type spaceFiles struct{ list []email.SpaceFile }
-
-func (s *spaceFiles) AgentFiles(context.Context, uuid.UUID, time.Time) ([]email.SpaceFile, error) {
-	return s.list, nil
-}
-
-func (s *spaceFiles) Open(context.Context, uuid.UUID, string) (io.ReadCloser, int64, error) {
-	return io.NopCloser(strings.NewReader("1,2\n")), 4, nil
 }
 
 // ML-17…ML-20: the confirmation of tools that change data in mail topics.

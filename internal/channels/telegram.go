@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net/http"
 	"strconv"
 	"strings"
@@ -93,6 +94,11 @@ func (t *Telegram) call(ctx context.Context, method string, in any, out any) err
 		return fmt.Errorf("telegram %s: %w", method, scrub(err, token))
 	}
 	defer resp.Body.Close()
+	return answer(resp, out)
+}
+
+// answer reads the answer of the Bot API into out.
+func answer(resp *http.Response, out any) error {
 	var r struct {
 		OK          bool            `json:"ok"`
 		Description string          `json:"description"`
@@ -318,6 +324,90 @@ func (t *Telegram) FetchFile(ctx context.Context, fileID string) (io.ReadCloser,
 		return nil, "", fmt.Errorf("telegram file: %d", resp.StatusCode)
 	}
 	return resp.Body, f.FilePath, nil
+}
+
+// SendFile implements FileSender: a photo by sendPhoto, else sendDocument
+// (FTR.NAB.CHAT-0001 R33).
+func (t *Telegram) SendFile(ctx context.Context, chatID string, f OutFile) error {
+	method, field := "sendDocument", "document"
+	if Photo(f.MimeType, f.Size) {
+		method, field = "sendPhoto", "photo"
+	}
+	return t.upload(ctx, method, map[string]string{"chat_id": chatID}, []part{{field, f}})
+}
+
+// SendAlbum implements AlbumSender: sendMediaGroup of photos or of documents.
+func (t *Telegram) SendAlbum(ctx context.Context, chatID string, photos bool, files []OutFile) error {
+	kind := "document"
+	if photos {
+		kind = "photo"
+	}
+	media := make([]map[string]string, len(files))
+	parts := make([]part, len(files))
+	for i, f := range files {
+		name := fmt.Sprintf("f%d", i)
+		media[i] = map[string]string{"type": kind, "media": "attach://" + name}
+		parts[i] = part{name, f}
+	}
+	b, _ := json.Marshal(media)
+	return t.upload(ctx, "sendMediaGroup", map[string]string{"chat_id": chatID, "media": string(b)}, parts)
+}
+
+type part struct {
+	field string
+	file  OutFile
+}
+
+// upload calls a method of the Bot API with files in multipart/form-data.
+func (t *Telegram) upload(ctx context.Context, method string, fields map[string]string, parts []part) error {
+	token, _ := t.creds()
+	if token == "" {
+		return &TelegramError{Status: http.StatusServiceUnavailable, Description: "the bot is not configured"}
+	}
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	for k, v := range fields {
+		_ = mw.WriteField(k, v)
+	}
+	for _, p := range parts {
+		if err := addPart(ctx, mw, p); err != nil {
+			return err
+		}
+	}
+	if err := mw.Close(); err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.APIURL+"/bot"+token+"/"+method, &body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := t.http.Do(req)
+	if err != nil {
+		metrics.ChannelOutbound.WithLabelValues("telegram", "error").Inc()
+		return fmt.Errorf("telegram %s: %w", method, scrub(err, token))
+	}
+	defer resp.Body.Close()
+	if err := answer(resp, nil); err != nil {
+		metrics.ChannelOutbound.WithLabelValues("telegram", "error").Inc()
+		return err
+	}
+	metrics.ChannelOutbound.WithLabelValues("telegram", "ok").Inc()
+	return nil
+}
+
+func addPart(ctx context.Context, mw *multipart.Writer, p part) error {
+	rc, err := p.file.Open(ctx)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	fw, err := mw.CreateFormFile(p.field, p.file.Name)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(fw, rc)
+	return err
 }
 
 // ─── updates ────────────────────────────────────────────────────────

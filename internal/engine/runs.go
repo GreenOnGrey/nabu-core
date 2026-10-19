@@ -75,6 +75,7 @@ func (e *Engine) HandleTaskRun(ctx context.Context, key, value []byte) error {
 	defer lease.Release(ctx)
 	ctx, cancel := context.WithTimeout(ctx, e.Cfg.TaskRunTimeout)
 	defer cancel()
+	e.dropRunFiles(ctx, u.ID, ri.RunID) // FTR.NAB.CHAT-0001 R33: the files of an earlier attempt are not this run's
 	text, class, errText, lost := e.taskTurn(ctx, lease, ri)
 	if lost {
 		// R5: the pod went away before the run began — it waits for a new one.
@@ -87,6 +88,7 @@ func (e *Engine) HandleTaskRun(ctx context.Context, key, value []byte) error {
 		return err
 	}
 	if class != "" {
+		e.dropRunFiles(ctx, u.ID, ri.RunID)
 		_ = e.Tasks.Finish(ctx, ri.RunID, false, "", class, errText, nil)
 		if paused, reason := e.Tasks.PausedNow(ctx, ri.TaskID); paused {
 			note := fmt.Sprintf("The scheduled task «%s» failed three times in a row and was paused. Reason: %s. Resume it in the Tasks section after fixing the cause.", ri.Title, reason)
@@ -97,7 +99,11 @@ func (e *Engine) HandleTaskRun(ctx context.Context, key, value []byte) error {
 		}
 		return nil
 	}
-	msg := e.postTaskMessage(ctx, u.ID, main.ID, ri, text)
+	files, err := e.Chat.TakeRunFiles(ctx, ri.RunID)
+	if err != nil {
+		slog.WarnContext(ctx, "files of a run", "run", ri.RunID, "err", err)
+	}
+	msg := e.postTaskCard(ctx, u.ID, main.ID, ri, text, nil, files)
 	var mid *uuid.UUID
 	if msg != nil {
 		mid = &msg.ID
@@ -108,16 +114,24 @@ func (e *Engine) HandleTaskRun(ctx context.Context, key, value []byte) error {
 // postTaskMessage writes the result to the main conversation with the task
 // mark and sends it to the task's channel.
 func (e *Engine) postTaskMessage(ctx context.Context, uid, conv uuid.UUID, ri *tasks.RunInfo, text string) *chat.Message {
-	return e.postTaskCard(ctx, uid, conv, ri, text, nil)
+	return e.postTaskCard(ctx, uid, conv, ri, text, nil, nil)
 }
 
-// postTaskCard is postTaskMessage with a card for the web chat: the channels
-// get the text (FTR.NAB.CMN-0003 arch §3.5).
-func (e *Engine) postTaskCard(ctx context.Context, uid, conv uuid.UUID, ri *tasks.RunInfo, text string, card json.RawMessage) *chat.Message {
+// postTaskCard is postTaskMessage with a card for the web chat (the channels
+// get the text: FTR.NAB.CMN-0003 arch §3.5) and the files the agent sent during
+// the run, which go under the result and after its text (FTR.NAB.CHAT-0001 R33).
+func (e *Engine) postTaskCard(ctx context.Context, uid, conv uuid.UUID, ri *tasks.RunInfo, text string, card json.RawMessage, files []chat.Attachment) *chat.Message {
 	m, err := e.Chat.AddAssistant(ctx, conv, "task:"+ri.TaskID.String(), nil, "", nil)
 	if err != nil {
 		slog.ErrorContext(ctx, "task message", "err", err)
+		e.dropFiles(ctx, uid, files)
 		return nil
+	}
+	if len(files) > 0 {
+		if err := e.Chat.SetAttachments(ctx, m.ID, files); err != nil {
+			slog.ErrorContext(ctx, "task files", "err", err)
+			e.dropFiles(ctx, uid, files)
+		}
 	}
 	final, err := e.Chat.Finish(ctx, m.ID, text, "done", nil, "", "")
 	if err != nil {
@@ -146,7 +160,7 @@ func (e *Engine) postTaskCard(ctx context.Context, uid, conv uuid.UUID, ri *task
 			e.Tasks.NoteDelivery(ctx, ri.RunID, "channel_unavailable")
 			return final
 		}
-		if sent, err := e.Mail.SendTask(context.WithoutCancel(ctx), u.Email, ri.Title, text, u.Language); err != nil || !sent {
+		if sent, err := e.Mail.SendTask(context.WithoutCancel(ctx), u.Email, ri.Title, text, u.Language, e.outFiles(uid, final.Attachments)); err != nil || !sent {
 			if err != nil {
 				slog.WarnContext(ctx, "task mail", "task", ri.TaskID, "err", err)
 			}
@@ -155,6 +169,7 @@ func (e *Engine) postTaskCard(ctx context.Context, uid, conv uuid.UUID, ri *task
 		return final
 	}
 	e.deliver(ctx, uid, ri.Channel, "⏰ "+ri.Title+"\n\n"+text)
+	e.deliverFiles(ctx, uid, ri.Channel, final.Attachments)
 	return final
 }
 
@@ -418,4 +433,24 @@ func (e *Engine) serviceTurn(ctx context.Context, runID uuid.UUID, ag *services.
 		return summary, operatorClass(err), operatorText(err), total, false
 	}
 	return summary, "", "", total, false
+}
+
+// dropRunFiles removes the files a run collected (FTR.NAB.CHAT-0001 R33): the
+// run failed or starts again.
+func (e *Engine) dropRunFiles(ctx context.Context, uid, run uuid.UUID) {
+	files, err := e.Chat.TakeRunFiles(ctx, run)
+	if err != nil {
+		slog.WarnContext(ctx, "files of a run", "run", run, "err", err)
+		return
+	}
+	e.dropFiles(ctx, uid, files)
+}
+
+// dropFiles removes attachments that reached no message.
+func (e *Engine) dropFiles(ctx context.Context, uid uuid.UUID, files []chat.Attachment) {
+	for _, f := range files {
+		if key, err := e.Chat.DeleteAttachment(ctx, uid, f.ID); err == nil {
+			_ = e.S3.Delete(ctx, key)
+		}
+	}
 }

@@ -30,8 +30,8 @@ import (
 
 // Mailer is the mail channel as the engine uses it (FTR.NAB.CMN-0002 R8, R11).
 type Mailer interface {
-	Reply(ctx context.Context, uid, conv uuid.UUID, answer string, since time.Time) error
-	SendTask(ctx context.Context, to, title, text, lang string) (bool, error)
+	Reply(ctx context.Context, uid, conv uuid.UUID, answer string, files []channels.OutFile, since time.Time) error
+	SendTask(ctx context.Context, to, title, text, lang string, files []channels.OutFile) (bool, error)
 }
 
 // group returns the group agent whose data belong to the user, or nil.

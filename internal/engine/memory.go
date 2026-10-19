@@ -76,7 +76,7 @@ func (e *Engine) digest(ctx context.Context, u *users.User, ri *tasks.RunInfo, p
 	text, card := comm.RenderDigest(items, period, u.Language)
 	shown := *ri
 	shown.Title = comm.DigestTitle(period, u.Language)
-	msg := e.postTaskCard(ctx, u.ID, main.ID, &shown, text, card)
+	msg := e.postTaskCard(ctx, u.ID, main.ID, &shown, text, card, nil)
 	metrics.MemoryDigests.WithLabelValues(period, "sent").Inc()
 	if e.Ledger != nil {
 		e.Ledger.Audit(ctx, ledger.Entry{AgentKind: "service", Agent: "memory-digest", UserID: &u.ID, Channel: "task:" + ri.TaskID.String(),

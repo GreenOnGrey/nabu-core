@@ -18,7 +18,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
 	"github.com/GreenOnGrey/nabu-core/internal/app"
@@ -34,9 +36,12 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/models"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/agent"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/crypto"
+	"github.com/GreenOnGrey/nabu-core/internal/platform/httpx"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/jwt"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/kafka"
+	"github.com/GreenOnGrey/nabu-core/internal/platform/mcp"
 	"github.com/GreenOnGrey/nabu-core/internal/space"
+	"github.com/GreenOnGrey/nabu-core/internal/tasks"
 )
 
 // fakeAgent plays the operator for the turns of FTR.NAB.CHAT-0001: it records
@@ -51,6 +56,7 @@ type fakeAgent struct {
 	window    int64
 	autoCompa bool // the harness compacts during the next prompt
 	failCompa bool
+	during    func() // called inside the turn, as a tool call of the agent
 }
 
 func (f *fakeAgent) Open(_ context.Context, req agent.SessionRequest, _ func(ctx context.Context) ([]byte, error)) (agent.SessionResponse, error) {
@@ -65,8 +71,11 @@ func (f *fakeAgent) Prompt(_ context.Context, _ string, p agent.PromptRequest, o
 	f.prompts = append(f.prompts, p)
 	auto := f.autoCompa
 	f.autoCompa = false
-	tokens, window := f.tokens, f.window
+	tokens, window, during := f.tokens, f.window, f.during
 	f.mu.Unlock()
+	if during != nil {
+		during()
+	}
 	if auto {
 		onEvent(agent.Event{Type: agent.EventCompaction, Auto: true, Summary: "auto summary", TokensBefore: 190_000, TokensAfter: 8_000})
 	}
@@ -799,4 +808,240 @@ func wavOf(seconds int) []byte {
 	_ = binary.Write(&b, binary.LittleEndian, uint32(seconds*rate))
 	b.Write(make([]byte, seconds*rate))
 	return b.Bytes()
+}
+
+// albumBot is a messenger with albums (Telegram) for the delivery of files;
+// it records what it sent.
+type albumBot struct {
+	mu   sync.Mutex
+	sent []string // "album:<names>" or "file:<name>"
+}
+
+func (*albumBot) Channel() string                            { return domain.ChannelVKTeams }
+func (*albumBot) Send(context.Context, string, string) error { return nil }
+func (*albumBot) Typing(context.Context, string)             {}
+func (*albumBot) FetchFile(context.Context, string) (io.ReadCloser, string, error) {
+	return nil, "", errors.New("no")
+}
+
+func (b *albumBot) SendFile(ctx context.Context, _ string, f channels.OutFile) error {
+	rc, err := f.Open(ctx)
+	if err != nil {
+		return err
+	}
+	rc.Close()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.sent = append(b.sent, "file:"+f.Name)
+	return nil
+}
+
+func (b *albumBot) SendAlbum(ctx context.Context, _ string, _ bool, files []channels.OutFile) error {
+	var names []string
+	for _, f := range files {
+		rc, err := f.Open(ctx)
+		if err != nil {
+			return err
+		}
+		rc.Close()
+		names = append(names, f.Name)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.sent = append(b.sent, "album:"+strings.Join(names, ","))
+	return nil
+}
+
+// FTR.NAB.CHAT-0001 R33: the agent sends files of its space; they are attached
+// to the answer and go to the messenger after the text: photos as one album,
+// documents apart; a run of a task keeps its files for its result.
+func TestChatAgentFiles(t *testing.T) {
+	ctx := context.Background()
+	r := newChatRig(t)
+	bot := &albumBot{}
+	r.eng.Adapters = map[string]channels.Adapter{domain.ChannelTelegram: bot, domain.ChannelVKTeams: bot}
+	uid := newUser(t, "att-"+uuid.NewString()[:6]+"@x.org")
+	files := map[string][]byte{"reports/summary.md": []byte("# Итоги\n"), "big.bin": make([]byte, 2<<20),
+		"a.png": []byte("\x89PNG a"), "b.png": []byte("\x89PNG b")}
+	tool := r.api.AttachTool(func(_ context.Context, _ uuid.UUID, p string, max int64) ([]byte, error) {
+		b, ok := files[p]
+		if !ok {
+			return nil, &mcp.ToolError{Msg: "no such file in your space: " + p}
+		}
+		if int64(len(b)) > max {
+			return nil, &mcp.ToolError{Msg: "the file is larger than 1 MB"}
+		}
+		return b, nil
+	})
+	main, err := r.api.Store.Main(ctx, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := mcp.Grant{UserID: uid, Conversation: main.ID, Channel: domain.ChannelTelegram}
+	if tool.Available(ctx, mcp.Grant{UserID: uid}) {
+		t.Fatal("ATT-05: chat_attach is offered to a session with neither a conversation nor a task")
+	}
+	call := func(g mcp.Grant, p string) (string, error) {
+		return tool.Handler(ctx, g, json.RawMessage(`{"path":"`+p+`"}`))
+	}
+	if _, err := call(g, "reports/summary.md"); err == nil || !strings.Contains(err.Error(), "no answer is being written in this conversation") {
+		t.Fatalf("ATT-04: a file is attached with no answer being written: %v", err)
+	}
+	var results []string
+	var errs []error
+	r.op.during = func() {
+		for _, p := range []string{"reports/summary.md", "missing.txt", "big.bin", "a.png", "b.png"} {
+			out, err := call(g, p)
+			results, errs = append(results, out), append(errs, err)
+		}
+	}
+	if err := r.api.Receive(ctx, channels.Inbound{UserID: uid, Channel: domain.ChannelTelegram, Text: "пришли итоги файлом"}); err != nil {
+		t.Fatal(err)
+	}
+	r.drain()
+	r.op.during = nil
+	if errs[0] != nil || !strings.Contains(results[0], "summary.md") {
+		t.Fatalf("ATT-01: %q %v", results[0], errs[0])
+	}
+	if errs[1] == nil || !strings.Contains(errs[1].Error(), "missing.txt") || errs[2] == nil || !strings.Contains(errs[2].Error(), "larger") {
+		t.Fatalf("ATT-03: %v / %v", errs[1], errs[2])
+	}
+	answerFiles := func(conv uuid.UUID) []chat.Attachment {
+		var atts []chat.Attachment
+		var b []byte
+		if err := pool.QueryRow(ctx, `SELECT attachments FROM messages WHERE conversation_id = $1 AND role = 'assistant' ORDER BY created_at DESC LIMIT 1`, conv).Scan(&b); err != nil {
+			t.Fatal(err)
+		}
+		_ = json.Unmarshal(b, &atts)
+		return atts
+	}
+	atts := answerFiles(main.ID)
+	if len(atts) != 3 || atts[0].FileName != "summary.md" || atts[0].MimeType != "text/markdown" || atts[0].Size != int64(len(files["reports/summary.md"])) ||
+		atts[1].MimeType != "image/png" {
+		t.Fatalf("ATT-01: the answer carries %+v", atts)
+	}
+	// ATT-02, ATT-12: the text, then the photos as one album, then the document alone
+	r.bus.mu.Lock()
+	var outs []engine.Outbound
+	for _, m := range r.bus.msgs {
+		if v, ok := strings.CutPrefix(m, kafka.TopicOutbound+" "); ok {
+			var o engine.Outbound
+			_ = json.Unmarshal([]byte(v), &o)
+			outs = append(outs, o)
+		}
+	}
+	r.bus.msgs = nil
+	r.bus.mu.Unlock()
+	if len(outs) != 3 || outs[0].Text != "ok" || len(outs[0].Attachments) != 0 ||
+		!outs[1].Photos || len(outs[1].Attachments) != 2 || outs[1].Attachments[0] != atts[1].ID ||
+		outs[2].Photos || len(outs[2].Attachments) != 1 || outs[2].Attachments[0] != atts[0].ID || outs[2].Text != "" {
+		t.Fatalf("ATT-02, ATT-12: outbound %+v", outs)
+	}
+
+	// ATT-13: a run of a task keeps the files for its result; an earlier attempt's are dropped
+	ts := &tasks.Service{Pool: pool, Events: r.ev, Bus: r.bus, Rules: tasks.Rules{MinInterval: 15 * time.Minute, MaxActive: 20},
+		Catchup: time.Hour, Tick: time.Second, MaxFailures: 3, DefaultTimezone: "UTC"}
+	r.eng.Tasks = ts
+	r.eng.Cfg.TaskRunTimeout = time.Minute
+	in := tasks.CreateInput{Title: "Отчёт", Instruction: "пришли отчёт"}
+	in.Schedule.Once = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	tk, err := ts.Create(ctx, uid, in, "web", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = pool.Exec(ctx, `UPDATE scheduled_tasks SET next_run_at = now() - interval '1 minute' WHERE id = $1`, tk.ID)
+	if n, err := ts.Due(ctx); err != nil || n != 1 {
+		t.Fatalf("due %d %v", n, err)
+	}
+	var runID uuid.UUID
+	_ = pool.QueryRow(ctx, `SELECT id FROM task_runs WHERE task_id = $1`, tk.ID).Scan(&runID)
+	tg := mcp.Grant{UserID: uid, TaskID: tk.ID}
+	if !tool.Available(ctx, tg) {
+		t.Fatal("ATT-13: chat_attach is not offered to a run of a task")
+	}
+	if _, err := call(tg, "big.bin"); err == nil {
+		t.Fatal("ATT-03: a large file in a run")
+	}
+	if _, err := call(tg, "a.png"); err != nil { // the attempt before a restart
+		t.Fatal(err)
+	}
+	var stale []chat.Attachment
+	var sb []byte
+	_ = pool.QueryRow(ctx, `SELECT attachments FROM task_runs WHERE id = $1`, runID).Scan(&sb)
+	_ = json.Unmarshal(sb, &stale)
+	r.op.during = func() {
+		if _, err := call(tg, "reports/summary.md"); err != nil {
+			t.Error(err)
+		}
+	}
+	payload, _ := json.Marshal(tasks.RunMessage{RunID: runID, TaskID: tk.ID, UserID: uid})
+	if err := r.eng.HandleTaskRun(ctx, nil, payload); err != nil {
+		t.Fatal(err)
+	}
+	r.op.during = nil
+	got := answerFiles(main.ID)
+	if len(stale) != 1 || len(got) != 1 || got[0].FileName != "summary.md" {
+		t.Fatalf("ATT-13: stale %+v, the result carries %+v", stale, got)
+	}
+	var n int
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM attachments WHERE id = $1`, stale[0].ID).Scan(&n)
+	if n != 0 {
+		t.Fatal("ATT-13: the file of the earlier attempt stays")
+	}
+
+	// ATT-17: an album that lost a file goes file by file without it, and is not retried
+	if _, err := pool.Exec(ctx, `INSERT INTO channel_contacts (channel, user_id, chat_id) VALUES ('vkteams', $1, '42') ON CONFLICT DO NOTHING`, uid); err != nil {
+		t.Fatal(err)
+	}
+	if key, err := r.api.Store.DeleteAttachment(ctx, uid, atts[2].ID); err != nil || r.s3.Delete(ctx, key) != nil {
+		t.Fatal(err)
+	}
+	ob, _ := json.Marshal(engine.Outbound{UserID: uid, Channel: domain.ChannelVKTeams, Attachments: []uuid.UUID{atts[1].ID, atts[2].ID}, Photos: true})
+	if err := r.eng.HandleOutbound(ctx, nil, ob); err != nil {
+		t.Fatalf("ATT-17: %v", err)
+	}
+	if len(bot.sent) != 1 || bot.sent[0] != "file:"+atts[1].FileName {
+		t.Fatalf("ATT-17: sent %q", bot.sent)
+	}
+
+	// ATT-18: at most 10 files with an answer
+	ans, err := r.api.Store.AddAssistant(ctx, main.ID, domain.ChannelWeb, nil, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range chat.MaxAgentFiles {
+		if _, err := call(g, "a.png"); err != nil {
+			t.Fatalf("ATT-18: file %d: %v", i+1, err)
+		}
+	}
+	if _, err := call(g, "a.png"); err == nil || !strings.Contains(err.Error(), "at most 10 files") {
+		t.Fatalf("ATT-18: the 11th file: %v", err)
+	}
+	if _, err := r.api.Store.Finish(ctx, ans.ID, "", "done", nil, "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// SEC-05: the file the agent sent is downloaded by its user only
+	router := chi.NewRouter()
+	as := func(u uuid.UUID) func(http.Handler) http.Handler {
+		return func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				next.ServeHTTP(w, req.WithContext(httpx.WithPrincipal(req.Context(), &domain.Principal{UserID: u})))
+			})
+		}
+	}
+	other := newUser(t, "att-other-"+uuid.NewString()[:6]+"@x.org")
+	router.Route("/own", func(rr chi.Router) { rr.Use(as(uid)); r.api.Routes(rr, true) })
+	router.Route("/other", func(rr chi.Router) { rr.Use(as(other)); r.api.Routes(rr, true) })
+	get := func(prefix string) (int, http.Header) {
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, prefix+"/attachments/"+atts[0].ID.String(), nil))
+		return w.Code, w.Header()
+	}
+	if code, h := get("/own"); code != http.StatusOK || h.Get("Content-Type") != "application/octet-stream" || h.Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("SEC-04, SEC-05: own %d %v", code, h)
+	}
+	if code, _ := get("/other"); code != http.StatusNotFound {
+		t.Fatalf("SEC-05: another user gets %d", code)
+	}
 }

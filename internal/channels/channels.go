@@ -33,6 +33,37 @@ type Adapter interface {
 	FetchFile(ctx context.Context, fileID string) (io.ReadCloser, string, error)
 }
 
+// OutFile is a file the agent sends (FTR.NAB.CHAT-0001 R33): an attachment
+// read when it is sent.
+type OutFile struct {
+	Name, MimeType string
+	Size           int64
+	Open           func(ctx context.Context) (io.ReadCloser, error)
+}
+
+// FileSender sends a file to a chat: the files of an answer go after its text.
+type FileSender interface {
+	SendFile(ctx context.Context, chatID string, f OutFile) error
+}
+
+// AlbumSender sends 2…10 files as one album: photos or documents.
+type AlbumSender interface {
+	SendAlbum(ctx context.Context, chatID string, photos bool, files []OutFile) error
+}
+
+// MaxAlbum is the most files of an album (Telegram sendMediaGroup).
+const MaxAlbum = 10
+
+// Photo reports a file a messenger shows as a photo: JPEG, PNG or WebP up to
+// 10 MB (Telegram sendPhoto); GIF and the rest go as documents.
+func Photo(mimeType string, size int64) bool {
+	switch mimeType {
+	case "image/jpeg", "image/png", "image/webp":
+		return size <= 10<<20
+	}
+	return false
+}
+
 // Drafter streams a draft of the answer to a private chat (Telegram R14).
 type Drafter interface {
 	Draft(ctx context.Context, chatID string, draftID int64, text string) error

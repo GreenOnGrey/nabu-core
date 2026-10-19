@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"strings"
 	"sync"
@@ -588,7 +589,7 @@ func (e *Engine) HandleInbound(ctx context.Context, key, value []byte) error {
 		// R8: a letter in the thread when the bot was the only recipient,
 		// otherwise the topic with an unread mark; a failure stays in the topic.
 		if e.Mail != nil && res.errClass == "" {
-			if err := e.Mail.Reply(context.WithoutCancel(ctx), u.ID, in.ConversationID, res.text, started); err != nil {
+			if err := e.Mail.Reply(context.WithoutCancel(ctx), u.ID, in.ConversationID, res.text, e.outFiles(u.ID, final.Attachments), started); err != nil {
 				slog.WarnContext(ctx, "mail reply", "conversation", in.ConversationID, "err", err)
 			}
 		}
@@ -600,6 +601,9 @@ func (e *Engine) HandleInbound(ctx context.Context, key, value []byte) error {
 			out = "**" + ga.Name + " " + groupMark(u.Language) + "**\n\n" + out // design §5 #4: the group agent signs its answers
 		}
 		e.deliver(ctx, u.ID, in.Channel, out)
+		if res.errClass == "" {
+			e.deliverFiles(ctx, u.ID, in.Channel, final.Attachments) // FTR.NAB.CHAT-0001 R33: the files go after the text
+		}
 	}
 	return nil
 }
@@ -887,7 +891,73 @@ type Outbound struct {
 	UserID  uuid.UUID `json:"userId"`
 	Channel string    `json:"channel"`
 	Text    string    `json:"text"`
+	// Attachments are files of an answer: one file, or an album of photos or
+	// of documents. They go apart from the text, so that a retry of their
+	// delivery does not repeat it (FTR.NAB.CHAT-0001 R33).
+	Attachments []uuid.UUID `json:"attachmentIds,omitempty"`
+	Photos      bool        `json:"photos,omitempty"`
 }
+
+// deliverFiles sends the files of an answer to a messenger after its text:
+// where the messenger has albums — the photos as one album, then the
+// documents as another; elsewhere one by one.
+func (e *Engine) deliverFiles(ctx context.Context, uid uuid.UUID, ch string, atts []chat.Attachment) {
+	publish := func(ids []uuid.UUID, photos bool) {
+		b, _ := json.Marshal(Outbound{UserID: uid, Channel: ch, Attachments: ids, Photos: photos})
+		if err := e.Bus.Publish(ctx, kafka.TopicOutbound, uid.String(), b); err != nil {
+			slog.ErrorContext(ctx, "publish outbound files", "err", err)
+		}
+	}
+	if _, ok := e.Adapters[ch].(channels.AlbumSender); !ok {
+		for _, a := range atts {
+			publish([]uuid.UUID{a.ID}, false)
+		}
+		return
+	}
+	var photos, docs []uuid.UUID
+	for _, a := range atts {
+		if channels.Photo(a.MimeType, a.Size) {
+			photos = append(photos, a.ID)
+		} else {
+			docs = append(docs, a.ID)
+		}
+	}
+	for _, g := range []struct {
+		ids    []uuid.UUID
+		photos bool
+	}{{photos, true}, {docs, false}} {
+		for ids := g.ids; len(ids) > 0; ids = ids[min(len(ids), channels.MaxAlbum):] {
+			publish(ids[:min(len(ids), channels.MaxAlbum)], g.photos)
+		}
+	}
+}
+
+// outFiles are attachments of the user read when they are sent; a file that
+// is gone opens with errFileGone, other failures are worth a retry.
+func (e *Engine) outFiles(uid uuid.UUID, atts []chat.Attachment) []channels.OutFile {
+	out := make([]channels.OutFile, 0, len(atts))
+	for _, a := range atts {
+		id := a.ID
+		out = append(out, channels.OutFile{Name: a.FileName, MimeType: a.MimeType, Size: a.Size,
+			Open: func(ctx context.Context) (io.ReadCloser, error) {
+				_, key, err := e.Chat.Attachment(ctx, uid, id)
+				if errors.Is(err, chat.ErrAttachmentGone) {
+					return nil, errFileGone
+				}
+				if err != nil {
+					return nil, err
+				}
+				rc, err := e.S3.Get(ctx, key)
+				if errors.Is(err, storage.ErrNotFound) {
+					return nil, errFileGone
+				}
+				return rc, err
+			}})
+	}
+	return out
+}
+
+var errFileGone = errors.New("the attachment is gone")
 
 func (e *Engine) deliver(ctx context.Context, uid uuid.UUID, ch, text string) {
 	if strings.TrimSpace(text) == "" {
@@ -922,13 +992,52 @@ func (e *Engine) HandleOutbound(ctx context.Context, _, value []byte) error {
 	if !ok {
 		return nil
 	}
-	if err := ad.Send(ctx, chatID, o.Text); err != nil {
+	send := func() error { return ad.Send(ctx, chatID, o.Text) }
+	if len(o.Attachments) > 0 {
+		send = func() error { return e.sendFiles(ctx, ad, o, chatID) }
+	}
+	if err := send(); err != nil {
 		var refusal interface{ Permanent() bool }
 		if errors.As(err, &refusal) && refusal.Permanent() {
 			slog.WarnContext(ctx, "channel delivery", "channel", o.Channel, "err", err)
 			return nil
 		}
 		return err // a transient failure: the consumer retries the delivery
+	}
+	return nil
+}
+
+// sendFiles sends a file or an album to a messenger chat. A file that is
+// gone is left out and not retried (FTR.NAB.CHAT-0001 tech §2.7): an album
+// that loses one goes again file by file.
+func (e *Engine) sendFiles(ctx context.Context, ad channels.Adapter, o Outbound, chatID string) error {
+	var atts []chat.Attachment
+	for _, id := range o.Attachments {
+		a, _, err := e.Chat.Attachment(ctx, o.UserID, id)
+		if errors.Is(err, chat.ErrAttachmentGone) {
+			slog.WarnContext(ctx, "outbound file is gone", "attachment", id)
+			continue
+		}
+		if err != nil {
+			return err // transient: the consumer retries the delivery
+		}
+		atts = append(atts, a)
+	}
+	files := e.outFiles(o.UserID, atts)
+	if as, ok := ad.(channels.AlbumSender); ok && len(files) > 1 {
+		err := as.SendAlbum(ctx, chatID, o.Photos, files)
+		if !errors.Is(err, errFileGone) {
+			return err
+		}
+	}
+	fs, ok := ad.(channels.FileSender)
+	if !ok {
+		return nil
+	}
+	for _, f := range files {
+		if err := fs.SendFile(ctx, chatID, f); err != nil && !errors.Is(err, errFileGone) {
+			return err
+		}
 	}
 	return nil
 }

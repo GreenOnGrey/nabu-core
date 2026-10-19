@@ -9,7 +9,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -53,18 +52,6 @@ const (
 // UnreadEvent is the SSE event of an unread mail answer (tech §3).
 const UnreadEvent = "conversation.unread"
 
-// Space gives the files the agent created during a turn (R8).
-type Space interface {
-	AgentFiles(ctx context.Context, uid uuid.UUID, since time.Time) ([]SpaceFile, error)
-	Open(ctx context.Context, uid uuid.UUID, path string) (io.ReadCloser, int64, error)
-}
-
-// SpaceFile is a file of the space.
-type SpaceFile struct {
-	Path string
-	Size int64
-}
-
 // Account is the user of a sender.
 type Account struct {
 	ID       uuid.UUID
@@ -82,7 +69,6 @@ type Mail struct {
 	Accounts    Accounts
 	Inbox       channels.Inbox
 	Attachments channels.Attachments
-	Space       Space
 	Events      events.Publisher
 	WebURL      string
 	ReplyLimit  int   // EMAIL_REPLY_LIMIT_PER_HOUR
@@ -362,9 +348,9 @@ func (m *Mail) thread(ctx context.Context, uid uuid.UUID, l *Letter, mode string
 
 // Reply sends the answer of the agent in a mail topic: a letter in the
 // thread to the sender when the bot was the only recipient (R8), otherwise
-// only the topic with an unread mark. since is the start of the turn: files
-// the agent created after it are attached.
-func (m *Mail) Reply(ctx context.Context, uid, conv uuid.UUID, answer string, since time.Time) error {
+// only the topic with an unread mark. files are the files the agent sent with
+// the answer (FTR.NAB.CHAT-0001 R33); since is the start of the turn.
+func (m *Mail) Reply(ctx context.Context, uid, conv uuid.UUID, answer string, files []channels.OutFile, since time.Time) error {
 	var to, mode, last, subject string
 	var ids []string
 	err := m.Pool.QueryRow(ctx, `SELECT COALESCE(reply_to,''), COALESCE(reply_mode,'web_only'), COALESCE(last_message_id,''), message_ids, subject
@@ -394,7 +380,7 @@ func (m *Mail) Reply(ctx context.Context, uid, conv uuid.UUID, answer string, si
 	}
 	msgID := uuid.NewString() + "@" + Domain(c.Settings.Mailbox)
 	refs := append([]string{}, ids...)
-	letter, err := m.compose(ctx, c, uid, conv, to, subject, last, refs, msgID, answer, lang, since)
+	letter, err := m.compose(ctx, c, conv, to, subject, last, refs, msgID, answer, files, lang, since)
 	if err != nil {
 		return err
 	}
@@ -427,8 +413,8 @@ func (m *Mail) MarkUnread(ctx context.Context, uid, conv uuid.UUID) error {
 	return nil
 }
 
-func (m *Mail) compose(ctx context.Context, c Credentials, uid, conv uuid.UUID, to, subject, inReplyTo string, refs []string, msgID, answer, lang string,
-	since time.Time) ([]byte, error) {
+func (m *Mail) compose(ctx context.Context, c Credentials, conv uuid.UUID, to, subject, inReplyTo string, refs []string, msgID, answer string,
+	files []channels.OutFile, lang string, since time.Time) ([]byte, error) {
 	var h mail.Header
 	h.SetDate(m.clock())
 	h.SetAddressList("From", []*mail.Address{{Name: "Nabu", Address: c.Settings.Mailbox}})
@@ -443,27 +429,8 @@ func (m *Mail) compose(ctx context.Context, c Credentials, uid, conv uuid.UUID, 
 	}
 	link := m.WebURL + "/chat/" + conv.String()
 	htmlBody, textBody := render.Email(render.Parse(answer))
-	var attach []SpaceFile
-	var links []string
-	if m.Space != nil {
-		files, err := m.Space.AgentFiles(ctx, uid, since)
-		if err == nil {
-			var total int64
-			for _, f := range files {
-				if total+f.Size <= m.AttachMax { // ML-14: up to 10 MB in total, the rest as links
-					attach = append(attach, f)
-					total += f.Size
-				} else {
-					links = append(links, f.Path)
-				}
-			}
-		}
-	}
-	for _, p := range links {
-		u := m.WebURL + "/space?path=" + url.QueryEscape(p)
-		htmlBody += `<p style="margin:8px 0;">📎 <a href="` + u + `" style="color:#6d5bd0;">` + htmlEsc(p) + `</a></p>`
-		textBody += "\n\n📎 " + p + ": " + u
-	}
+	attach, more := m.split(files)
+	htmlBody, textBody = moreFiles(htmlBody, textBody, more, link, lang)
 	open := channels.T(lang, "mail.open")
 	if m.Pending != nil && m.Pending(ctx, conv, since) { // ML-17
 		open = channels.T(lang, "mail.confirm")
@@ -471,20 +438,59 @@ func (m *Mail) compose(ctx context.Context, c Credentials, uid, conv uuid.UUID, 
 	htmlBody = `<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5;color:#1d1d2c;max-width:720px;">` +
 		htmlBody + `<p style="margin:20px 0 0;"><a href="` + link + `" style="color:#6d5bd0;">` + htmlEsc(open) + `</a></p></div>`
 	textBody += "\n\n" + open + ": " + link
-	return buildLetter(h, textBody, htmlBody, func(add func(name, mime string, r io.Reader) error) error {
-		for _, f := range attach {
-			rc, _, err := m.Space.Open(ctx, uid, f.Path)
+	return buildLetter(h, textBody, htmlBody, attachAll(ctx, attach))
+}
+
+// split takes the files in order while they fit EMAIL_ATTACH_MAX in total
+// (ML-14); the rest are named with a link to the conversation.
+func (m *Mail) split(files []channels.OutFile) (attach []channels.OutFile, more []string) {
+	var total int64
+	for _, f := range files {
+		if len(more) == 0 && total+f.Size <= m.AttachMax {
+			attach = append(attach, f)
+			total += f.Size
+		} else {
+			more = append(more, f.Name)
+		}
+	}
+	return attach, more
+}
+
+// moreFiles names the files that did not fit the letter.
+func moreFiles(htmlBody, textBody string, more []string, link, lang string) (string, string) {
+	if len(more) == 0 {
+		return htmlBody, textBody
+	}
+	head := channels.T(lang, "mail.more_files")
+	htmlBody += `<p style="margin:12px 0 4px;">` + htmlEsc(head) + `</p>`
+	textBody += "\n\n" + head
+	for _, n := range more {
+		htmlBody += `<p style="margin:4px 0;">📎 <a href="` + link + `" style="color:#6d5bd0;">` + htmlEsc(n) + `</a></p>`
+		textBody += "\n📎 " + n
+	}
+	textBody += "\n" + link
+	return htmlBody, textBody
+}
+
+// attachAll adds the files to a letter; a file that cannot be read is left out.
+func attachAll(ctx context.Context, files []channels.OutFile) func(add func(name, mime string, r io.Reader) error) error {
+	if len(files) == 0 {
+		return nil
+	}
+	return func(add func(name, mime string, r io.Reader) error) error {
+		for _, f := range files {
+			rc, err := f.Open(ctx)
 			if err != nil {
 				continue
 			}
-			err = add(f.Path[strings.LastIndex(f.Path, "/")+1:], "", rc)
+			err = add(f.Name, f.MimeType, rc)
 			rc.Close()
 			if err != nil {
 				return err
 			}
 		}
 		return nil
-	})
+	}
 }
 
 func htmlEsc(s string) string {
@@ -541,8 +547,9 @@ func buildLetter(h mail.Header, text, htmlBody string, files func(add func(name,
 }
 
 // SendTask delivers the result of a scheduled task by mail (R11): a new
-// letter to the user; false — the limit of letters to the address is reached.
-func (m *Mail) SendTask(ctx context.Context, to, title, text, lang string) (bool, error) {
+// letter to the user with the files the agent sent (FTR.NAB.CHAT-0001 R33);
+// false — the limit of letters to the address is reached.
+func (m *Mail) SendTask(ctx context.Context, to, title, text, lang string, files []channels.OutFile) (bool, error) {
 	c, enabled, err := m.Credentials(ctx)
 	if err != nil || !enabled {
 		return false, err
@@ -558,10 +565,12 @@ func (m *Mail) SendTask(ctx context.Context, to, title, text, lang string) (bool
 	h.SetMessageID(uuid.NewString() + "@" + Domain(c.Settings.Mailbox))
 	htmlBody, textBody := render.Email(render.Parse(text))
 	link := m.WebURL + "/chat"
+	attach, more := m.split(files)
+	htmlBody, textBody = moreFiles(htmlBody, textBody, more, link, lang)
 	open := channels.T(lang, "mail.open")
 	htmlBody = `<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5;color:#1d1d2c;max-width:720px;">` +
 		htmlBody + `<p style="margin:20px 0 0;"><a href="` + link + `" style="color:#6d5bd0;">` + htmlEsc(open) + `</a></p></div>`
-	msg, err := buildLetter(h, textBody+"\n\n"+open+": "+link, htmlBody, nil)
+	msg, err := buildLetter(h, textBody+"\n\n"+open+": "+link, htmlBody, attachAll(ctx, attach))
 	if err != nil {
 		return false, err
 	}
