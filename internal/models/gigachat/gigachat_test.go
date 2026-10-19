@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +14,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+
+	"github.com/GreenOnGrey/nabu-core/internal/platform/agent"
 )
 
 // GC-04: tools become functions, a tool result a function message, several
@@ -128,6 +131,7 @@ type fakeGigaChat struct {
 	mu        sync.Mutex
 	tokens    int
 	reject    int // the next chat requests answered 401
+	status    int // the chat requests answered with this status
 	uploads   []string
 	deletes   []string
 	chatBody  string
@@ -172,7 +176,13 @@ func (f *fakeGigaChat) handler(t *testing.T) http.Handler {
 		if reject {
 			f.reject--
 		}
+		status := f.status
 		f.mu.Unlock()
+		if status != 0 {
+			w.WriteHeader(status)
+			_, _ = io.WriteString(w, `{"message":"refused"}`)
+			return
+		}
 		if reject {
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = io.WriteString(w, `{"message":"token expired"}`)
@@ -183,7 +193,7 @@ func (f *fakeGigaChat) handler(t *testing.T) http.Handler {
 	return r
 }
 
-// GC-01, GC-02, GC-03, GC-06, GC-07 through the bridge.
+// GC-01, GC-02, GC-03, GC-06, GC-07, GC-08 through the bridge.
 func TestBridge(t *testing.T) {
 	f := &fakeGigaChat{expiresIn: 30 * time.Minute}
 	up := httptest.NewServer(f.handler(t))
@@ -249,6 +259,41 @@ func TestBridge(t *testing.T) {
 	}
 	if _, err := cl.Token(context.Background(), *conn); err != nil || f.tokens != before+2 {
 		t.Fatalf("GC-02: a token expiring within a minute is renewed (%d)", f.tokens-before)
+	}
+	// GC-08: 402 and 429 keep their status and are classified as the balance and the limits
+	for status, class := range map[int]agent.ErrorClass{402: agent.ErrInsufficientBalance, 429: agent.ErrRateLimit} {
+		f.mu.Lock()
+		f.status = status
+		f.mu.Unlock()
+		code, body := post("bridge-"+id.String(), `{"model":"GigaChat-2-Max","messages":[{"role":"user","content":"hi"}]}`)
+		if c := agent.Classify(strconv.Itoa(code) + " " + body); code != status || c.Class != class {
+			t.Fatalf("GC-08 %d: %d %s → %s", status, code, body, c.Class)
+		}
+	}
+	f.mu.Lock()
+	f.status = 0
+	f.mu.Unlock()
+	// the service does not answer: 503, and the text says 503 too
+	down := &Bridge{Client: &Client{HTTP: up.Client()}, Verify: b.Verify,
+		Lookup: func(context.Context, uuid.UUID) (*Conn, error) {
+			c := *conn
+			c.APIURL = "http://127.0.0.1:1"
+			return &c, nil
+		}}
+	rd := chi.NewRouter()
+	down.Routes(rd)
+	sd := httptest.NewServer(rd)
+	defer sd.Close()
+	req, _ := http.NewRequest(http.MethodPost, sd.URL+Prefix+"/"+id.String()+"/v1/chat/completions", strings.NewReader(`{"model":"GigaChat-2-Max","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer bridge-"+id.String())
+	if resp, err := http.DefaultClient.Do(req); err != nil {
+		t.Fatal(err)
+	} else {
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(raw), `"message":"503`) {
+			t.Fatalf("unavailable: %d %s", resp.StatusCode, raw)
+		}
 	}
 	// models
 	list, err := b.Client.Models(context.Background(), *conn)

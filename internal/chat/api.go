@@ -77,15 +77,16 @@ type API struct {
 	MaxFile  int64
 	// Skills lists the skills the user may call (FTR.NAB.CHAT-0001 R4); nil: none.
 	Skills func(ctx context.Context, uid uuid.UUID) ([]Skill, error)
-	// MaxVoice bounds a voice recording in bytes (R20: five minutes).
-	MaxVoice int64
+	// MaxVoiceSeconds bounds a voice recording (R20: TRANSCRIBE_MAX_SECONDS,
+	// five minutes by default).
+	MaxVoiceSeconds int
 }
 
 // staleTurn: an answer streaming for longer is not a running turn (R1).
 const staleTurn = 15 * time.Minute
 
-// minCompact: a shorter context is not compacted (R2).
-const minCompact = 2000
+// MinCompact: a shorter context is not compacted (R2, CTX-06).
+const MinCompact = 2000
 
 // ─── attachments ────────────────────────────────────────────────────
 
@@ -363,7 +364,6 @@ func (a *API) PatchAgent(ctx context.Context, uid uuid.UUID, name, tone *string,
 		}
 		conn, mid = &model.ConnectionID, &model.Model
 	}
-	before, _ := a.agentView(ctx, uid)
 	if err := a.Users.SetAgent(ctx, uid, name, tone, conn, mid); err != nil {
 		return nil, err
 	}
@@ -376,16 +376,8 @@ func (a *API) PatchAgent(ctx context.Context, uid uuid.UUID, name, tone *string,
 	if err != nil {
 		return nil, err
 	}
+	// R16: the divider «Модель: …» is written by the engine at the first answer of the new model
 	a.Events.Publish(ctx, events.Event{Type: events.AgentUpdated, UserID: &uid, Data: v})
-	// R16: the change of the model is an event of the main conversation
-	if before != nil && v.Model != nil && (before.Model == nil || before.Model.ConnectionID != v.Model.ConnectionID || before.Model.Model != v.Model.Model) {
-		if main, err := a.Store.Main(ctx, uid); err == nil {
-			cid := v.Model.ConnectionID
-			if ev, err := a.Store.AddEvent(ctx, main.ID, domain.ChannelWeb, Event{Kind: EventModel, ConnectionID: &cid, Model: v.Model.Model, Name: v.Model.Name}); err == nil {
-				a.Events.Publish(ctx, events.Event{Type: events.MessageCreated, UserID: &uid, Data: ev})
-			}
-		}
-	}
 	return v, nil
 }
 
@@ -438,7 +430,7 @@ func (a *API) Routes(r chi.Router, site bool) {
 			if a.Whisper == nil {
 				return apperr.Unavailable("transcription_unavailable", "voice input is not configured")
 			}
-			f, hdr, err := formFile(r, a.maxVoice())
+			f, hdr, err := formFile(r, a.voiceReadLimit())
 			if err != nil {
 				return err
 			}
@@ -545,11 +537,11 @@ func (a *API) Routes(r chi.Router, site bool) {
 		if err != nil {
 			return err
 		}
-		job, err := a.Reset(r.Context(), p.UserID, &id, p.Channel())
+		event, err := a.Reset(r.Context(), p.UserID, &id, p.Channel())
 		if err != nil {
 			return err
 		}
-		httpx.JSON(w, http.StatusAccepted, map[string]any{"jobId": job})
+		httpx.JSON(w, http.StatusAccepted, map[string]any{"eventId": event})
 		return nil
 	}))
 	r.Post("/conversations/{id}/context:compact", h(func(w http.ResponseWriter, r *http.Request) error {

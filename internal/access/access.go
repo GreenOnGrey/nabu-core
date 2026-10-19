@@ -198,18 +198,28 @@ func loadResources(ctx context.Context, q Querier) (*resources, error) {
 	return r, rows.Err()
 }
 
-// Effective computes the access of a user (arch §3.2).
+// Effective computes the access of a user (arch §3.2). uuid.Nil is nobody in
+// particular: the access of «Все пользователи» alone — a group agent without
+// an owner gets it (R12). A blocked user has no access, an administrator
+// included.
 func (s *Service) Effective(ctx context.Context, uid uuid.UUID) (*Access, error) {
 	return effective(ctx, s.Pool, uid)
 }
 
 func effective(ctx context.Context, q Querier, uid uuid.UUID) (*Access, error) {
 	a := &Access{Groups: []GroupRef{}, Models: []ModelGrant{}, Channels: []ChannelGrant{}, CatalogItems: []ItemGrant{}}
-	if err := q.QueryRow(ctx, `SELECT is_admin FROM users WHERE id = $1`, uid).Scan(&a.Admin); err != nil {
-		if postgres.IsNoRows(err) {
+	if uid != uuid.Nil {
+		var blocked bool
+		if err := q.QueryRow(ctx, `SELECT is_admin, status = 'blocked' FROM users WHERE id = $1`, uid).Scan(&a.Admin, &blocked); err != nil {
+			if postgres.IsNoRows(err) {
+				return a, nil
+			}
+			return nil, err
+		}
+		if blocked {
+			a.Admin = false
 			return a, nil
 		}
-		return nil, err
 	}
 	res, err := loadResources(ctx, q)
 	if err != nil {
@@ -385,11 +395,15 @@ func defaultModel(ctx context.Context, q Querier, uid uuid.UUID, a *Access, grou
 }
 
 // ItemGranted reports whether the item is in the access of the user, without
-// computing the rest (the proxy of MCP asks on every call: R10).
+// computing the rest (the proxy of MCP asks on every call: R10). As in
+// Effective, uuid.Nil asks for «Все пользователи» alone and a blocked or
+// unknown user has nothing.
 func (s *Service) ItemGranted(ctx context.Context, uid, item uuid.UUID) bool {
 	var ok bool
-	_ = s.Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM catalog_items c WHERE c.id = $2 AND c.published AND NOT c.in_development AND (
-		(SELECT is_admin FROM users WHERE id = $1) OR EXISTS (
+	_ = s.Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM catalog_items c WHERE c.id = $2 AND c.published AND NOT c.in_development
+		AND ($1 = '00000000-0000-0000-0000-000000000000'::uuid OR EXISTS (SELECT 1 FROM users WHERE id = $1 AND status <> 'blocked'))
+		AND (
+		COALESCE((SELECT is_admin FROM users WHERE id = $1), false) OR EXISTS (
 			SELECT 1 FROM access_grants ag JOIN user_groups g ON g.id = ag.group_id
 			WHERE ag.kind = 'catalog_item' AND ag.item_id = $2
 			  AND (g.builtin = 'all' OR g.id IN (SELECT group_id FROM user_group_members WHERE user_id = $1)))))`, uid, item).Scan(&ok)

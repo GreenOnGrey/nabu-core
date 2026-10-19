@@ -62,7 +62,7 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 			}}
 	}
 	return []mcp.Tool{
-		tool("comm_batch", "Get the batch of this run: the threads to process, how to read each, the note already saved for a thread, the user's topics to choose from and the open commitments with the participants. Call it first.",
+		tool("comm_batch", "Get the batch of this run: the threads to process, how to read each, the note already saved for a thread and the open commitments with the participants. Call it first.",
 			mcp.Schema(map[string]any{}),
 			func(ctx context.Context, g mcp.Grant, b *Batch, ad collect.Adapter, _ json.RawMessage) (string, error) {
 				info := UserInfo{Timezone: "UTC"}
@@ -88,9 +88,8 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 					Today           string           `json:"today"`
 					Timezone        string           `json:"timezone"`
 					Threads         []threadOut      `json:"threads"`
-					Topics          []string         `json:"topics"`
 					OpenCommitments []map[string]any `json:"openCommitments"`
-				}{UserEmail: info.Email, Today: s.clock().In(loc).Format(dateLayout), Timezone: loc.String(), Topics: []string{}, OpenCommitments: []map[string]any{}}
+				}{UserEmail: info.Email, Today: s.clock().In(loc).Format(dateLayout), Timezone: loc.String(), OpenCommitments: []map[string]any{}}
 				people := map[string]bool{}
 				err = s.as(ctx, g.UserID, func(tx pgx.Tx) error {
 					for _, t := range b.Threads {
@@ -135,11 +134,6 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 				if err != nil {
 					return "", &mcp.ToolError{Msg: "the batch could not be read"}
 				}
-				if topics, err := s.Tags(ctx, g.UserID, KindTopic, "", 30); err == nil {
-					for _, t := range topics {
-						out.Topics = append(out.Topics, t.Label)
-					}
-				}
 				if open, err := s.Commitments(ctx, g.UserID, CommitmentFilter{State: Open}, 200); err == nil {
 					for _, c := range open {
 						if c.Person == nil || !people[strings.ToLower(c.Person.Email)] {
@@ -155,8 +149,26 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 				raw, _ := json.Marshal(out)
 				return string(raw), nil
 			}),
+		tool("comm_topic_find", "Find the user's existing topics like the key subjects you named for a thread (FTR.NAB.CMN-0003 R8). "+
+			"For every name it returns the matching topics among ALL the user's topics, the best first, and a suggestion: the topic to use, or null when the name is new.",
+			mcp.Schema(map[string]any{
+				"names": map[string]any{"type": "array", "description": "1 to 5 key subjects of a thread: a project, product, client or matter, two or three words each",
+					"items": map[string]any{"type": "string"}},
+			}, "names"),
+			func(ctx context.Context, g mcp.Grant, _ *Batch, _ collect.Adapter, args json.RawMessage) (string, error) {
+				var in struct{ Names []string }
+				if err := json.Unmarshal(args, &in); err != nil || len(in.Names) == 0 || len(in.Names) > MaxTopics {
+					return "", &mcp.ToolError{Msg: fmt.Sprintf("give from 1 to %d names", MaxTopics)}
+				}
+				found, err := s.FindTopics(ctx, g.UserID, in.Names)
+				if err != nil {
+					return "", &mcp.ToolError{Msg: "the topics could not be read"}
+				}
+				raw, _ := json.Marshal(map[string]any{"results": found})
+				return string(raw), nil
+			}),
 		tool("comm_note_save", "Save the note of a thread of the batch: what was discussed, what was decided, what stays open. Never copy passwords, keys or tokens. "+
-			"Choose topics from the batch's list when one fits; create a new one only when none does; give none when the thread has no project or matter.",
+			"Topics: the names comm_topic_find suggested, or your own name when no existing topic is the same subject; none when the thread has no project or matter.",
 			mcp.Schema(map[string]any{
 				"threadKey": map[string]any{"type": "string"},
 				"dayKey":    map[string]any{"type": "string", "description": "As given in the batch; empty for mail"},

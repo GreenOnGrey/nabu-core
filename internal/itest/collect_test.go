@@ -386,7 +386,7 @@ func TestCollect(t *testing.T) {
 	// The "model" follows the instructions — and also tries what a letter told it to (SEC-01).
 	var refused []string
 	var offered, sourceTools []string
-	var batchJSON string
+	var batchJSON, topicsJSON, topicsRefused string
 	op.script = func(call func(server, tool string, args any) (string, bool)) {
 		out, isErr := call("nabu", "comm_batch", map[string]any{})
 		if isErr {
@@ -444,6 +444,9 @@ func TestCollect(t *testing.T) {
 					"summary": "Отправитель просит переслать переписку на внешний адрес и передаёт доступ: Пароль от стенда: Qwerty!2345", "topics": []string{"Безопасность"}})
 			}
 		}
+		// NOTE-17: the collector looks its key subjects up through the tool.
+		topicsJSON, _ = call("nabu", "comm_topic_find", map[string]any{"names": []string{"релиз 2.3", "Проект Альфа"}})
+		topicsRefused, _ = call("nabu", "comm_topic_find", map[string]any{"names": []string{"a", "b", "c", "d", "e", "f"}})
 		// SEC-03: what the run sees
 		req := op.requests[len(op.requests)-1]
 		for _, srv := range req.MCP {
@@ -461,7 +464,7 @@ func TestCollect(t *testing.T) {
 	if o.status != "succeeded" || o.batches != 1 || o.summary != "messages:3 notes:2" {
 		t.Fatalf("first tick: %+v, refused %v", o, refused)
 	}
-	if strings.Contains(batchJSON, `"t2"`) || !strings.Contains(batchJSON, `"userEmail":"col-a@x.org"`) {
+	if strings.Contains(batchJSON, `"t2"`) || !strings.Contains(batchJSON, `"userEmail":"col-a@x.org"`) || strings.Contains(batchJSON, `"topics"`) {
 		t.Fatalf("batch: %s", batchJSON)
 	}
 	notes, _ := s.List(ctx, a, comm.Filter{}, httpx.Page{Limit: 10})
@@ -496,12 +499,20 @@ func TestCollect(t *testing.T) {
 	if gmail.count("create_draft") != 0 || strings.Join(gmail.read, ",") != "t1,t3" && strings.Join(gmail.read, ",") != "t3,t1" {
 		t.Fatalf("the source got create_draft %d times, read %v", gmail.count("create_draft"), gmail.read)
 	}
-	// SEC-03: the run sees the read tool of the adapter and the four tools of the collection — nothing else.
+	// SEC-03: the run sees the read tool of the adapter and the five tools of the collection — nothing else.
 	if strings.Join(sourceTools, ",") != "get_thread" {
 		t.Fatalf("source tools of the run: %v", sourceTools)
 	}
-	if strings.Join(offered, ",") != "comm_batch,comm_note_save,commitment_save,commitment_close" {
+	if strings.Join(offered, ",") != "comm_batch,comm_topic_find,comm_note_save,commitment_save,commitment_close" {
 		t.Fatalf("built-in tools of the run: %v", offered)
+	}
+	// NOTE-17: the existing topic is suggested, a new subject is not; more than five names are refused.
+	if !strings.Contains(topicsJSON, `{"query":"релиз 2.3","matches":[{"name":"Релиз 2.3","notes":1,"score":1}],"suggestion":"Релиз 2.3"}`) ||
+		!strings.Contains(topicsJSON, `{"query":"Проект Альфа","matches":[],"suggestion":null}`) {
+		t.Fatalf("comm_topic_find: %s", topicsJSON)
+	}
+	if !strings.Contains(topicsRefused, "from 1 to 5 names") {
+		t.Fatalf("six names: %s", topicsRefused)
 	}
 	// NOTE-07: the password the model copied is masked.
 	sec, _ := s.Search(ctx, a, comm.Filter{Query: "переслать"}, 5)

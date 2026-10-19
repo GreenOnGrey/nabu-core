@@ -62,6 +62,32 @@ func (s *Service) delegationHeaders(it *Item, email string) map[string]string {
 	}
 }
 
+// callGranted checks a call against the access of the user of the token or,
+// for a group agent, of its owner as it is now (FTR.NAB.CMN-0007 R10, R12):
+// a group agent whose owner lost the item loses it at once too. A service
+// agent (channel "run") has the items of its configuration, groups aside
+// (R12, RES-14).
+func (s *Service) callGranted(ctx context.Context, uid uuid.UUID, ch string, item uuid.UUID) bool {
+	switch {
+	case uid != uuid.Nil:
+		return s.Access.ItemGranted(ctx, uid, item)
+	case ch == "run":
+		return true
+	}
+	gid, err := uuid.Parse(strings.TrimPrefix(ch, "group:"))
+	if !strings.HasPrefix(ch, "group:") || err != nil {
+		return false
+	}
+	var owner *uuid.UUID
+	if err := s.Pool.QueryRow(ctx, `SELECT owner_id FROM group_agents WHERE id = $1`, gid).Scan(&owner); err != nil {
+		return false
+	}
+	if owner == nil {
+		return s.Access.ItemGranted(ctx, uuid.Nil, item) // «Все пользователи»
+	}
+	return s.Access.ItemGranted(ctx, *owner, item)
+}
+
 func rpcError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -233,7 +259,7 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 	uid, _ := uuid.Parse(c.User)
 	// FTR.NAB.CMN-0007 R10, RES-08: the access is checked on every call, so a
 	// taken access closes the tools of a running turn at once
-	if s.Access != nil && uid != uuid.Nil && !s.Access.ItemGranted(r.Context(), uid, itemID) {
+	if s.Access != nil && !s.callGranted(r.Context(), uid, c.Channel, itemID) {
 		rpcError(w, http.StatusForbidden, "access_denied_item: the item is no longer granted to you")
 		return
 	}
@@ -460,6 +486,9 @@ func (s *Service) CallSource(ctx context.Context, uid, itemID uuid.UUID, tool st
 	if !it.allowed(tool) {
 		// the adapter calls only the tools the administrator allowed (GML-09)
 		return "", fmt.Errorf("the tool %s is not allowed in the item %s", tool, it.Name)
+	}
+	if s.Access != nil && !s.Access.ItemGranted(ctx, uid, itemID) { // FTR.NAB.CMN-0007 RES-09: the collection pauses
+		return "", ErrSourceAccess
 	}
 	headers, perr := s.itemHeaders(ctx, it, uid)
 	if perr != nil {

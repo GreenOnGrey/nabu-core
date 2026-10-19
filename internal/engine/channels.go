@@ -145,15 +145,12 @@ func (d *drafter) event(ctx context.Context, ev agent.Event) {
 // and the skills chosen by the owner; no personal access of members.
 func (e *Engine) groupRequest(ctx context.Context, u *users.User, ga *groups.Agent, conv uuid.UUID, label string) (*built, error) {
 	// FTR.NAB.CMN-0007 R12: a group agent has the access of its owner
-	resolve := func() (agent.ModelSpec, string, error) {
-		return e.Models.ResolvePersonal(ctx, ga.ConnectionID, ga.Model)
-	}
+	// (without an owner — that of «Все пользователи»)
+	owner := uuid.Nil
 	if ga.OwnerID != nil {
-		resolve = func() (agent.ModelSpec, string, error) {
-			return e.Models.ResolveUser(ctx, *ga.OwnerID, ga.ConnectionID, ga.Model)
-		}
+		owner = *ga.OwnerID
 	}
-	model, key, err := resolve()
+	model, key, err := e.Models.ResolveUser(ctx, owner, ga.ConnectionID, ga.Model)
 	if err != nil {
 		return nil, err
 	}
@@ -166,11 +163,7 @@ func (e *Engine) groupRequest(ctx context.Context, u *users.User, ga *groups.Age
 		convStr = conv.String()
 	}
 	var cat *catalog.SessionMCP
-	var owners []uuid.UUID
-	if ga.OwnerID != nil {
-		owners = append(owners, *ga.OwnerID)
-	}
-	if cat, err = e.Catalog.ForGroup(ctx, ga.ID, ga.Skills, convStr, tokenTTL, owners...); err != nil {
+	if cat, err = e.Catalog.ForGroup(ctx, ga.ID, ga.Skills, convStr, tokenTTL, owner); err != nil {
 		return nil, err
 	}
 	builtinTok := e.Signer.Issue(jwt.Claims{Audience: jwt.AudMCP, Subject: "builtin", User: u.ID.String(), Conversation: convStr}, tokenTTL)
@@ -194,12 +187,12 @@ func (e *Engine) groupRequest(ctx context.Context, u *users.User, ga *groups.Age
 		req.Workspace = &agent.Workspace{ID: wsID, URL: e.Cfg.RelayInternalURL + "/internal/v1/workspaces/" + wsID, Token: call,
 			Note: "The working directory is the space of the group in Nabu: files persist between conversations of the group."}
 	}
-	owner := ""
+	ownerEmail := ""
 	if ga.Owner != nil {
-		owner = ga.Owner.Email
+		ownerEmail = ga.Owner.Email
 	}
 	p := Persona{User: u, Agent: users.Agent{Name: ga.Name, Tone: ga.Tone}, Memory: mem, Spaces: e.Space.Enabled, Now: time.Now(), Catalog: titles,
-		Group: &GroupInfo{Title: ga.ChatTitle, Channel: ga.Channel, Owner: owner}}
+		Group: &GroupInfo{Title: ga.ChatTitle, Channel: ga.Channel, Owner: ownerEmail}}
 	req.SystemAppend = p.Instructions()
 	return &built{req: req, persona: p, secrets: secrets, model: model, group: ga}, nil
 }

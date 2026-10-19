@@ -40,9 +40,27 @@ var cache = &skillsCache{descr: map[string]map[string]string{}, merged: map[stri
 // SkillsFor lists the skills of the user's sessions, by name; a name met in
 // two items is taken from the first one by the item's name.
 func (s *Service) SkillsFor(ctx context.Context, uid uuid.UUID) ([]Skill, error) {
+	return s.skillsOf(ctx, uid, true, nil)
+}
+
+// GroupSkills lists the skills of a group agent: those the owner chose, within
+// the owner's access (FTR.NAB.CMN-0007 R12, FTR.NAB.CHAT-0001 R6); uuid.Nil —
+// an agent without an owner.
+func (s *Service) GroupSkills(ctx context.Context, owner uuid.UUID, chosen []string) ([]Skill, error) {
+	want := map[string]bool{}
+	for _, n := range chosen {
+		want[n] = true
+	}
+	return s.skillsOf(ctx, owner, false, want)
+}
+
+// skillsOf lists the skills of the items granted to uid: the connected ones,
+// or all of them with only the names in want.
+func (s *Service) skillsOf(ctx context.Context, uid uuid.UUID, connected bool, want map[string]bool) ([]Skill, error) {
 	rows, err := s.Pool.Query(ctx, `SELECT c.id, COALESCE(NULLIF(c.title,''), c.name), c.skills, c.skills_snapshot
-		FROM catalog_items c JOIN user_connections u ON u.item_id = c.id AND u.user_id = $1
-		WHERE c.type = 'skill' AND c.published AND NOT c.in_development AND c.skills_snapshot IS NOT NULL ORDER BY c.name`, uid)
+		FROM catalog_items c
+		WHERE c.type = 'skill' AND c.published AND NOT c.in_development AND c.skills_snapshot IS NOT NULL
+		  AND (NOT $2 OR EXISTS (SELECT 1 FROM user_connections u WHERE u.item_id = c.id AND u.user_id = $1)) ORDER BY c.name`, uid, connected)
 	if err != nil {
 		return nil, err
 	}
@@ -79,7 +97,7 @@ func (s *Service) SkillsFor(ctx context.Context, uid uuid.UUID) ([]Skill, error)
 		}
 		descr := s.skillDescriptions(ctx, it.snap)
 		for _, n := range it.names {
-			if seen[n] {
+			if seen[n] || (want != nil && !want[n]) {
 				continue
 			}
 			seen[n] = true

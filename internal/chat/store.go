@@ -8,6 +8,7 @@ package chat
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"slices"
 	"time"
 
@@ -359,10 +360,38 @@ type Event struct {
 }
 
 // AddEvent stores an event of a conversation.
-func (s *Store) AddEvent(ctx context.Context, conv uuid.UUID, channel string, ev Event) (*Message, error) {
+func (s *Store) AddEvent(ctx context.Context, conv uuid.UUID, channel string, ev Event, at ...EventAt) (*Message, error) {
 	b, _ := json.Marshal(ev)
-	return scanMsg(s.Pool.QueryRow(ctx, `WITH m AS (INSERT INTO messages (conversation_id, role, text, channel, event)
-		VALUES ($1,'event','',$2,$3) RETURNING *) SELECT `+msgCols+` FROM m`, conv, channel, b))
+	var o EventAt
+	if len(at) > 0 {
+		o = at[0]
+	}
+	m, err := scanMsg(s.Pool.QueryRow(ctx, `WITH m AS (INSERT INTO messages (id, conversation_id, role, text, channel, event, created_at)
+		VALUES (COALESCE($4, gen_random_uuid()), $1, 'event', '', $2, $3,
+			COALESCE((SELECT created_at - interval '1 microsecond' FROM messages WHERE id = $5), now()))
+		ON CONFLICT (id) DO NOTHING RETURNING *) SELECT `+msgCols+` FROM m`, conv, channel, b, o.ID, o.Before))
+	if postgres.IsNoRows(err) {
+		return nil, ErrEventExists
+	}
+	return m, err
+}
+
+// EventAt places an event: ID makes it idempotent (a command delivered twice
+// writes one event); Before puts it right before a message.
+type EventAt struct {
+	ID, Before *uuid.UUID
+}
+
+// ErrEventExists: the event with this id is written already.
+var ErrEventExists = errors.New("the event exists")
+
+// PreviousModel is the model of the last answer of the conversation before
+// the message (R16: a change of the model is shown where it takes effect).
+func (s *Store) PreviousModel(ctx context.Context, conv, msg uuid.UUID) string {
+	var m string
+	_ = s.Pool.QueryRow(ctx, `SELECT model FROM messages WHERE conversation_id = $1 AND role = 'assistant' AND id <> $2 AND model IS NOT NULL
+		ORDER BY created_at DESC LIMIT 1`, conv, msg).Scan(&m)
+	return m
 }
 
 // Busy reports whether an answer is being written in the conversation (R1:
@@ -379,6 +408,8 @@ func (s *Store) Busy(ctx context.Context, conv uuid.UUID, stale time.Duration) b
 type ContextFill struct {
 	Tokens int64 `json:"tokens"`
 	Window int64 `json:"window"`
+	// Empty: nothing was said since the conversation began or was reset.
+	Empty bool `json:"-"`
 }
 
 // Context returns the fill of the open session of a conversation; a
@@ -387,6 +418,9 @@ func (s *Store) Context(ctx context.Context, conv uuid.UUID) ContextFill {
 	var f ContextFill
 	_ = s.Pool.QueryRow(ctx, `SELECT context_tokens, context_window FROM harness_sessions WHERE conversation_id = $1 AND closed_at IS NULL`, conv).
 		Scan(&f.Tokens, &f.Window)
+	_ = s.Pool.QueryRow(ctx, `SELECT NOT EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = $1 AND m.role IN ('user','assistant')
+		AND m.created_at > COALESCE((SELECT max(created_at) FROM messages WHERE conversation_id = $1 AND role = 'event' AND event->>'kind' = 'reset'), '-infinity'))`,
+		conv).Scan(&f.Empty)
 	return f
 }
 

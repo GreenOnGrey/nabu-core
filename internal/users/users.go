@@ -46,7 +46,11 @@ type Identity struct {
 
 // Repo persists users.
 type Repo struct {
-	Pool            *pgxpool.Pool
+	Pool *pgxpool.Pool
+	// RoleChanged runs in the transaction of AdminPatch when the role of
+	// administrator changes (FTR.NAB.CMN-0007 R3, R10): what only «admins»
+	// gave is taken with the role, or the role does not change.
+	RoleChanged     func(ctx context.Context, tx pgx.Tx, actor, uid uuid.UUID, admin bool) error
 	DefaultLanguage string
 	DefaultTimezone string
 	SpaceQuota      int64
@@ -451,21 +455,41 @@ func (r *Repo) AdminPatch(ctx context.Context, actor, id uuid.UUID, isAdmin, blo
 	if isAdmin != nil {
 		admin = *isAdmin
 	}
-	// FTR.NAB.CMN-0007 R3, ADM-03: the group «admins» never empties
-	if u.IsAdmin && (!admin || status == "blocked") {
-		var others int
-		if err := r.Pool.QueryRow(ctx, `SELECT count(*) FROM users WHERE is_admin AND status = 'active' AND id <> $1`, id).Scan(&others); err != nil {
-			return nil, err
+	err = pgx.BeginFunc(ctx, r.Pool, func(tx pgx.Tx) error {
+		// FTR.NAB.CMN-0007 R3, ADM-03: the group «admins» never empties; the
+		// other administrators are locked, so two demotions cannot both pass
+		if u.IsAdmin && (!admin || status == "blocked") {
+			rows, err := tx.Query(ctx, `SELECT id FROM users WHERE is_admin AND status = 'active' AND id <> $1 FOR UPDATE`, id)
+			if err != nil {
+				return err
+			}
+			others := 0
+			for rows.Next() {
+				others++
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				return err
+			}
+			if others == 0 {
+				return apperr.Conflict("last_admin", "the last administrator cannot lose the role")
+			}
 		}
-		if others == 0 {
-			return nil, apperr.Conflict("last_admin", "the last administrator cannot lose the role")
+		if _, err := tx.Exec(ctx, `UPDATE users SET is_admin = $2, status = $3 WHERE id = $1`, id, admin, status); err != nil {
+			return err
 		}
-	}
-	if _, err := r.Pool.Exec(ctx, `UPDATE users SET is_admin = $2, status = $3 WHERE id = $1`, id, admin, status); err != nil {
+		if status == "blocked" {
+			if _, err := tx.Exec(ctx, `DELETE FROM user_sessions WHERE user_id = $1`, id); err != nil {
+				return err
+			}
+		}
+		if r.RoleChanged != nil && admin != u.IsAdmin {
+			return r.RoleChanged(ctx, tx, actor, id, admin)
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, err
-	}
-	if status == "blocked" {
-		_, _ = r.Pool.Exec(ctx, `DELETE FROM user_sessions WHERE user_id = $1`, id)
 	}
 	return r.Get(ctx, id)
 }

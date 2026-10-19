@@ -1374,3 +1374,66 @@ func TestCommAPI(t *testing.T) {
 		t.Fatalf("state after deleting everything: %d %s", code, body)
 	}
 }
+
+// NOTE-17, NOTE-18
+func TestCommTopicFind(t *testing.T) {
+	ctx := context.Background()
+	s := commStore(t)
+	u := newUser(t, "topics@x.org")
+	saveNote(t, s, u, "a", "Стратегия", "s", nil, []string{"ИТ Стратегия"}, comm.Message{ID: "a1"})
+	saveNote(t, s, u, "b", "StarLine", "s", nil, []string{"Миграция StarLine"}, comm.Message{ID: "b1"})
+	// NOTE-17: the key subject is looked for among all topics; the same subject is suggested, a new one is not,
+	// a one-word name inside a longer topic is only shown.
+	found, err := s.FindTopics(ctx, u, []string{"стратегия ИТ 2027", "Проект Альфа", "StarLine"})
+	if err != nil || len(found) != 3 {
+		t.Fatalf("%+v %v", found, err)
+	}
+	if found[0].Suggestion == nil || *found[0].Suggestion != "ИТ Стратегия" {
+		t.Fatalf("strategy: %+v", found[0])
+	}
+	if found[1].Suggestion != nil || len(found[1].Matches) != 0 {
+		t.Fatalf("a new subject matched: %+v", found[1])
+	}
+	if found[2].Suggestion != nil || len(found[2].Matches) != 1 || found[2].Matches[0].Name != "Миграция StarLine" {
+		t.Fatalf("starline: %+v", found[2])
+	}
+	// … among all of them, not only the most used: 600 topics, the one asked for is used once.
+	if _, err := pool.Exec(ctx, `INSERT INTO comm_topics (user_id, name, name_key) SELECT $1, 'Тема '||i, 'тема '||i FROM generate_series(1, 600) i`, u); err != nil {
+		t.Fatal(err)
+	}
+	if found, err := s.FindTopics(ctx, u, []string{"Тема 599"}); err != nil || found[0].Suggestion == nil || *found[0].Suggestion != "Тема 599" {
+		t.Fatalf("a rare topic: %+v %v", found, err)
+	}
+	// NOTE-18: a name that differs only by case, punctuation or ё becomes the existing topic — from the collector …
+	res := saveNote(t, s, u, "c", "Стратегия", "s", nil, []string{"ИТ-стратегия"}, comm.Message{ID: "c1"})
+	if n, _ := s.Get(ctx, u, res.ID); len(n.Topics) != 1 || n.Topics[0].Label != "ИТ Стратегия" {
+		t.Fatalf("topics: %+v", n.Topics)
+	}
+	// … and from the user.
+	other := saveNote(t, s, u, "d", "Другое", "s", nil, nil, comm.Message{ID: "d1"})
+	if n, err := s.Update(ctx, u, other.ID, comm.NotePatch{AddTags: []comm.TagRef{{Kind: comm.KindTopic, Name: "ит стратегия!"}}}); err != nil ||
+		len(n.Topics) != 1 || n.Topics[0].Label != "ИТ Стратегия" {
+		t.Fatalf("a user's tag: %+v %v", n, err)
+	}
+	var starline uuid.UUID
+	if err := pool.QueryRow(ctx, `SELECT id FROM comm_topics WHERE user_id = $1 AND name = 'Миграция StarLine'`, u).Scan(&starline); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RenameTopic(ctx, u, starline, "ИТ-Стратегия"); !isCode(err, "topic_exists") {
+		t.Fatalf("a rename into another topic: %v", err)
+	}
+	var dups int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM comm_topics WHERE user_id = $1 AND name NOT LIKE 'Тема %'`, u).Scan(&dups); err != nil || dups != 2 {
+		t.Fatalf("topics: %d %v", dups, err)
+	}
+	// Topics stored before the rule that share a loose key: the most used one is taken, every time.
+	if _, err := pool.Exec(ctx, `INSERT INTO comm_topics (user_id, name, name_key) VALUES ($1, 'ИТ.Стратегия', 'ит.стратегия')`, u); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 3 {
+		res := saveNote(t, s, u, fmt.Sprintf("e%d", i), "Стратегия", "s", nil, []string{"ИТ_стратегия"}, comm.Message{ID: fmt.Sprintf("e%d", i)})
+		if n, _ := s.Get(ctx, u, res.ID); len(n.Topics) != 1 || n.Topics[0].Label != "ИТ Стратегия" {
+			t.Fatalf("legacy duplicates: %+v", n.Topics)
+		}
+	}
+}

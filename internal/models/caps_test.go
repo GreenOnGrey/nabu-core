@@ -155,7 +155,7 @@ func TestDiscover(t *testing.T) {
 	if Usable(by["embed-x"]) || !Usable(by["plain"]) {
 		t.Fatal("embeddings are not usable by an agent")
 	}
-	// MDL-03: no list — the directory of the type
+	// MDL-03, ZAI-01: no list (404) — the directory of the type
 	z, err := s.discover(ctx, &Connection{ID: uuid.New(), Type: TypeZAI, BaseURL: srv.URL + "/zai"}, "k", nil)
 	if err != nil || z.Listed || len(z.Models) != len(ofType(TypeZAI)) {
 		t.Fatalf("MDL-03: %+v %v", z, err)
@@ -169,3 +169,18 @@ func TestDiscover(t *testing.T) {
 }
 
 func jsonUnmarshal(s string, v any) error { return json.Unmarshal([]byte(s), v) }
+
+// ZAI-02: the endpoint of Z.AI sets the address; another one is refused.
+func TestZAIEndpoint(t *testing.T) {
+	for ep, want := range map[string]string{"": ZAIURL, "general": ZAIURL, "coding": "https://api.z.ai/api/coding/paas/v4"} {
+		in := Input{Type: TypeZAI, APIKey: "zai-key-0001", Options: map[string]string{"endpoint": ep}}
+		if err := in.normalize(); err != nil || in.BaseURL != want {
+			t.Errorf("%q: %s %v", ep, in.BaseURL, err)
+		}
+	}
+	in := Input{Type: TypeZAI, APIKey: "zai-key-0001", Options: map[string]string{"endpoint": "other"}}
+	var ae *apperr.Error
+	if err := in.normalize(); !errors.As(err, &ae) || ae.Code != "invalid_endpoint" {
+		t.Fatalf("other: %v", err)
+	}
+}

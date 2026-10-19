@@ -285,7 +285,8 @@ func (f *fakeTelegram) count(method string) int {
 	return n
 }
 
-// TG-03, TG-08, TG-09, GR-01…GR-04, GR-09, GR-10, GR-11: the Telegram bot and group agents.
+// TG-03, TG-08, TG-09, GR-01…GR-04, GR-09, GR-10, GR-11: the Telegram bot and group agents;
+// FTR.NAB.CHAT-0001 SKL-10.
 func TestTelegramBotAndGroups(t *testing.T) {
 	ctx := context.Background()
 	f := &fakeTelegram{}
@@ -306,6 +307,15 @@ func TestTelegramBotAndGroups(t *testing.T) {
 		return channels.Update{Message: &channels.TGMessage{From: &channels.TGUser{ID: from, First: "Ivan"}, Chat: channels.TGChat{ID: from, Type: "private"}, Text: text}}
 	}
 	owner := newUser(t, "gr-owner@x.org")
+	// FTR.NAB.CHAT-0001 SKL-10: the setup of the bot registers the four commands of the conversation
+	if err := bot.Setup(ctx, "https://api.nabu.x"); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []string{`"command":"new"`, `"command":"compact"`, `"command":"skills"`, `"command":"skill"`} {
+		if !f.said("setMyCommands", c) || !f.said("setMyCommands", `"language_code":"ru"`) {
+			t.Fatalf("SKL-10: %s not registered: %v", c, f.calls)
+		}
+	}
 	// TG-03: the bot asks for the key, then binds
 	wh.Handle(ctx, private(9001, "привет"))
 	if !f.said("sendMessage", "Nabu") || len(in.got) != 0 {
@@ -408,7 +418,7 @@ func TestTelegramBotAndGroups(t *testing.T) {
 	}
 	// GR-07: the session of a group agent gets platform items only
 	cat := &catalog.Service{Pool: pool, Box: r.Box, Signer: jwt.NewSigner("https://nabu-api.x", key), InternalURL: "http://api:8081"}
-	sm, err := cat.ForGroup(ctx, ga.ID, nil, "", time.Hour)
+	sm, err := cat.ForGroup(ctx, ga.ID, nil, "", time.Hour, uuid.Nil)
 	if err != nil {
 		t.Fatal(err)
 	}

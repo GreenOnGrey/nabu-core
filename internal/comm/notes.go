@@ -469,8 +469,14 @@ func (s *Service) SaveNote(ctx context.Context, uid uuid.UUID, in SaveNote) (*Sa
 				return err
 			}
 		}
+		var keys topicKeys
+		if len(topics) > 0 {
+			if keys, err = loadTopicKeys(ctx, tx, uid); err != nil {
+				return err
+			}
+		}
 		for _, name := range topics {
-			id, err := upsertTopic(ctx, tx, uid, name)
+			id, err := upsertTopic(ctx, tx, uid, name, keys)
 			if err != nil {
 				return err
 			}
@@ -513,7 +519,7 @@ func uniqueTopics(in []string) []string {
 	var out []string
 	for _, t := range in {
 		t = clipRunes(strings.Join(strings.Fields(masked(t)), " "), 80)
-		if k := nameKey(t); k != "" && !seen[k] {
+		if k := looseKey(t); k != "" && !seen[k] {
 			seen[k] = true
 			out = append(out, t)
 		}
@@ -529,10 +535,19 @@ func upsertPerson(ctx context.Context, tx pgx.Tx, uid uuid.UUID, email, name str
 	return id, err
 }
 
-func upsertTopic(ctx context.Context, tx pgx.Tx, uid uuid.UUID, name string) (uuid.UUID, error) {
+// upsertTopic finds the topic or creates it. A name that differs from an
+// existing topic only by case, punctuation or ё is that topic
+// (FTR.NAB.CMN-0003 R8): «ИТ-стратегия» is «ИТ Стратегия».
+func upsertTopic(ctx context.Context, tx pgx.Tx, uid uuid.UUID, name string, keys topicKeys) (uuid.UUID, error) {
+	if id, ok := keys[looseKey(name)]; ok {
+		return id, nil
+	}
 	var id uuid.UUID
 	err := tx.QueryRow(ctx, `INSERT INTO comm_topics (user_id, name, name_key) VALUES ($1, $2, $3)
 		ON CONFLICT (user_id, name_key) DO UPDATE SET name_key = EXCLUDED.name_key RETURNING id`, uid, name, nameKey(name)).Scan(&id)
+	if err == nil && keys != nil {
+		keys[looseKey(name)] = id
+	}
 	return id, err
 }
 
@@ -632,7 +647,11 @@ func resolveTag(ctx context.Context, tx pgx.Tx, uid uuid.UUID, r TagRef) (uuid.U
 		if name == "" {
 			return uuid.Nil, apperr.Unprocessable("invalid_tag", "a topic needs id or name")
 		}
-		return upsertTopic(ctx, tx, uid, name)
+		keys, err := loadTopicKeys(ctx, tx, uid)
+		if err != nil {
+			return uuid.Nil, err
+		}
+		return upsertTopic(ctx, tx, uid, name, keys)
 	case KindPerson:
 		if r.ID != nil {
 			var ok bool
@@ -749,6 +768,13 @@ func (s *Service) RenameTopic(ctx context.Context, uid, id uuid.UUID, name strin
 		return apperr.Unprocessable("invalid_topic", "the name is required").With("field", "name")
 	}
 	err := s.as(ctx, uid, func(tx pgx.Tx) error {
+		keys, err := loadTopicKeys(ctx, tx, uid)
+		if err != nil {
+			return err
+		}
+		if other, ok := keys[looseKey(name)]; ok && other != id { // R8: «ИТ-стратегия» next to «ИТ Стратегия» is one topic
+			return apperr.Conflict("topic_exists", "a topic with this name exists: merge the topics instead")
+		}
 		tag, err := tx.Exec(ctx, `UPDATE comm_topics SET name = $3, name_key = $4 WHERE user_id = $1 AND id = $2`, uid, id, name, nameKey(name))
 		if postgres.IsUniqueViolation(err) {
 			return apperr.Conflict("topic_exists", "a topic with this name exists: merge the topics instead")

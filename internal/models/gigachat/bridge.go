@@ -128,7 +128,7 @@ func upstreamError(w http.ResponseWriter, err error) {
 		oaError(w, status, strconv.Itoa(ge.Status)+": "+ge.Message)
 		return
 	}
-	oaError(w, http.StatusBadGateway, "503 service unavailable: "+err.Error())
+	oaError(w, http.StatusServiceUnavailable, "503 service unavailable: "+err.Error())
 }
 
 func (b *Bridge) models(w http.ResponseWriter, r *http.Request) {
@@ -207,18 +207,18 @@ func (b *Bridge) completions(w http.ResponseWriter, r *http.Request) {
 		upstreamError(w, readError(resp))
 		return
 	}
-	metrics.GigaChatBridge.WithLabelValues("200").Inc()
 	if !req.Stream {
 		raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 		if err != nil {
-			oaError(w, http.StatusBadGateway, "503 "+err.Error())
+			oaError(w, http.StatusBadGateway, "502 "+err.Error())
 			return
 		}
 		out, err := translateResponse(raw, in.Model)
 		if err != nil {
-			oaError(w, http.StatusBadGateway, "503 "+err.Error())
+			oaError(w, http.StatusBadGateway, "502 "+err.Error())
 			return
 		}
+		metrics.GigaChatBridge.WithLabelValues("200").Inc()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(out)
 		return
@@ -232,7 +232,11 @@ func (b *Bridge) completions(w http.ResponseWriter, r *http.Request) {
 			fl.Flush()
 		}
 	}
+	// the status is sent before the stream: a stream broken halfway counts as 502
 	if err := translateStream(resp.Body, w, flush, in.Model); err != nil && ctx.Err() == nil {
+		metrics.GigaChatBridge.WithLabelValues("502").Inc()
 		slog.WarnContext(ctx, "gigachat bridge stream", "err", err)
+		return
 	}
+	metrics.GigaChatBridge.WithLabelValues("200").Inc()
 }

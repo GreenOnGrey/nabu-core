@@ -5,6 +5,7 @@ package itest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,12 +14,14 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/GreenOnGrey/nabu-core/internal/access"
 	"github.com/GreenOnGrey/nabu-core/internal/catalog"
 	"github.com/GreenOnGrey/nabu-core/internal/channels"
 	"github.com/GreenOnGrey/nabu-core/internal/models"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/crypto"
+	"github.com/GreenOnGrey/nabu-core/internal/platform/httpx"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/jwt"
 )
 
@@ -30,7 +33,7 @@ func builtinGroup(t *testing.T, kind string) uuid.UUID {
 	return id
 }
 
-// FTR.NAB.CMN-0007: MIG-01, MIG-03, ADM-01…ADM-04, GRP-01…GRP-08, ACC-01…ACC-05, RES-01…RES-12, OLD-01…OLD-03
+// FTR.NAB.CMN-0007: ADM-01…ADM-04, GRP-01…GRP-08, ACC-01…ACC-05, RES-01, RES-03, RES-05, RES-07, RES-10, RES-11, OLD-01…OLD-03
 func TestAccessGroups(t *testing.T) {
 	ctx := context.Background()
 	acc := &access.Service{Pool: pool}
@@ -145,7 +148,7 @@ func TestAccessGroups(t *testing.T) {
 		t.Fatalf("AvailableFor: %+v", avail)
 	}
 
-	// RES-09 (channels): the registry grants by groups
+	// RES-05: the registry grants channels by groups
 	reg := &channels.Registry{Pool: pool, Granted: acc.Channels}
 	if ok, why, _ := reg.Available(ctx, u, "telegram"); !ok || why != channels.ReasonGroup {
 		t.Fatalf("RES-05 telegram: %v %s", ok, why)
@@ -199,8 +202,15 @@ func TestAccessGroups(t *testing.T) {
 	if err := acc.Delete(ctx, actor, b.ID, b.ID.String()); err != nil {
 		t.Fatal(err)
 	}
-	if l, _ := acc.Log(ctx, "group:"+b.ID.String(), 0, 0); len(l) < 3 {
-		t.Fatalf("GRP-08: %d entries", len(l))
+	if l, _ := acc.Log(ctx, "group:"+b.ID.String(), httpx.Page{Limit: 100}); len(l.Items) < 3 {
+		t.Fatalf("GRP-08: %d entries", len(l.Items))
+	}
+	if l, _ := acc.Log(ctx, "group:"+b.ID.String(), httpx.Page{Limit: 2}); len(l.Items) != 2 || l.NextCursor == nil {
+		t.Fatalf("GRP-08 pages: %+v", l)
+	} else if c, err := httpx.ParsePage(httptest.NewRequest("GET", "/?cursor="+*l.NextCursor, nil)); err != nil {
+		t.Fatal(err)
+	} else if next, _ := acc.Log(ctx, "group:"+b.ID.String(), c); len(next.Items) == 0 || next.Items[0].ID >= l.Items[1].ID {
+		t.Fatalf("GRP-08 next page: %+v", next)
 	}
 
 	// ADM-04: built-in groups
@@ -246,10 +256,22 @@ func TestAccessGroups(t *testing.T) {
 		t.Fatalf("ADM-03: %v", err)
 	}
 	_, _ = pool.Exec(ctx, `UPDATE users SET is_admin = true WHERE id = $1`, boss)
-	if _, err := repo().AdminPatch(ctx, boss, u, ptr(false), nil); err != nil {
+	// tech §4: the access goes in the transaction of the role — a failure keeps both
+	failing := repo()
+	failing.RoleChanged = func(context.Context, pgx.Tx, uuid.UUID, uuid.UUID, bool) error { return errors.New("reconcile failed") }
+	if _, err := failing.AdminPatch(ctx, boss, u, ptr(false), nil); err == nil {
+		t.Fatal("ADM-02: the role changed although the access did not")
+	}
+	if ea, _ := acc.Effective(ctx, u); !ea.Admin || !connected(t, u, item.ID) {
+		t.Fatalf("ADM-02: a failed change of the role left %+v", ea)
+	}
+	roles := repo()
+	roles.RoleChanged = func(ctx context.Context, tx pgx.Tx, by, uid uuid.UUID, admin bool) error {
+		return acc.AdminChanged(ctx, tx, access.Actor{ID: by}, uid, admin)
+	}
+	if _, err := roles.AdminPatch(ctx, boss, u, ptr(false), nil); err != nil {
 		t.Fatal(err)
 	}
-	acc.AdminChanged(ctx, actor, u, false)
 	_, _ = pool.Exec(ctx, `UPDATE users SET is_admin = true WHERE id = ANY($1)`, others)
 	_, _ = pool.Exec(ctx, `UPDATE users SET is_admin = false WHERE id = $1`, boss)
 	if connected(t, u, item.ID) {
@@ -284,7 +306,7 @@ func TestAccessGroups(t *testing.T) {
 	resp.Body.Close()
 }
 
-// MIG-01, MIG-03: the migration gives «all» what everybody had (run in a
+// MIG-01…MIG-05: the migration gives «all» what everybody had (run in a
 // transaction that is rolled back).
 func TestAccessMigration(t *testing.T) {
 	ctx := context.Background()
@@ -317,6 +339,7 @@ func TestAccessMigration(t *testing.T) {
 			"available":[{"connectionId":"` + connID.String() + `","model":"deepseek-v4.1-flash"},{"connectionId":"` + connID.String() + `","model":"deepseek-v4-pro"},
 			{"connectionId":"` + uuid.NewString() + `","model":"gone"}]}') ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 		`UPDATE channels SET all_users = (kind IN ('web','telegram'))`,
+		`INSERT INTO channel_user_access (channel, user_id) SELECT 'vkteams', id FROM users LIMIT 1 ON CONFLICT DO NOTHING`,
 	} {
 		if _, err := tx.Exec(ctx, q); err != nil {
 			t.Fatal(err)
@@ -328,8 +351,59 @@ func TestAccessMigration(t *testing.T) {
 	var models, defaults, chans, webs int
 	_ = tx.QueryRow(ctx, `SELECT count(*) FILTER (WHERE kind = 'model'), count(*) FILTER (WHERE is_default), count(*) FILTER (WHERE kind = 'channel'),
 		count(*) FILTER (WHERE channel = 'web') FROM access_grants WHERE group_id = $1`, all).Scan(&models, &defaults, &chans, &webs)
+	// MIG-02: the model of a deleted connection is skipped, the migration passes
 	if models != 2 || defaults != 1 || chans != 1 || webs != 0 {
-		t.Fatalf("MIG-01: models %d defaults %d channels %d web %d", models, defaults, chans, webs)
+		t.Fatalf("MIG-01, MIG-02: models %d defaults %d channels %d web %d", models, defaults, chans, webs)
+	}
+	// MIG-03: the personal grant of VK Teams is not carried over
+	var kinds []string
+	rows, _ := tx.Query(ctx, `SELECT channel FROM access_grants WHERE group_id = $1 AND kind = 'channel'`, all)
+	for rows.Next() {
+		var k string
+		_ = rows.Scan(&k)
+		kinds = append(kinds, k)
+	}
+	rows.Close()
+	if strings.Join(kinds, ",") != "telegram" {
+		t.Fatalf("MIG-03: %v", kinds)
+	}
+	// MIG-04: a user without personal grants has the same access before and after
+	var before, after []string
+	for _, q := range []struct {
+		sql string
+		out *[]string
+	}{
+		{`SELECT a->>'model' FROM settings s, jsonb_array_elements(s.value->'available') a WHERE s.key = 'personal_models'
+			AND EXISTS (SELECT 1 FROM model_connections c WHERE c.id = (a->>'connectionId')::uuid)
+			UNION ALL SELECT 'channel:' || kind FROM channels WHERE all_users AND kind <> 'web' ORDER BY 1`, &before},
+		{`SELECT COALESCE(model, 'channel:' || channel) FROM access_grants WHERE group_id = '` + all.String() + `' AND kind IN ('model','channel') ORDER BY 1`, &after},
+	} {
+		rows, err := tx.Query(ctx, q.sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var v string
+			_ = rows.Scan(&v)
+			*q.out = append(*q.out, v)
+		}
+		rows.Close()
+	}
+	if strings.Join(before, ",") != strings.Join(after, ",") {
+		t.Fatalf("MIG-04: %v → %v", before, after)
+	}
+	// MIG-05: Down, then Up — the schema and the built-in groups are back
+	down := up[to+len("-- +goose Down"):]
+	upAll := up[strings.Index(up, "-- +goose Up")+len("-- +goose Up") : to]
+	if _, err := tx.Exec(ctx, down); err != nil {
+		t.Fatalf("MIG-05 down: %v", err)
+	}
+	if _, err := tx.Exec(ctx, upAll); err != nil {
+		t.Fatalf("MIG-05 up: %v", err)
+	}
+	var builtins int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM user_groups WHERE builtin IN ('all','admins')`).Scan(&builtins); err != nil || builtins != 2 {
+		t.Fatalf("MIG-05: %d %v", builtins, err)
 	}
 }
 

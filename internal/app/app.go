@@ -20,6 +20,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/robfig/cron/v3"
@@ -207,17 +208,12 @@ func newCore(ctx context.Context, cfg *config.Config) (*core, error) {
 	c.vk = channels.NewVKTeams()
 	c.chatAPI = &chat.API{Store: c.chat, Pool: pool, Users: c.users, Models: c.models, Bus: producer, Events: pub, S3: s3, MaxFile: cfg.UploadMaxBytes,
 		// FTR.NAB.CHAT-0001 R20: 5 minutes of opus at up to 192 kbit/s
-		MaxVoice: int64(cfg.TranscribeMaxSeconds) * 24 << 10}
+		MaxVoiceSeconds: cfg.TranscribeMaxSeconds}
 	if cfg.WhisperURL != "" { // the site (api) and the voice messages of messengers (api, worker)
 		c.chatAPI.Whisper = whisper.New(cfg.WhisperURL)
 	}
 	c.chatAPI.Skills = func(ctx context.Context, uid uuid.UUID) ([]chat.Skill, error) {
-		list, err := c.catalog.SkillsFor(ctx, uid)
-		out := make([]chat.Skill, 0, len(list))
-		for _, s := range list {
-			out = append(out, chat.Skill(s))
-		}
-		return out, err
+		return ChatSkills(ctx, c.catalog, c.groups, uid)
 	}
 	c.accounts = &accounts.Service{Pool: pool, S3: s3, Events: pub, Ledger: c.ledger}
 	c.groups = &groups.Service{Pool: pool, Registry: c.registry, Users: c.users, Inbox: c.chatAPI,
@@ -494,8 +490,8 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 	}()
 
 	chatAPI := c.chatAPI
-	allowedModel := func(ctx context.Context, m groups.ModelChoice) bool {
-		avail, err := c.models.AvailableForUsers(ctx)
+	allowedModel := func(ctx context.Context, owner uuid.UUID, m groups.ModelChoice) bool {
+		avail, err := c.models.AvailableFor(ctx, owner)
 		if err != nil {
 			return false
 		}
@@ -534,11 +530,12 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 		return access.Actor{ID: uid, Email: email}
 	}
 	adminUsers := &admin.Users{Repo: c.users,
-		Channels:    func(ctx context.Context, uid uuid.UUID) (any, error) { return c.registry.OfUser(ctx, uid) },
-		GroupAgents: func(ctx context.Context, uid uuid.UUID) (any, error) { return c.groups.List(ctx, "", &uid) },
-		AdminChanged: func(ctx context.Context, actor, uid uuid.UUID, admin bool) {
-			c.access.AdminChanged(ctx, actorOf(ctx, actor), uid, admin)
-		}}
+		Channels:      func(ctx context.Context, uid uuid.UUID) (any, error) { return c.registry.OfUser(ctx, uid) },
+		GroupAgents:   func(ctx context.Context, uid uuid.UUID) (any, error) { return c.groups.List(ctx, "", &uid) },
+		AccessChanged: c.access.Changed}
+	c.users.RoleChanged = func(ctx context.Context, tx pgx.Tx, actor, uid uuid.UUID, admin bool) error {
+		return c.access.AdminChanged(ctx, tx, actorOf(ctx, actor), uid, admin)
+	}
 	builtin := mcp.NewServer(c.signer)
 	confirms := &confirm.Service{Pool: c.pool, Box: c.box, Events: c.events, TTL: cfg.ConfirmationTTL,
 		Execute: func(ctx context.Context, p *confirm.Pending, args json.RawMessage) (string, bool, error) {
@@ -607,21 +604,8 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 			return actorOf(r.Context(), p.UserID)
 		}, c.models.ModelInfo)
 		// FTR.NAB.CHAT-0001 R22: the state of the recognizer of speech
-		r.Get("/voice", httpx.Handler(func(w http.ResponseWriter, r *http.Request) error {
-			out := map[string]any{"configured": cfg.WhisperURL != "", "ok": false}
-			if wc, ok := c.chatAPI.Whisper.(*whisper.Client); ok && wc != nil {
-				out["url"] = cfg.WhisperURL
-				pctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-				defer cancel()
-				if err := wc.Ping(pctx); err != nil {
-					out["error"] = err.Error()
-				} else {
-					out["ok"] = true
-				}
-			}
-			httpx.JSON(w, 200, out)
-			return nil
-		}))
+		wc, _ := c.chatAPI.Whisper.(*whisper.Client)
+		r.Get("/voice", whisper.StatusHandler(cfg.WhisperURL, wc))
 		c.catalog.AdminRoutes(r, cfg.SecretsKey)
 		c.services.AdminRoutes(r)
 		c.clients.AdminRoutes(r)
@@ -1091,4 +1075,26 @@ func (c *core) botAddresses(ctx context.Context) []string {
 		}
 	}
 	return out
+}
+
+// ChatSkills are the skills a user may call (FTR.NAB.CHAT-0001 R4); for the
+// technical user of a group, those of the group agent (R6): the skills its
+// owner chose within the owner's access (FTR.NAB.CMN-0007 R12).
+func ChatSkills(ctx context.Context, cat *catalog.Service, gs *groups.Service, uid uuid.UUID) ([]chat.Skill, error) {
+	var list []catalog.Skill
+	var err error
+	if ga, gerr := gs.ByDataUser(ctx, uid); gerr == nil && ga != nil {
+		owner := uuid.Nil
+		if ga.OwnerID != nil {
+			owner = *ga.OwnerID
+		}
+		list, err = cat.GroupSkills(ctx, owner, ga.Skills)
+	} else {
+		list, err = cat.SkillsFor(ctx, uid)
+	}
+	out := make([]chat.Skill, 0, len(list))
+	for _, s := range list {
+		out = append(out, chat.Skill(s))
+	}
+	return out, err
 }

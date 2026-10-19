@@ -365,8 +365,9 @@ type ModelChoice struct {
 	Model        string    `json:"model"`
 }
 
-// ModelAllowed reports whether the model is allowed for personal agents.
-type ModelAllowed func(ctx context.Context, c ModelChoice) bool
+// ModelAllowed reports whether the model is in the access of the owner of the
+// agent (FTR.NAB.CMN-0007 R12); uuid.Nil — an agent without an owner.
+type ModelAllowed func(ctx context.Context, owner uuid.UUID, c ModelChoice) bool
 
 // ErrForbidden is group_agent_forbidden (tech §1).
 func ErrForbidden() error {
@@ -395,7 +396,14 @@ func (s *Service) Update(ctx context.Context, actor *domain.Principal, id uuid.U
 	var conn *uuid.UUID
 	var model *string
 	if p.Model != nil {
-		if allowed != nil && !allowed(ctx, *p.Model) {
+		owner := uuid.Nil
+		switch {
+		case p.OwnerID != nil && *p.OwnerID != uuid.Nil:
+			owner = *p.OwnerID
+		case a.OwnerID != nil:
+			owner = *a.OwnerID
+		}
+		if allowed != nil && !allowed(ctx, owner, *p.Model) {
 			return nil, apperr.Unprocessable("model_not_available", "the model is not in the list of available models").With("field", "model")
 		}
 		conn, model = &p.Model.ConnectionID, &p.Model.Model

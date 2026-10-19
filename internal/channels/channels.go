@@ -64,8 +64,9 @@ type Attachments interface {
 // of api and worker (arch §2.2).
 const AccessChanged = "access.changed"
 
-// cacheTTL bounds how long a pod trusts its availability cache (CH-04).
-const cacheTTL = 60 * time.Second
+// cacheTTL bounds how long a pod trusts its availability cache (CH-04;
+// FTR.NAB.CMN-0007 ACC-07: a lost reset event costs at most 30 s).
+const cacheTTL = 30 * time.Second
 
 // Channel is a row of the registry as the administration sees it.
 type Channel struct {
@@ -97,11 +98,12 @@ type Registry struct {
 	// R9); with it «all users» and the personal access are not read.
 	Granted func(ctx context.Context, uid uuid.UUID) (map[string]bool, error)
 
-	mu      sync.Mutex
-	loaded  time.Time
-	rows    map[string]row
-	access  map[uuid.UUID]userAccess
-	nowFunc func() time.Time
+	mu     sync.Mutex
+	loaded time.Time
+	rows   map[string]row
+	access map[uuid.UUID]userAccess
+	// Clock is the time of the caches (tests); nil — time.Now.
+	Clock func() time.Time
 }
 
 type row struct {
@@ -116,8 +118,8 @@ type userAccess struct {
 }
 
 func (r *Registry) now() time.Time {
-	if r.nowFunc != nil {
-		return r.nowFunc()
+	if r.Clock != nil {
+		return r.Clock()
 	}
 	return time.Now()
 }

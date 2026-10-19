@@ -18,7 +18,7 @@ import (
 
 // Transcriber turns audio into text. language is the language of the user
 // (en, ru, …): a hint — another language is still detected
-// (FTR.NAB.CHAT-0001 R20).
+// (FTR.NAB.CHAT-0001 R20). The caller bounds the time with ctx.
 type Transcriber interface {
 	Transcribe(ctx context.Context, audio io.Reader, filename, language string) (string, error)
 }
@@ -34,36 +34,20 @@ func New(baseURL string) *Client {
 	return &Client{url: baseURL, http: &http.Client{Timeout: 2 * time.Minute, Transport: otelhttp.NewTransport(http.DefaultTransport)}}
 }
 
-// Transcribe sends the audio and returns the recognized text.
+// Transcribe sends the audio and returns the recognized text. The language
+// of the user is used unless the recognizer is sure the speech is in another
+// one (FTR.NAB.CHAT-0001 R20).
 func (c *Client) Transcribe(ctx context.Context, audio io.Reader, filename, language string) (string, error) {
 	if c.url == "" {
 		return "", fmt.Errorf("whisper: WHISPER_URL is not configured")
 	}
-	var body bytes.Buffer
-	mw := multipart.NewWriter(&body)
-	fw, err := mw.CreateFormFile("audio_file", filename)
+	data, err := io.ReadAll(audio)
 	if err != nil {
 		return "", err
 	}
-	if _, err := io.Copy(fw, audio); err != nil {
-		return "", err
-	}
-	if err := mw.Close(); err != nil {
-		return "", err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url+"/asr?"+query(language), &body)
+	raw, err := c.post(ctx, "/asr?"+query(c.language(ctx, data, filename, language)), data, filename)
 	if err != nil {
 		return "", err
-	}
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("whisper: %w", err)
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode >= 300 {
-		return "", fmt.Errorf("whisper: %s: %s", resp.Status, strings.TrimSpace(string(raw)))
 	}
 	var out struct {
 		Text string `json:"text"`
@@ -73,6 +57,58 @@ func (c *Client) Transcribe(ctx context.Context, audio io.Reader, filename, lang
 		return strings.TrimSpace(string(raw)), nil
 	}
 	return strings.TrimSpace(out.Text), nil
+}
+
+// detectSure is the confidence from which a detected language wins over the
+// language of the user.
+const detectSure = 0.5
+
+// language is the language to recognize in: the detected one when the
+// recognizer is sure, otherwise the hint. A failed detection is not an error.
+func (c *Client) language(ctx context.Context, data []byte, filename, hint string) string {
+	raw, err := c.post(ctx, "/detect-language?encode=true", data, filename)
+	if err != nil {
+		return hint
+	}
+	var d struct {
+		Code       string   `json:"language_code"`
+		Confidence *float64 `json:"confidence"`
+	}
+	if json.Unmarshal(raw, &d) != nil || d.Code == "" || (d.Confidence != nil && *d.Confidence < detectSure) {
+		return hint
+	}
+	return d.Code
+}
+
+// post sends the audio as the form field audio_file.
+func (c *Client) post(ctx context.Context, path string, data []byte, filename string) ([]byte, error) {
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	fw, err := mw.CreateFormFile("audio_file", filename)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := fw.Write(data); err != nil {
+		return nil, err
+	}
+	if err := mw.Close(); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url+path, &body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("whisper: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("whisper: %s: %s", resp.Status, strings.TrimSpace(string(raw)))
+	}
+	return raw, nil
 }
 
 // query is the query of /asr: transcription to JSON with ffmpeg decoding and
@@ -101,4 +137,25 @@ func (c *Client) Ping(ctx context.Context) error {
 		return fmt.Errorf("whisper: %s", resp.Status)
 	}
 	return nil
+}
+
+// StatusHandler serves the state of the recognizer for the settings of the
+// administration (FTR.NAB.CHAT-0001 R22): not configured, available, or not
+// answering with the reason.
+func StatusHandler(url string, c *Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		out := map[string]any{"configured": url != "" && c != nil, "ok": false}
+		if url != "" && c != nil {
+			out["url"] = url
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+			if err := c.Ping(ctx); err != nil {
+				out["error"] = err.Error()
+			} else {
+				out["ok"] = true
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
+	}
 }

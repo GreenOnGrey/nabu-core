@@ -306,14 +306,21 @@ func (s *Service) Order(ctx context.Context, actor Actor, ids []uuid.UUID) error
 	return err
 }
 
-// Members lists the members of a group; q searches the name and the email.
-func (s *Service) Members(ctx context.Context, id uuid.UUID, q string, limit int) ([]UserRef, error) {
+// Members lists a page of the members of a group by name; q searches the
+// name and the email (tech §2).
+func (s *Service) Members(ctx context.Context, id uuid.UUID, q string, page httpx.Page) (httpx.List[UserRef], error) {
+	var out httpx.List[UserRef]
 	g, err := s.Group(ctx, id)
 	if err != nil {
-		return nil, err
+		return out, err
 	}
-	if limit <= 0 || limit > 500 {
-		limit = 200
+	var after *uuid.UUID
+	if page.Cursor != nil {
+		c, err := uuid.Parse(page.Cursor.ID)
+		if err != nil {
+			return out, apperr.BadRequest("invalid_cursor", "invalid cursor")
+		}
+		after = &c
 	}
 	cond := `u.id IN (SELECT user_id FROM user_group_members WHERE group_id = $1)`
 	switch {
@@ -322,22 +329,24 @@ func (s *Service) Members(ctx context.Context, id uuid.UUID, q string, limit int
 	case g.Builtin != nil && *g.Builtin == BuiltinAdmins:
 		cond = `u.is_admin AND $1::uuid IS NOT NULL`
 	}
+	const sortKey = `lower(COALESCE(NULLIF(u.name,''), u.email))`
 	rows, err := s.Pool.Query(ctx, `SELECT u.id, u.email, COALESCE(u.name,'') FROM users u WHERE `+cond+`
 		AND u.created_via <> 'group' AND u.status <> 'archived' AND ($2 = '' OR u.email ILIKE '%' || $2 || '%' OR u.name ILIKE '%' || $2 || '%')
-		ORDER BY lower(COALESCE(NULLIF(u.name,''), u.email)) LIMIT $3`, id, strings.TrimSpace(q), limit)
+		AND ($4::uuid IS NULL OR (`+sortKey+`, u.id) > (SELECT `+sortKey+`, u.id FROM users u WHERE u.id = $4))
+		ORDER BY `+sortKey+`, u.id LIMIT $3`, id, strings.TrimSpace(q), page.Limit+1, after)
 	if err != nil {
-		return nil, err
+		return out, err
 	}
 	defer rows.Close()
-	out := []UserRef{}
+	var items []UserRef
 	for rows.Next() {
 		var u UserRef
 		if err := rows.Scan(&u.ID, &u.Email, &u.Name); err != nil {
-			return nil, err
+			return out, err
 		}
-		out = append(out, u)
+		items = append(items, u)
 	}
-	return out, rows.Err()
+	return httpx.NewList(items, page.Limit, func(u UserRef) (time.Time, string) { return time.Time{}, u.ID.String() }), rows.Err()
 }
 
 func (s *Service) memberIDs(ctx context.Context, q Querier, id uuid.UUID) ([]uuid.UUID, error) {
@@ -383,7 +392,7 @@ func (s *Service) AddMembers(ctx context.Context, actor Actor, id uuid.UUID, use
 		for _, u := range users {
 			if _, err := tx.Exec(ctx, `INSERT INTO user_group_members (group_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, id, u); err != nil {
 				if postgres.IsForeignKeyViolation(err) {
-					return apperr.Unprocessable("not_found", "unknown user").With("userId", u)
+					return apperr.NotFound("not_found", "unknown user").With("userId", u)
 				}
 				return err
 			}
@@ -671,22 +680,25 @@ type LogEntry struct {
 }
 
 // Log lists the journal, newest first; target filters by group:<id> or user:<id>.
-func (s *Service) Log(ctx context.Context, target string, before int64, limit int) ([]LogEntry, error) {
-	if limit <= 0 || limit > 200 {
-		limit = 100
+func (s *Service) Log(ctx context.Context, target string, page httpx.Page) (httpx.List[LogEntry], error) {
+	var before int64
+	if page.Cursor != nil {
+		if _, err := fmt.Sscan(page.Cursor.ID, &before); err != nil {
+			return httpx.List[LogEntry]{}, apperr.BadRequest("invalid_cursor", "invalid cursor")
+		}
 	}
 	rows, err := s.Pool.Query(ctx, `SELECT id, at, actor_email, action, target, before, after FROM admin_log
-		WHERE ($1 = '' OR target = $1) AND ($2 = 0 OR id < $2) ORDER BY id DESC LIMIT $3`, target, before, limit)
+		WHERE ($1 = '' OR target = $1) AND ($2 = 0 OR id < $2) ORDER BY id DESC LIMIT $3`, target, before, page.Limit+1)
 	if err != nil {
-		return nil, err
+		return httpx.List[LogEntry]{}, err
 	}
 	defer rows.Close()
-	out := []LogEntry{}
+	var out []LogEntry
 	for rows.Next() {
 		var e LogEntry
 		var b, a []byte
 		if err := rows.Scan(&e.ID, &e.At, &e.ActorEmail, &e.Action, &e.Target, &b, &a); err != nil {
-			return nil, err
+			return httpx.List[LogEntry]{}, err
 		}
 		if len(b) > 0 {
 			e.Before = b
@@ -696,19 +708,29 @@ func (s *Service) Log(ctx context.Context, target string, before int64, limit in
 		}
 		out = append(out, e)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return httpx.List[LogEntry]{}, err
+	}
+	return httpx.NewList(out, page.Limit, func(e LogEntry) (time.Time, string) { return e.At, fmt.Sprint(e.ID) }), nil
 }
 
-// AdminChanged is called after a change of the role of administrator
-// (ADM-02): what only «admins» gave is taken.
-func (s *Service) AdminChanged(ctx context.Context, actor Actor, uid uuid.UUID, admin bool) {
+// AdminChanged runs in the transaction that changes the role of
+// administrator (ADM-02, users.Repo.RoleChanged): what only «admins» gave is
+// taken in it, so a failure keeps the role. Publish Changed after the commit.
+func (s *Service) AdminChanged(ctx context.Context, q Querier, actor Actor, uid uuid.UUID, admin bool) error {
 	n := 0
 	if !admin {
-		n, _ = reconcile(ctx, s.Pool, []uuid.UUID{uid})
+		var err error
+		if n, err = reconcile(ctx, q, []uuid.UUID{uid}); err != nil {
+			return err
+		}
 	}
-	s.log(ctx, s.Pool, actor, "user.admin", "user:"+uid.String(), nil, map[string]any{"admin": admin, "revokedConnections": n})
-	s.changed(ctx)
+	s.log(ctx, q, actor, "user.admin", "user:"+uid.String(), nil, map[string]any{"admin": admin, "revokedConnections": n})
+	return nil
 }
+
+// Changed tells the caches that access changed.
+func (s *Service) Changed(ctx context.Context) { s.changed(ctx) }
 
 // ─── HTTP ───────────────────────────────────────────────────────────
 
@@ -799,11 +821,15 @@ func (s *Service) Routes(r chi.Router, actor func(r *http.Request) Actor, info M
 		if err != nil {
 			return err
 		}
-		l, err := s.Members(r.Context(), id, r.URL.Query().Get("q"), 0)
+		page, err := httpx.ParsePage(r)
 		if err != nil {
 			return err
 		}
-		httpx.JSON(w, 200, map[string]any{"items": l})
+		l, err := s.Members(r.Context(), id, r.URL.Query().Get("q"), page)
+		if err != nil {
+			return err
+		}
+		httpx.JSON(w, 200, l)
 		return nil
 	}))
 	r.Post("/groups/{id}/members", h(func(w http.ResponseWriter, r *http.Request) error {
@@ -901,13 +927,15 @@ func (s *Service) Routes(r chi.Router, actor func(r *http.Request) Actor, info M
 		return nil
 	}))
 	r.Get("/admin-log", h(func(w http.ResponseWriter, r *http.Request) error {
-		var before int64
-		_, _ = fmt.Sscan(r.URL.Query().Get("before"), &before)
-		l, err := s.Log(r.Context(), r.URL.Query().Get("target"), before, 0)
+		page, err := httpx.ParsePage(r)
 		if err != nil {
 			return err
 		}
-		httpx.JSON(w, 200, map[string]any{"items": l})
+		l, err := s.Log(r.Context(), r.URL.Query().Get("target"), page)
+		if err != nil {
+			return err
+		}
+		httpx.JSON(w, 200, l)
 		return nil
 	}))
 }

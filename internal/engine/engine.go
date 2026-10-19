@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/GreenOnGrey/nabu-core/internal/agentpods"
+	"github.com/GreenOnGrey/nabu-core/internal/apperr"
 	"github.com/GreenOnGrey/nabu-core/internal/catalog"
 	"github.com/GreenOnGrey/nabu-core/internal/channels"
 	"github.com/GreenOnGrey/nabu-core/internal/chat"
@@ -253,9 +254,9 @@ func (e *Engine) ensureSession(ctx context.Context, lease *agentpods.Lease, conv
 		}
 		_, _ = e.Pool.Exec(ctx, `UPDATE harness_sessions SET closed_at = now() WHERE id = $1`, cur.ID)
 	}
-	var carried ContextCarry
+	var carried contextCarry
 	if cur != nil {
-		carried = ContextCarry{cur.ContextTokens, cur.ContextWindow}
+		carried = contextCarry{cur.ContextTokens, cur.ContextWindow}
 	}
 	req := b.req
 	if snap, err := storage.ReadAll(ctx, e.S3, snapshotKey(conv)); err == nil && len(snap) > 0 {
@@ -310,9 +311,9 @@ func (e *Engine) saveSnapshot(ctx context.Context, op Operator, conv uuid.UUID, 
 	_, _ = e.Pool.Exec(ctx, `UPDATE harness_sessions SET last_active_at = now() WHERE conversation_id = $1 AND closed_at IS NULL`, conv)
 }
 
-// ContextCarry is the fill of a closed session carried to the session
+// contextCarry is the fill of a closed session carried to the session
 // restored from its snapshot.
-type ContextCarry struct{ Tokens, Window int64 }
+type contextCarry struct{ Tokens, Window int64 }
 
 // ─── the stream of a turn ───────────────────────────────────────────
 
@@ -675,6 +676,9 @@ func (e *Engine) promptOf(ctx context.Context, u *users.User, m *chat.Message, i
 		}
 		fmt.Fprintf(&b, "[The user attached %s (%s, %d bytes).]\n", a.FileName, a.MimeType, a.Size)
 	}
+	if m.Voice { // FTR.NAB.CHAT-0001 R21
+		b.WriteString("[Voice message: the text below was recognized from speech and may contain recognition errors.]\n")
+	}
 	switch {
 	case mc.Email != nil:
 		b.WriteString(emailPrompt(mc, m.Text))
@@ -708,19 +712,48 @@ func (e *Engine) podLost(lease *agentpods.Lease, err error) bool {
 	return true
 }
 
+// modelChanged writes the divider «Модель: …» right before the first answer
+// of another model in the conversation (FTR.NAB.CHAT-0001 R16, SEL-03): the
+// answer that was being written when the user chose finishes on the old one.
+func (e *Engine) modelChanged(ctx context.Context, uid, conv, msgID uuid.UUID, ch string, m agent.ModelSpec, name string) {
+	prev := e.Chat.PreviousModel(ctx, conv, msgID)
+	if prev == "" || prev == name {
+		return
+	}
+	var cid *uuid.UUID
+	if id, err := uuid.Parse(m.ConnectionID); err == nil {
+		cid = &id
+	}
+	ev, err := e.Chat.AddEvent(ctx, conv, eventChannel(ch), chat.Event{Kind: chat.EventModel, ConnectionID: cid, Model: m.ModelID, Name: name},
+		chat.EventAt{Before: &msgID})
+	if err != nil {
+		slog.WarnContext(ctx, "model event", "conversation", conv, "err", err)
+		return
+	}
+	e.publish(ctx, events.MessageCreated, uid, ev)
+}
+
+// requestClass is the class of a failure to build the session of a turn or a
+// command.
+func requestClass(ctx context.Context, err error) string {
+	if e, ok := apperr.As(err); ok && e.Code == "no_models_granted" { // FTR.NAB.CMN-0007 RES-03
+		return e.Code
+	}
+	if strings.Contains(err.Error(), "agent_not_configured") {
+		return "agent_not_configured"
+	}
+	slog.ErrorContext(ctx, "build session", "err", err)
+	return string(agent.ErrAgentCrashed)
+}
+
 func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked time.Time, u *users.User, conv, msgID uuid.UUID, ch string, clientID *uuid.UUID, text string, images []agent.Image,
 	author *uuid.UUID, draft *drafter, skill string) turnResult {
 	b, err := e.personalRequest(ctx, u, conv, nil, "conv "+conv.String()[:8])
 	if err != nil {
-		var class = "agent_not_configured"
-		if strings.Contains(err.Error(), "no_models_granted") { // FTR.NAB.CMN-0007 RES-03
-			return turnResult{errClass: "no_models_granted", errText: err.Error()}
-		}
-		if !strings.Contains(err.Error(), "agent_not_configured") {
-			class = string(agent.ErrAgentCrashed)
-			slog.ErrorContext(ctx, "build session", "err", err)
-		}
-		return turnResult{errClass: class, errText: err.Error()}
+		return turnResult{errClass: requestClass(ctx, err), errText: err.Error()}
+	}
+	if skill != "" && !hasSkill(b.req.Skills, skill) { // FTR.NAB.CHAT-0001 tech §4: the skill set of the session
+		return turnResult{errClass: "skill_unavailable", errText: "the skill " + skill + " is not available in this session"}
 	}
 	if e.Sandboxes != nil && e.Space.Enabled {
 		go func() {
@@ -743,11 +776,12 @@ func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked
 	}
 	op := lease.Operator()
 	images, text = imagesFor(b.model, images, text, e.Space.Enabled)
-	if d := modelDef(b.model); d != nil && d.Name != "" { // R18: the answer names its model
-		e.Chat.SetModel(ctx, msgID, d.Name)
-	} else {
-		e.Chat.SetModel(ctx, msgID, b.model.ModelID)
+	name := b.model.ModelID
+	if d := modelDef(b.model); d != nil && d.Name != "" {
+		name = d.Name
 	}
+	e.modelChanged(ctx, u.ID, conv, msgID, ch, b.model, name)
+	e.Chat.SetModel(ctx, msgID, name) // R18: the answer names its model
 	var sess *convSession
 	for attempt := 0; attempt < 2; attempt++ {
 		sess, err = e.ensureSession(ctx, lease, conv, b, attempt > 0)
@@ -784,7 +818,7 @@ func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked
 			}
 		}
 		if skill != "" { // R5: the skill's instructions come into the context with the request
-			prompt = skillPrompt(b.req.Skills, skill, prompt)
+			prompt = skillPrompt(skill, prompt)
 		}
 		err = op.Prompt(ctx, sess.OpSession, agent.PromptRequest{Text: prompt, Images: images}, col.handle)
 		if errors.Is(err, agent.ErrSessionGone) || errors.Is(err, agent.ErrStreamBroken) {
@@ -799,7 +833,7 @@ func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked
 	if sess != nil {
 		for _, c := range col.compactions { // R2: compactions the harness made itself
 			c.Auto = true
-			if _, cerr := e.compactionEvent(ctx, u, conv, ch, c, modelWindow(b.model)); cerr != nil {
+			if _, cerr := e.compactionEvent(ctx, u, conv, ch, c); cerr != nil {
 				slog.WarnContext(ctx, "compaction event", "err", cerr)
 			}
 		}
@@ -913,6 +947,7 @@ var errorTexts = map[string]map[string]string{
 		"agent_not_configured": "The agent is not configured yet: an administrator has to add a model connection.",
 		"user_blocked":         "Access to the agent is closed for your account.",
 		"no_models_granted":    "No model is available to you — ask an administrator.",
+		"skill_unavailable":    "The skill is not available in this conversation — pick it again from the list.",
 	},
 	"ru": {
 		"insufficient_balance": "У провайдера моделей закончился баланс. Его должен пополнить администратор.",
@@ -927,6 +962,7 @@ var errorTexts = map[string]map[string]string{
 		"agent_not_configured": "Агент ещё не настроен: администратор должен добавить подключение к моделям.",
 		"user_blocked":         "Доступ к агенту для вашей учётной записи закрыт.",
 		"no_models_granted":    "Вам не доступна ни одна модель — обратитесь к администратору.",
+		"skill_unavailable":    "Скилл недоступен в этом разговоре — выберите его заново из списка.",
 	},
 }
 

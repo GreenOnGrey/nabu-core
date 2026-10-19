@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
@@ -13,18 +14,21 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/google/uuid"
 
+	"github.com/GreenOnGrey/nabu-core/internal/app"
 	"github.com/GreenOnGrey/nabu-core/internal/apperr"
 	"github.com/GreenOnGrey/nabu-core/internal/catalog"
 	"github.com/GreenOnGrey/nabu-core/internal/channels"
 	"github.com/GreenOnGrey/nabu-core/internal/chat"
 	"github.com/GreenOnGrey/nabu-core/internal/domain"
 	"github.com/GreenOnGrey/nabu-core/internal/engine"
+	"github.com/GreenOnGrey/nabu-core/internal/groups"
 	"github.com/GreenOnGrey/nabu-core/internal/ledger"
 	"github.com/GreenOnGrey/nabu-core/internal/memory"
 	"github.com/GreenOnGrey/nabu-core/internal/models"
@@ -154,7 +158,7 @@ func newChatRig(t *testing.T) *chatRig {
 	}
 	r.cat = &catalog.Service{Pool: pool, Box: box, S3: r.s3, Signer: signer, InternalURL: "http://api.test"}
 	r.api = &chat.API{Store: &chat.Store{Pool: pool}, Pool: pool, Users: repo(), Models: r.ms, Bus: r.bus, Events: r.ev, S3: r.s3, MaxFile: 1 << 20,
-		MaxVoice: 64 << 10}
+		MaxVoiceSeconds: 2}
 	r.api.Skills = func(ctx context.Context, uid uuid.UUID) ([]chat.Skill, error) {
 		list, err := r.cat.SkillsFor(ctx, uid)
 		out := []chat.Skill{}
@@ -234,7 +238,7 @@ func isCodeErr(err error, code string) bool {
 	return ok && e.Code == code
 }
 
-// CTX-01, CTX-02, CTX-05…CTX-09, CTX-11, SEL-01…SEL-03, MDL-06, MDL-11, MDL-12
+// CTX-01…CTX-03, CTX-05…CTX-09, CTX-11, SEL-01…SEL-03, MDL-06, MDL-11, MDL-12
 func TestChatContext(t *testing.T) {
 	ctx := context.Background()
 	r := newChatRig(t)
@@ -316,18 +320,40 @@ func TestChatContext(t *testing.T) {
 	if _, ok := r.s3.m["sessions/"+main.ID.String()+".jsonl"]; !ok {
 		t.Fatal("a snapshot is expected before the reset")
 	}
-	if _, err := r.api.Reset(ctx, uid, nil, domain.ChannelWeb); err != nil {
+	resetID, err := r.api.Reset(ctx, uid, nil, domain.ChannelWeb)
+	if err != nil {
 		t.Fatal(err)
 	}
 	r.drain()
+	// tech §2.1: 202 {eventId} is the id of the divider; a job delivered twice writes one
+	var dividers int
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM messages WHERE conversation_id = $1 AND event->>'kind' = 'reset'`, main.ID).Scan(&dividers)
+	again, _ := json.Marshal(chat.Inbound{UserID: uid, ConversationID: main.ID, MessageID: resetID, Channel: domain.ChannelWeb, Command: chat.CommandReset})
+	if err := r.eng.HandleInbound(ctx, nil, again); err != nil {
+		t.Fatal(err)
+	}
+	var same, after int
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM messages WHERE id = $1 AND event->>'kind' = 'reset'`, resetID).Scan(&same)
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM messages WHERE conversation_id = $1 AND event->>'kind' = 'reset'`, main.ID).Scan(&after)
+	if same != 1 || after != dividers {
+		t.Fatalf("eventId: %d with the id, %d → %d dividers", same, dividers, after)
+	}
+	// CTX-06: nothing said since the reset — compaction is refused, the operator is not called
+	compacts := len(r.op.compacts)
+	if _, err := r.api.Compact(ctx, uid, nil, domain.ChannelWeb, ""); !isCodeErr(err, "context_too_short") || len(r.op.compacts) != compacts {
+		t.Fatalf("CTX-06 after a reset: %v", err)
+	}
 	if _, ok := r.s3.m["sessions/"+main.ID.String()+".jsonl"]; ok {
 		t.Fatal("CTX-01: the snapshot outlived the reset")
 	}
 	if f := r.api.Store.Context(ctx, main.ID); f.Tokens != 0 {
 		t.Fatalf("CTX-01: fill after reset %+v", f)
 	}
+	// CTX-03: reset on the site, the next message from Telegram — a new session without the past
 	opened := len(r.op.opened)
-	r.api.Post(ctx, uid, nil, "о чём мы говорили?", domain.ChannelWeb, nil, nil, nil) //nolint:errcheck
+	if err := r.api.Receive(ctx, channels.Inbound{UserID: uid, Channel: domain.ChannelTelegram, Text: "о чём мы говорили?"}); err != nil {
+		t.Fatal(err)
+	}
 	r.drain()
 	if len(r.op.opened) != opened+1 {
 		t.Fatal("CTX-01: a new session is expected")
@@ -367,14 +393,32 @@ func TestChatContext(t *testing.T) {
 	if v, err = r.api.PatchAgent(ctx, uid, nil, nil, &models.Choice{ConnectionID: r.text.ID, Model: "vision-1"}); err != nil || !v.Chosen {
 		t.Fatalf("choose: %+v %v", v, err)
 	}
-	if evs := r.events(main.ID); evs[len(evs)-1].Kind != chat.EventModel || evs[len(evs)-1].Model != "vision-1" {
-		t.Fatalf("SEL-03: %+v", evs)
+	// SEL-03: the divider comes with the first answer of the new model, right before it
+	if evs := r.events(main.ID); slices.ContainsFunc(evs, func(e chat.Event) bool { return e.Kind == chat.EventModel }) {
+		t.Fatalf("SEL-03: a divider before any answer of the model: %+v", evs)
 	}
 	att2, _ := r.api.Attachments().Store(ctx, uid, "shot2.png", "image/png", strings.NewReader("png-bytes"), 9)
 	r.api.Post(ctx, uid, nil, "а теперь?", domain.ChannelWeb, nil, []uuid.UUID{att2}, nil) //nolint:errcheck
 	r.drain()
 	if p := r.op.last(); len(p.Images) != 1 {
 		t.Fatalf("MDL-11: %d images", len(p.Images))
+	}
+	var order []string // the fake harness also compacts after every answer
+	rows, _ := pool.Query(ctx, `SELECT role, COALESCE(event->>'kind','') FROM messages WHERE conversation_id = $1 AND (role <> 'event' OR event->>'kind' <> 'compact')
+		ORDER BY created_at DESC LIMIT 3`, main.ID)
+	for rows.Next() {
+		var role, kind string
+		_ = rows.Scan(&role, &kind)
+		order = append(order, role+":"+kind)
+	}
+	rows.Close()
+	if strings.Join(order, ",") != "assistant:,event:model,user:" {
+		t.Fatalf("SEL-03: %v", order)
+	}
+	if evs := r.events(main.ID); !slices.ContainsFunc(evs, func(e chat.Event) bool {
+		return e.Kind == chat.EventModel && e.Model == "vision-1" && e.Name == "vision-1"
+	}) {
+		t.Fatalf("SEL-03: %+v", evs)
 	}
 	if v, err = r.api.PatchAgent(ctx, uid, nil, nil, nil, true); err != nil || v.Chosen || v.Model.Model != "text-1" {
 		t.Fatalf("R16: back to the default %+v %v", v, err)
@@ -402,7 +446,7 @@ func packSkills(t *testing.T, skills map[string]string) []byte {
 	return b
 }
 
-// SKL-03, SKL-04, SKL-06, SKL-07, SKL-08, VOC-04, VOC-08, VOC-09
+// SKL-03, SKL-04, SKL-06…SKL-09, VOC-04, VOC-05, VOC-08, VOC-09
 func TestChatSkillsAndVoice(t *testing.T) {
 	ctx := context.Background()
 	r := newChatRig(t)
@@ -427,7 +471,7 @@ func TestChatSkillsAndVoice(t *testing.T) {
 		return it.ID
 	}
 	mk("Юристы", nil, map[string]string{"contract-review": "Проверка договора", "nda-check": "Проверка NDA"})
-	mk("Отчёты", nil, map[string]string{"weekly-report": "Еженедельный отчёт", "contract-review": "Другая версия"})
+	reports := mk("Отчёты", nil, map[string]string{"weekly-report": "Еженедельный отчёт", "contract-review": "Другая версия"})
 	mk("Черновики", &no, map[string]string{"draft-skill": "Не опубликован"})
 
 	// SKL-06, SKL-07: skills of the published items, a name once
@@ -516,6 +560,10 @@ func TestChatSkillsAndVoice(t *testing.T) {
 	if !isVoice || !strings.Contains(text, "позвонить Ивану") || w.lang != "ru" {
 		t.Fatalf("VOC-08: %q %v %q", text, isVoice, w.lang)
 	}
+	r.drain()
+	if p := r.op.last(); !strings.Contains(p.Text, "[Voice message") || !strings.Contains(p.Text, "позвонить Ивану") {
+		t.Fatalf("R21: the agent gets the mark of a voice message: %q", p.Text)
+	}
 	// VOC-09: the recognizer is down — the file goes to the agent and the bot says so
 	w.fail = true
 	r.outbound()
@@ -527,6 +575,78 @@ func TestChatSkillsAndVoice(t *testing.T) {
 		ORDER BY m.created_at DESC LIMIT 1`, uid).Scan(&text, &isVoice)
 	if out := r.outbound(); isVoice || text != "" || len(out) != 1 || !strings.Contains(out[0], "распознать") {
 		t.Fatalf("VOC-09: %q %v %v", text, isVoice, out)
+	}
+	r.drain()
+	r.outbound()
+	// VOC-05: longer than the limit (2 s in the rig) by the header of a WAV — not recognized, the user is told
+	w.fail = false
+	long := wavOf(3)
+	longVoice, _ := r.api.Attachments().Store(ctx, uid, "voice.wav", "audio/wav", bytes.NewReader(long), int64(len(long)))
+	w.lang = ""
+	if err := tg("", longVoice); err != nil {
+		t.Fatal(err)
+	}
+	if out := r.outbound(); w.lang != "" || len(out) != 1 || !strings.Contains(out[0], "распознать") {
+		t.Fatalf("VOC-05: recognized %q, said %v", w.lang, out)
+	}
+	r.drain()
+	r.outbound()
+
+	// tech §4: a skill that left the session between the message and the turn fails the turn, not silently
+	if _, err := r.api.PostMessage(ctx, uid, nil, chat.PostInput{Text: "отчёт", Channel: domain.ChannelWeb, Skill: "weekly-report"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.cat.Save(ctx, &reports, catalog.Input{Published: &no}); err != nil {
+		t.Fatal(err)
+	}
+	prompts := len(r.op.prompts)
+	r.drain()
+	var status, class string
+	_ = pool.QueryRow(ctx, `SELECT m.status, COALESCE(m.error_class,'') FROM messages m JOIN conversations c ON c.id = m.conversation_id
+		WHERE c.user_id = $1 AND m.role = 'assistant' ORDER BY m.created_at DESC LIMIT 1`, uid).Scan(&status, &class)
+	if status != "failed" || class != "skill_unavailable" || len(r.op.prompts) != prompts {
+		t.Fatalf("a skill out of the session: %s %s, prompts %d → %d", status, class, prompts, len(r.op.prompts))
+	}
+
+	// SKL-09: in a group the commands act on the conversation of the group and list the skills of the group agent
+	gs := &groups.Service{Pool: pool, Users: repo()}
+	r.api.Skills = func(ctx context.Context, u uuid.UUID) ([]chat.Skill, error) { return app.ChatSkills(ctx, r.cat, gs, u) }
+	var data uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO users (email, created_via) VALUES ($1, 'group') RETURNING id`, "grp-"+uuid.NewString()[:6]+"@groups.nabu").Scan(&data); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO group_agents (channel, external_chat_id, owner_id, data_user_id, skills) VALUES ('telegram', $1, $2, $3, '{nda-check}')`,
+		"-100"+uuid.NewString()[:8], uid, data); err != nil {
+		t.Fatal(err)
+	}
+	group := func(text string) {
+		if err := r.api.Receive(ctx, channels.Inbound{UserID: data, Channel: domain.ChannelTelegram, Text: text}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	group("/skills@nabu_bot")
+	if out := r.outbound(); len(out) != 1 || !strings.Contains(out[0], "nda-check") || strings.Contains(out[0], "weekly-report") || strings.Contains(out[0], "contract-review") {
+		t.Fatalf("SKL-09 /skills: %v", out)
+	}
+	umain, _ := r.api.Store.Main(ctx, uid)
+	resets := func(conv uuid.UUID) int {
+		n := 0
+		for _, e := range r.events(conv) {
+			if e.Kind == chat.EventReset {
+				n++
+			}
+		}
+		return n
+	}
+	ownerResets := resets(umain.ID)
+	group("/new@nabu_bot")
+	r.drain()
+	gmain, _ := r.api.Store.Main(ctx, data)
+	if evs := r.events(gmain.ID); len(evs) != 1 || evs[0].Kind != chat.EventReset {
+		t.Fatalf("SKL-09 /new: %+v", evs)
+	}
+	if resets(umain.ID) != ownerResets {
+		t.Fatal("SKL-09: the conversation of the owner was reset")
 	}
 }
 
@@ -603,4 +723,80 @@ func TestModelsRefresh(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("MDL-10: %d refreshes", calls)
 	}
+}
+
+// MDL-07, MDL-08: the probes of a check report the capabilities; a confirmed
+// tool call becomes the source, an unconfirmed image changes nothing.
+func TestModelProbes(t *testing.T) {
+	ctx := context.Background()
+	box, _ := crypto.NewBox(key)
+	ms := &models.Service{Pool: pool, Box: box}
+	yes := true
+	conn, err := ms.Create(ctx, models.Input{Type: models.TypeOpenAICompatible, Name: "Probes " + uuid.NewString()[:6], BaseURL: "http://llm.invalid",
+		APIKey: "sk-probe-0001", Models: []models.ModelRef{{ID: "probe-x", Overrides: &models.CapsPatch{Image: &yes}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn.Models[0].Sources[models.FTools] != models.SrcDefault {
+		t.Fatalf("the tools of an unknown model are expected from the defaults: %+v", conn.Models[0].Sources)
+	}
+	var asked []string
+	ms.Check = func(_ context.Context, req agent.LLMCheckRequest) (*agent.LLMCheckResponse, error) {
+		asked = req.Probes
+		return &agent.LLMCheckResponse{Results: []agent.LLMCheckResult{{Model: "probe-x", OK: true,
+			Caps: map[string]string{agent.ProbeImage: agent.ProbeUnconfirmed, agent.ProbeTools: agent.ProbeConfirmed}}}}, nil
+	}
+	res, err := ms.CheckConnection(ctx, conn.ID)
+	if err != nil || len(res.Results) != 1 || res.Results[0].Caps[agent.ProbeImage] != agent.ProbeUnconfirmed || !slices.Contains(asked, agent.ProbeImage) {
+		t.Fatalf("MDL-07: %+v %v (probes %v)", res, err, asked)
+	}
+	after, _ := ms.Get(ctx, conn.ID)
+	m := after.Models[0]
+	if !m.HasInput("image") || m.Sources[models.FImage] != models.SrcManual {
+		t.Fatalf("MDL-07: the check switched off the image: %+v", m)
+	}
+	if !m.Tools || m.Sources[models.FTools] != models.SrcProbe {
+		t.Fatalf("MDL-08: %+v", m.Sources)
+	}
+}
+
+// GC-09: Pi gets a token of the bridge, never the authorization key of GigaChat.
+func TestGigaChatKeyStaysInAPI(t *testing.T) {
+	ctx := context.Background()
+	box, _ := crypto.NewBox(key)
+	const secret = "R2lnYUNoYXQtYXV0aG9yaXphdGlvbi1rZXk="
+	enc, _ := box.Seal(secret)
+	var id uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO model_connections (name, type, base_url, api_key_enc, options, models) VALUES ($1, 'gigachat', 'https://gigachat.devices.sberbank.ru/api/v1', $2,
+		'{"scope":"GIGACHAT_API_PERS"}', '[{"id":"GigaChat-2-Max","tools":true,"contextWindow":128000}]') RETURNING id`, "GigaChat "+uuid.NewString()[:6], enc).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	ms := &models.Service{Pool: pool, Box: box, Signer: jwt.NewSigner("https://nabu.test", key), InternalURL: "http://api:8081"}
+	spec, tok, err := ms.Resolve(ctx, models.Choice{ConnectionID: id, Model: "GigaChat-2-Max"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(spec)
+	if strings.Contains(string(raw)+tok, secret) || !strings.HasPrefix(spec.BaseURL, "http://api:8081/internal/llm/gigachat/"+id.String()) || !ms.VerifyBridge(tok, id) {
+		t.Fatalf("GC-09: %s %q", raw, tok)
+	}
+	if c, err := ms.BridgeConn(ctx, id); err != nil || c.AuthKey != secret {
+		t.Fatalf("the bridge reads the key in api: %+v %v", c, err)
+	}
+}
+
+// wavOf is a WAV recording of the given length: 16 kHz mono 16-bit.
+func wavOf(seconds int) []byte {
+	const rate = 32000
+	var b bytes.Buffer
+	b.WriteString("RIFF")
+	_ = binary.Write(&b, binary.LittleEndian, uint32(36+seconds*rate))
+	b.WriteString("WAVEfmt ")
+	for _, v := range []any{uint32(16), uint16(1), uint16(1), uint32(16000), uint32(rate), uint16(2), uint16(16)} {
+		_ = binary.Write(&b, binary.LittleEndian, v)
+	}
+	b.WriteString("data")
+	_ = binary.Write(&b, binary.LittleEndian, uint32(seconds*rate))
+	b.Write(make([]byte, seconds*rate))
+	return b.Bytes()
 }

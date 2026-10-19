@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -59,14 +60,18 @@ func (e *Engine) reset(ctx context.Context, u *users.User, in chat.Inbound) {
 	if err := e.S3.Delete(ctx, snapshotKey(in.ConversationID)); err != nil {
 		slog.WarnContext(ctx, "delete the snapshot of a reset conversation", "conversation", in.ConversationID, "err", err)
 	}
-	ev, err := e.Chat.AddEvent(ctx, in.ConversationID, eventChannel(in.Channel), chat.Event{Kind: chat.EventReset})
+	// the event has the id of the job (tech §2.1: 202 {eventId}); a job delivered twice writes it once
+	ev, err := e.Chat.AddEvent(ctx, in.ConversationID, eventChannel(in.Channel), chat.Event{Kind: chat.EventReset}, chat.EventAt{ID: &in.MessageID})
+	if errors.Is(err, chat.ErrEventExists) {
+		return
+	}
 	if err != nil {
 		slog.ErrorContext(ctx, "reset event", "err", err)
 		return
 	}
 	metrics.ContextEvents.WithLabelValues(chat.EventReset, "false").Inc()
 	e.publish(ctx, events.MessageCreated, u.ID, ev)
-	e.publish(ctx, events.ConversationContext, u.ID, map[string]any{"conversationId": in.ConversationID, "tokens": 0, "window": 0})
+	e.publishContext(ctx, u.ID, in.ConversationID, 0, 0)
 	if domain.Messenger(in.Channel) {
 		e.deliver(ctx, u.ID, in.Channel, channels.T(u.Language, "cmd.reset"))
 	}
@@ -96,12 +101,20 @@ func (e *Engine) compactCommand(ctx context.Context, key, value []byte, in chat.
 	defer cancel()
 	b, err := e.personalRequest(ctx, u, in.ConversationID, nil, "compact "+in.ConversationID.String()[:8])
 	if err != nil {
-		e.compactFailed(ctx, u, in, "agent_not_configured", err.Error())
+		e.compactFailed(ctx, u, in, requestClass(ctx, err), err.Error())
 		return nil
 	}
 	sess, err := e.ensureSession(ctx, lease, in.ConversationID, b, false)
 	if err != nil {
 		e.compactFailed(ctx, u, in, operatorClass(err), operatorText(err))
+		return nil
+	}
+	if sess.ContextTokens > 0 && sess.ContextTokens < chat.MinCompact { // CTX-06: the size became known in the session
+		e.publish(ctx, events.ChatError, u.ID, map[string]any{"conversationId": in.ConversationID, "errorClass": "context_too_short", "retryable": false,
+			"text": "the context is already short", "command": chat.CommandCompact})
+		if domain.Messenger(in.Channel) {
+			e.deliver(ctx, u.ID, in.Channel, channels.T(u.Language, "cmd.too_short"))
+		}
 		return nil
 	}
 	if _, err := e.compact(ctx, lease.Operator(), u, b, in.ConversationID, sess, in.Instructions, false, in.Channel); err != nil {
@@ -130,14 +143,16 @@ func (e *Engine) compact(ctx context.Context, op Operator, u *users.User, b *bui
 	if window == 0 {
 		window = modelWindow(b.model)
 	}
-	_, _ = e.Pool.Exec(ctx, `UPDATE harness_sessions SET context_tokens = $2, context_window = $3 WHERE id = $1`, sess.ID, res.TokensAfter, window)
 	e.saveSnapshot(context.WithoutCancel(ctx), op, conv, sess.OpSession)
-	return e.compactionEvent(ctx, u, conv, ch, agent.Event{Summary: res.Summary, TokensBefore: res.TokensBefore, TokensAfter: res.TokensAfter, Auto: auto}, window)
+	m, err := e.compactionEvent(ctx, u, conv, ch, agent.Event{Summary: res.Summary, TokensBefore: res.TokensBefore, TokensAfter: res.TokensAfter, Auto: auto})
+	e.recordContext(ctx, u.ID, conv, sess.ID, res.TokensAfter, window)
+	return m, err
 }
 
 // compactionEvent writes the event of a compaction (asked for or made by the
 // harness itself) and tells the user.
-func (e *Engine) compactionEvent(ctx context.Context, u *users.User, conv uuid.UUID, ch string, ev agent.Event, window int64) (*chat.Message, error) {
+// The fill of the context follows with recordContext.
+func (e *Engine) compactionEvent(ctx context.Context, u *users.User, conv uuid.UUID, ch string, ev agent.Event) (*chat.Message, error) {
 	m, err := e.Chat.AddEvent(ctx, conv, eventChannel(ch), chat.Event{Kind: chat.EventCompact, Auto: ev.Auto,
 		TokensBefore: ev.TokensBefore, TokensAfter: ev.TokensAfter, Summary: ev.Summary})
 	if err != nil {
@@ -145,9 +160,8 @@ func (e *Engine) compactionEvent(ctx context.Context, u *users.User, conv uuid.U
 	}
 	metrics.ContextEvents.WithLabelValues(chat.EventCompact, fmt.Sprint(ev.Auto)).Inc()
 	e.publish(ctx, events.MessageCreated, u.ID, m)
-	e.publish(ctx, events.ConversationContext, u.ID, map[string]any{"conversationId": conv, "tokens": ev.TokensAfter, "window": window})
 	if domain.Messenger(ch) {
-		e.deliver(ctx, u.ID, ch, channels.T(u.Language, "cmd.compacted", thousands(ev.TokensBefore, u.Language), thousands(ev.TokensAfter, u.Language)))
+		e.deliver(ctx, u.ID, ch, channels.T(u.Language, "cmd.compacted", shortTokens(ev.TokensBefore, u.Language), shortTokens(ev.TokensAfter, u.Language)))
 	}
 	return m, nil
 }
@@ -164,7 +178,7 @@ func (e *Engine) compactFailed(ctx context.Context, u *users.User, in chat.Inbou
 }
 
 // thousands writes a number of tokens shortly: 182 тыс., 1,2 млн.
-func thousands(n int64, lang string) string {
+func shortTokens(n int64, lang string) string {
 	k, m := "K", "M"
 	if lang == "ru" {
 		k, m = " тыс.", " млн"
@@ -216,6 +230,11 @@ func (e *Engine) recordContext(ctx context.Context, uid uuid.UUID, conv uuid.UUI
 		return
 	}
 	_, _ = e.Pool.Exec(ctx, `UPDATE harness_sessions SET context_tokens = $2, context_window = $3 WHERE id = $1`, sessID, tokens, window)
+	e.publishContext(ctx, uid, conv, tokens, window)
+}
+
+// publishContext tells the site the fill of the context of a conversation (R3).
+func (e *Engine) publishContext(ctx context.Context, uid, conv uuid.UUID, tokens, window int64) {
 	e.publish(ctx, events.ConversationContext, uid, map[string]any{"conversationId": conv, "tokens": tokens, "window": window, "at": time.Now().UTC()})
 }
 
@@ -251,15 +270,13 @@ func imagesFor(m agent.ModelSpec, images []agent.Image, text string, space bool)
 	return nil, text
 }
 
+// hasSkill reports whether the skill is in the skill set of the session.
+func hasSkill(sk *agent.Skills, name string) bool {
+	return sk != nil && slices.Contains(sk.Names, name)
+}
+
 // skillPrompt is the request with the skill's command: Pi puts the skill's
 // SKILL.md into the context and the rest as the user's request.
-func skillPrompt(sk *agent.Skills, name, prompt string) string {
-	if sk != nil {
-		for _, n := range sk.Names {
-			if n == name {
-				return "/skill:" + name + " " + prompt
-			}
-		}
-	}
-	return "[The user asked to follow the skill " + name + ", which is not loaded in this session.]\n" + prompt
+func skillPrompt(name, prompt string) string {
+	return "/skill:" + name + " " + prompt
 }

@@ -22,9 +22,9 @@ type Users struct {
 	// Channels and GroupAgents fill the card of a user (FTR.NAB.CMN-0002 tech §2.2).
 	Channels    func(ctx context.Context, uid uuid.UUID) (any, error)
 	GroupAgents func(ctx context.Context, uid uuid.UUID) (any, error)
-	// AdminChanged is called after the role of administrator changes
-	// (FTR.NAB.CMN-0007 R3: the access of «admins» comes or goes).
-	AdminChanged func(ctx context.Context, actor, uid uuid.UUID, admin bool)
+	// AccessChanged is called after the role of administrator changed
+	// (FTR.NAB.CMN-0007 R3: the access of «admins» came or went).
+	AccessChanged func(ctx context.Context)
 }
 
 // Routes mounts GET /users, POST /users (invitation) and PATCH /users/{id}.
@@ -104,8 +104,8 @@ func (u *Users) Routes(r chi.Router) {
 		if err != nil {
 			return err
 		}
-		if u.AdminChanged != nil && before != nil && before.IsAdmin != usr.IsAdmin {
-			u.AdminChanged(r.Context(), p.UserID, id, usr.IsAdmin)
+		if u.AccessChanged != nil && before != nil && before.IsAdmin != usr.IsAdmin {
+			u.AccessChanged(r.Context())
 		}
 		httpx.JSON(w, 200, usr)
 		return nil

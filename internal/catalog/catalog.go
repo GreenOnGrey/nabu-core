@@ -99,9 +99,10 @@ type Access interface {
 	ItemGranted(ctx context.Context, uid, item uuid.UUID) bool
 }
 
-// granted returns the items of the user's access; nil — every item.
+// granted returns the items of the user's access; nil — every item (no
+// access control). uuid.Nil is the access of «Все пользователи» alone.
 func (s *Service) granted(ctx context.Context, uid uuid.UUID) (map[uuid.UUID]bool, error) {
-	if s.Access == nil || uid == uuid.Nil {
+	if s.Access == nil {
 		return nil, nil
 	}
 	return s.Access.Items(ctx, uid)
@@ -714,14 +715,12 @@ type SessionMCP struct {
 // (FTR.NAB.CMN-0002 R16, GR-07): only published platform items, no personal
 // access of the members; skills — those chosen by the owner. The proxy
 // tokens carry no user: platform credentials only.
-func (s *Service) ForGroup(ctx context.Context, groupID uuid.UUID, skills []string, conv string, ttl time.Duration, owner ...uuid.UUID) (*SessionMCP, error) {
-	// FTR.NAB.CMN-0007 R12: a group agent has the access of its owner
-	var g map[uuid.UUID]bool
-	if len(owner) > 0 {
-		var err error
-		if g, err = s.granted(ctx, owner[0]); err != nil {
-			return nil, err
-		}
+func (s *Service) ForGroup(ctx context.Context, groupID uuid.UUID, skills []string, conv string, ttl time.Duration, owner uuid.UUID) (*SessionMCP, error) {
+	// FTR.NAB.CMN-0007 R12: a group agent has the access of its owner;
+	// without an owner (uuid.Nil) — that of «Все пользователи»
+	g, err := s.granted(ctx, owner)
+	if err != nil {
+		return nil, err
 	}
 	rows, err := s.Pool.Query(ctx, `SELECT c.id, c.type, c.name, COALESCE(c.title,''), COALESCE(c.description,''), c.exposure, c.skills, c.skills_snapshot
 		FROM catalog_items c WHERE c.published AND NOT c.in_development AND (c.type = 'skill' OR c.mode = 'platform') ORDER BY c.name`)
