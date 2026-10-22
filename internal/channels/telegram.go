@@ -15,7 +15,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -273,16 +272,6 @@ func splitRunes(s string, n int) []string {
 		r = r[n:]
 	}
 	return append(out, string(r))
-}
-
-// Draft implements Drafter: the streamed answer of a private chat
-// (sendMessageDraft; a draft lives 30 seconds, the final message follows).
-func (t *Telegram) Draft(ctx context.Context, chatID string, draftID int64, text string) error {
-	if utf8.RuneCountInString(text) > TelegramLimit {
-		r := []rune(text)
-		text = "…" + string(r[len(r)-TelegramLimit+1:])
-	}
-	return t.call(ctx, "sendMessageDraft", map[string]any{"chat_id": chatID, "draft_id": draftID, "text": text}, nil)
 }
 
 // Typing implements Adapter.

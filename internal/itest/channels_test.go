@@ -353,9 +353,6 @@ func TestTelegramBotAndGroups(t *testing.T) {
 	if err := bot.Send(ctx, "9001", "**важно**\n\n| a | b |\n|---|---|\n| 1 | 2 |"); err != nil || !f.said("sendMessage", `важно`) || !f.said("sendMessage", `"parse_mode":"HTML"`) || !f.said("sendMessage", `pre`) {
 		t.Fatalf("TG-09: %v %v", err, f.bodies)
 	}
-	if err := bot.Draft(ctx, "9001", 42, "черновик"); err != nil || !f.said("sendMessageDraft", `"draft_id":42`) {
-		t.Fatal("TG-10: draft")
-	}
 
 	added := func(chat int64, from int64, status string) channels.Update {
 		u := channels.Update{}

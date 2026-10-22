@@ -18,6 +18,7 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/catalog"
 	"github.com/GreenOnGrey/nabu-core/internal/chat"
 	"github.com/GreenOnGrey/nabu-core/internal/domain"
+	"github.com/GreenOnGrey/nabu-core/internal/platform/agent"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/crypto"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/jwt"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/kafka"
@@ -293,5 +294,46 @@ func TestSessionCatalogChange(t *testing.T) {
 	_ = pool.QueryRow(ctx, `SELECT count(*) FROM harness_sessions WHERE conversation_id = $1 AND closed_at IS NULL`, main.ID).Scan(&open)
 	if open != 1 {
 		t.Fatalf("NX-07: %d open sessions", open)
+	}
+}
+
+// FTR.NAB.CMN-0002 R14, TG-10: in a messenger the text the agent writes before
+// a call of a tool goes at once as a message of its own, the rest after the
+// turn; the steps of tools stay on the site.
+func TestMessengerSegments(t *testing.T) {
+	ctx := context.Background()
+	r := newChatRig(t)
+	uid := newUser(t, "segments-"+uuid.NewString()[:6]+"@x.org")
+	r.op.script = []agent.Event{
+		{Type: agent.EventTextDelta, Delta: "Сейчас посмотрю "},
+		{Type: agent.EventTextDelta, Delta: "задачу."},
+		{Type: agent.EventToolCall, ID: "t1", Name: "hammurapi__read_issue"},
+		{Type: agent.EventToolResult, ID: "t1", Name: "hammurapi__read_issue", Summary: "ISS.FMS-0007"},
+		{Type: agent.EventToolCall, ID: "t2", Name: "hammurapi__list_issues"}, // no text between tools — no empty message
+		{Type: agent.EventToolResult, ID: "t2", Name: "hammurapi__list_issues", Summary: "3 issues"},
+		{Type: agent.EventTextDelta, Delta: "Готово: дубликатов нет."},
+	}
+	defer func() { r.op.script = nil }()
+	if _, err := r.api.Post(ctx, uid, nil, "есть дубликаты?", domain.ChannelTelegram, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	r.drain()
+	out := r.outbound()
+	if len(out) != 2 || out[0] != "Сейчас посмотрю задачу." || out[1] != "Готово: дубликатов нет." {
+		t.Fatalf("TG-10: %q", out)
+	}
+	// the site keeps the whole answer with its steps
+	main, _ := r.api.Store.Main(ctx, uid)
+	h, _ := r.api.Store.History(ctx, main.ID, 10)
+	last := h[len(h)-1]
+	if last.Text != "Сейчас посмотрю задачу.Готово: дубликатов нет." || len(last.ToolSteps) != 2 {
+		t.Fatalf("TG-10 site: %q %d", last.Text, len(last.ToolSteps))
+	}
+	// an answer without tools is one message, as before
+	r.op.script = nil
+	r.api.Post(ctx, uid, nil, "привет", domain.ChannelTelegram, nil, nil, nil) //nolint:errcheck
+	r.drain()
+	if out := r.outbound(); len(out) != 1 || out[0] != "ok" {
+		t.Fatalf("TG-10 one message: %q", out)
 	}
 }

@@ -56,7 +56,8 @@ type fakeAgent struct {
 	window    int64
 	autoCompa bool // the harness compacts during the next prompt
 	failCompa bool
-	during    func() // called inside the turn, as a tool call of the agent
+	during    func()        // called inside the turn, as a tool call of the agent
+	script    []agent.Event // the events of the answer instead of the text "ok"
 }
 
 func (f *fakeAgent) Open(_ context.Context, req agent.SessionRequest, _ func(ctx context.Context) ([]byte, error)) (agent.SessionResponse, error) {
@@ -79,7 +80,15 @@ func (f *fakeAgent) Prompt(_ context.Context, _ string, p agent.PromptRequest, o
 	if auto {
 		onEvent(agent.Event{Type: agent.EventCompaction, Auto: true, Summary: "auto summary", TokensBefore: 190_000, TokensAfter: 8_000})
 	}
-	onEvent(agent.Event{Type: agent.EventTextDelta, Delta: "ok"})
+	f.mu.Lock()
+	script := f.script
+	f.mu.Unlock()
+	if script == nil {
+		script = []agent.Event{{Type: agent.EventTextDelta, Delta: "ok"}}
+	}
+	for _, ev := range script {
+		onEvent(ev)
+	}
 	onEvent(agent.Event{Type: agent.EventUsage, Usage: agent.Usage{TokensIn: 10, TokensOut: 2}})
 	onEvent(agent.Event{Type: agent.EventContext, ContextTokens: tokens, ContextWindow: window})
 	onEvent(agent.Event{Type: agent.EventSettled})

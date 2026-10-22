@@ -522,13 +522,15 @@ func (e *Engine) HandleInbound(ctx context.Context, key, value []byte) error {
 	}
 	started := time.Now()
 	mctx := parseContext(in.Context)
-	var draft *drafter
-	if domain.Messenger(in.Channel) {
+	var seg *segmenter
+	if domain.Messenger(in.Channel) && e.Chat.Source(ctx, in.ConversationID) != "email" {
+		prefix := ""
+		if ga := e.group(ctx, u); ga != nil {
+			prefix = "**" + ga.Name + " " + groupMark(u.Language) + "**\n\n" // design §5 #4: the group agent signs its answers
+		}
+		seg = newSegmenter(ctx, e, u.ID, in.Channel, prefix) // R14: the text before a tool goes at once
 		if ad := e.Adapters[in.Channel]; ad != nil {
 			if chatID, ok := e.chatOf(ctx, u, in.Channel); ok {
-				if in.Channel == domain.ChannelTelegram && u.CreatedVia != "group" {
-					draft = newDrafter(ad, chatID) // R14: private chats show the answer as it is written
-				}
 				tctx, stop := context.WithCancel(ctx)
 				defer stop()
 				go func() {
@@ -555,7 +557,7 @@ func (e *Engine) HandleInbound(ctx context.Context, key, value []byte) error {
 	if userMsg.Skill != nil {
 		skill = *userMsg.Skill
 	}
-	res := e.personalTurn(ctx, lease, asked, u, in.ConversationID, asst.ID, in.Channel, in.ClientID, text, images, author, draft, skill)
+	res := e.personalTurn(ctx, lease, asked, u, in.ConversationID, asst.ID, in.Channel, in.ClientID, text, images, author, seg, skill)
 	if res.podLost {
 		// R5, LC-04: the pod went away before the answer began — the turn goes
 		// back to the queue and continues this answer in a new pod.
@@ -591,11 +593,10 @@ func (e *Engine) HandleInbound(ctx context.Context, key, value []byte) error {
 			}
 		}
 	case domain.Messenger(in.Channel):
-		out := res.text
+		// R14: what the agent wrote before its tools went already; the rest follows
+		out := seg.rest()
 		if res.errClass != "" {
 			out = errorText(u.Language, res.errClass)
-		} else if ga := e.group(ctx, u); ga != nil {
-			out = "**" + ga.Name + " " + groupMark(u.Language) + "**\n\n" + out // design §5 #4: the group agent signs its answers
 		}
 		e.deliver(ctx, u.ID, in.Channel, out)
 		if res.errClass == "" {
@@ -748,7 +749,7 @@ func requestClass(ctx context.Context, err error) string {
 }
 
 func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked time.Time, u *users.User, conv, msgID uuid.UUID, ch string, clientID *uuid.UUID, text string, images []agent.Image,
-	author *uuid.UUID, draft *drafter, skill string) turnResult {
+	author *uuid.UUID, seg *segmenter, skill string) turnResult {
 	b, err := e.personalRequest(ctx, u, conv, nil, "conv "+conv.String()[:8])
 	if err != nil {
 		return turnResult{errClass: requestClass(ctx, err), errText: err.Error()}
@@ -772,8 +773,8 @@ func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked
 		col.audit.Agent, col.audit.UserID, col.audit.GroupAgentID = b.group.Name+" (group)", author, &b.group.ID
 		col.usage = ledger.UsageRow{GroupAgentID: &b.group.ID, Agent: "group agent", Model: b.model.ModelID, ConnectionID: &connID}
 	}
-	if draft != nil {
-		col.onEvent = func(ev agent.Event) { draft.event(ctx, ev) }
+	if seg != nil {
+		col.onEvent = seg.event
 	}
 	op := lease.Operator()
 	images, text = imagesFor(b.model, images, text, e.Space.Enabled)

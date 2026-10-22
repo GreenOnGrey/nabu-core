@@ -64,11 +64,6 @@ func Photo(mimeType string, size int64) bool {
 	return false
 }
 
-// Drafter streams a draft of the answer to a private chat (Telegram R14).
-type Drafter interface {
-	Draft(ctx context.Context, chatID string, draftID int64, text string) error
-}
-
 // Inbound is a normalized message from a channel.
 type Inbound struct {
 	UserID      uuid.UUID

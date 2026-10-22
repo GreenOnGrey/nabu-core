@@ -2,8 +2,6 @@ package engine
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -97,45 +95,64 @@ func (e *Engine) Deliverable(ctx context.Context, uid uuid.UUID, ch string) (boo
 	return true, ""
 }
 
-// drafter streams the answer to a private Telegram chat (R14, TG-10).
-type drafter struct {
-	d       channels.Drafter
-	chat    string
-	id      int64
-	mu      sync.Mutex
-	text    strings.Builder
-	last    time.Time
-	stopped bool
+// segmenter delivers the answer to a messenger as the agent writes it
+// (FTR.NAB.CMN-0002 R14): the text before a call of a tool goes at once as a
+// message of its own, the rest after the turn — the user sees what the agent
+// said before it went to work, not one message at the end. The steps of tools
+// stay on the site.
+type segmenter struct {
+	e      *Engine
+	ctx    context.Context
+	uid    uuid.UUID
+	ch     string
+	prefix string // the signature of a group agent on its first message
+	mu     sync.Mutex
+	text   strings.Builder
+	sent   bool
 }
 
-func newDrafter(ad channels.Adapter, chat string) *drafter {
-	d, ok := ad.(channels.Drafter)
-	if !ok {
-		return nil
-	}
-	var b [8]byte
-	_, _ = rand.Read(b[:])
-	id := int64(binary.BigEndian.Uint64(b[:]) >> 2)
-	if id == 0 {
-		id = 1
-	}
-	return &drafter{d: d, chat: chat, id: id}
+func newSegmenter(ctx context.Context, e *Engine, uid uuid.UUID, ch, prefix string) *segmenter {
+	return &segmenter{e: e, ctx: ctx, uid: uid, ch: ch, prefix: prefix}
 }
 
-func (d *drafter) event(ctx context.Context, ev agent.Event) {
-	if d == nil || ev.Type != agent.EventTextDelta {
+func (s *segmenter) event(ev agent.Event) {
+	if s == nil {
 		return
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.text.WriteString(ev.Delta)
-	if d.stopped || time.Since(d.last) < time.Second {
-		return
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch ev.Type {
+	case agent.EventTextDelta:
+		s.text.WriteString(ev.Delta)
+	case agent.EventToolCall:
+		if t := s.take(); t != "" {
+			s.e.deliver(s.ctx, s.uid, s.ch, t)
+		}
 	}
-	d.last = time.Now()
-	if err := d.d.Draft(ctx, d.chat, d.id, d.text.String()); err != nil {
-		d.stopped = true // drafts are a courtesy: the final message follows anyway
+}
+
+// take returns the text not delivered yet, signed when it is the first message.
+func (s *segmenter) take() string {
+	t := strings.TrimSpace(s.text.String())
+	s.text.Reset()
+	if t == "" {
+		return ""
 	}
+	if !s.sent {
+		t = s.prefix + t
+	}
+	s.sent = true
+	return t
+}
+
+// rest is the text written after the last call of a tool.
+func (s *segmenter) rest() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.take()
 }
 
 // ─── group agents (R16) ─────────────────────────────────────────────
