@@ -685,6 +685,30 @@ func (a *API) Routes(r chi.Router, site bool) {
 		httpx.JSON(w, http.StatusAccepted, map[string]any{"messageId": m.ID, "message": m})
 		return nil
 	}))
+	r.Post("/conversations/{id}/notices", h(func(w http.ResponseWriter, r *http.Request) error {
+		p, err := httpx.MustPrincipal(r)
+		if err != nil {
+			return err
+		}
+		var in struct {
+			Text           string          `json:"text"`
+			Payload        json.RawMessage `json:"payload"`
+			IdempotencyKey string          `json:"idempotencyKey"`
+		}
+		if err := httpx.DecodeMax(r, &in, 64<<10); err != nil {
+			return err
+		}
+		m, created, err := a.PostNotice(r.Context(), p, chi.URLParam(r, "id"), Notice{Text: in.Text, Payload: in.Payload, IdempotencyKey: in.IdempotencyKey})
+		if err != nil {
+			return err
+		}
+		status := http.StatusOK
+		if created {
+			status = http.StatusCreated
+		}
+		httpx.JSON(w, status, m)
+		return nil
+	}))
 	r.Post("/messages/{id}/retry", h(func(w http.ResponseWriter, r *http.Request) error {
 		p, err := httpx.MustPrincipal(r)
 		if err != nil {
@@ -774,4 +798,76 @@ func formFile(r *http.Request, max int64) (io.ReadCloser, string, error) {
 		return nil, "", apperr.BadRequest("invalid_upload", "the file field is missing")
 	}
 	return f, hdr.Filename, nil
+}
+
+// Bounds of a notice (FTR.NAB.CHAT-0002 tech §2.1).
+const (
+	MaxNoticeText    = 8000
+	MaxNoticePayload = 8 << 10
+	MaxNoticeKey     = 200
+)
+
+// ValidateNotice checks a notice; the error names the field (NC-05).
+func ValidateNotice(n *Notice) error {
+	n.Text = strings.TrimSpace(n.Text)
+	n.IdempotencyKey = strings.TrimSpace(n.IdempotencyKey)
+	bad := func(field, msg string) error {
+		return apperr.Unprocessable("invalid_notice", msg).With("field", field)
+	}
+	switch {
+	case n.Text == "" || utf8.RuneCountInString(n.Text) > MaxNoticeText:
+		return bad("text", fmt.Sprintf("the text is 1–%d characters", MaxNoticeText))
+	case n.IdempotencyKey == "" || utf8.RuneCountInString(n.IdempotencyKey) > MaxNoticeKey:
+		return bad("idempotencyKey", fmt.Sprintf("the key is 1–%d characters", MaxNoticeKey))
+	case len(n.Payload) > MaxNoticePayload:
+		return bad("payload", "the payload is larger than 8 KB")
+	}
+	if p := strings.TrimSpace(string(n.Payload)); p == "" || p == "null" {
+		n.Payload = nil
+	} else if !strings.HasPrefix(p, "{") || !json.Valid(n.Payload) {
+		return bad("payload", "the payload is a JSON object")
+	}
+	return nil
+}
+
+// PostNotice stores a notice of the service client of the principal in a
+// topic of its user (FTR.NAB.CHAT-0002 R1–R5): the agent sees it with the
+// next turn, no turn starts, messengers do not get it.
+func (a *API) PostNotice(ctx context.Context, p *domain.Principal, convParam string, n Notice) (*Message, bool, error) {
+	client := p.ClientName
+	if p.ClientID == nil {
+		return nil, false, apperr.Forbidden("delegation_required", "notices are written by service clients on behalf of users")
+	}
+	if err := ValidateNotice(&n); err != nil {
+		metrics.Notices.WithLabelValues(client, "invalid").Inc()
+		return nil, false, err
+	}
+	conv, err := uuid.Parse(convParam)
+	if convParam == "main" {
+		var c *Conversation
+		if c, err = a.Store.Main(ctx, p.UserID); err == nil {
+			conv = c.ID
+		}
+	}
+	if err != nil {
+		metrics.Notices.WithLabelValues(client, "not_found").Inc()
+		return nil, false, apperr.NotFound("not_found", "conversation not found")
+	}
+	m, created, err := a.Store.AddNotice(ctx, p.UserID, conv, *p.ClientID, p.Channel(), n)
+	if err != nil {
+		if ae, ok := apperr.As(err); ok && ae.Status == http.StatusNotFound {
+			metrics.Notices.WithLabelValues(client, "not_found").Inc()
+		}
+		return nil, false, err
+	}
+	if !created {
+		metrics.Notices.WithLabelValues(client, "duplicate").Inc()
+		return m, false, nil
+	}
+	metrics.Notices.WithLabelValues(client, "created").Inc()
+	slog.InfoContext(ctx, "notice", "client", client, "conversation_id", conv, "message_id", m.ID, "idempotency_key", n.IdempotencyKey)
+	a.Events.Publish(ctx, events.Event{Type: events.MessageCreated, UserID: &p.UserID, Data: m})
+	a.Events.Publish(ctx, events.Event{Type: "conversation.unread", UserID: &p.UserID,
+		Data: map[string]any{"conversationId": conv, "unreadCount": a.Store.UnreadCount(ctx, conv)}})
+	return m, true, nil
 }

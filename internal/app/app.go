@@ -641,6 +641,7 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 	})...)
 	builtin.Allowed = c.users.Allowed
 	builtin.ChannelOf = c.chat.LastUserChannel
+	c.catalog.ChannelOf = c.chat.LastUserChannel // FTR.NAB.CHAT-0002 R6
 	// R9: in mail topics tools that change data wait for the user
 	builtin.Hold = func(ctx context.Context, g mcp.Grant, tool string, args json.RawMessage) (string, bool) {
 		return confirms.Hold(ctx, g.Conversation, g.UserID, nil, confirm.Builtin, tool, args)

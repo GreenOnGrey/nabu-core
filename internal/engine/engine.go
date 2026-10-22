@@ -263,24 +263,14 @@ func (e *Engine) ensureSession(ctx context.Context, lease *agentpods.Lease, conv
 	if snap, err := storage.ReadAll(ctx, e.S3, snapshotKey(conv)); err == nil && len(snap) > 0 {
 		req.Snapshot = snap
 	} else {
-		hist, _ := e.Chat.History(ctx, conv, 30)
-		for _, m := range hist {
-			if m.Status == "done" && strings.TrimSpace(m.Text) != "" {
-				req.History = append(req.History, agent.HistoryMessage{Role: m.Role, Text: m.Text})
-			}
-		}
+		req.History = e.history(ctx, conv, b.persona.User.Timezone)
 	}
 	resp, err := e.open(ctx, op, req)
 	if err != nil && req.Snapshot != nil {
 		// a snapshot Pi cannot read: start over with the history
 		slog.WarnContext(ctx, "restore from snapshot failed, seeding with history", "conversation", conv, "err", err)
 		req.Snapshot = nil
-		hist, _ := e.Chat.History(ctx, conv, 30)
-		for _, m := range hist {
-			if m.Status == "done" && strings.TrimSpace(m.Text) != "" {
-				req.History = append(req.History, agent.HistoryMessage{Role: m.Role, Text: m.Text})
-			}
-		}
+		req.History = e.history(ctx, conv, b.persona.User.Timezone)
 		resp, err = e.open(ctx, op, req)
 	}
 	if err != nil {
@@ -824,6 +814,8 @@ func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked
 		if skill != "" { // R5: the skill's instructions come into the context with the request
 			prompt = skillPrompt(skill, prompt)
 		}
+		// FTR.NAB.CHAT-0002 R3: the notices since the last answer come first
+		prompt = e.turnNotices(ctx, conv, msgID, u.Timezone) + prompt
 		err = op.Prompt(ctx, sess.OpSession, agent.PromptRequest{Text: prompt, Images: images}, col.handle)
 		if errors.Is(err, agent.ErrSessionGone) || errors.Is(err, agent.ErrStreamBroken) {
 			_, _ = e.Pool.Exec(ctx, `UPDATE harness_sessions SET closed_at = now() WHERE id = $1`, sess.ID)
@@ -1084,4 +1076,52 @@ func errorText(lang, class string) string {
 		return t
 	}
 	return m["agent_crashed"]
+}
+
+// noticeLine is a notice of a product as the agent reads it
+// (FTR.NAB.CHAT-0002 tech §3.2).
+func noticeLine(m chat.Message, tz string) string {
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		loc = time.UTC
+	}
+	client := strings.TrimPrefix(m.Channel, "client:")
+	if m.ClientName != nil {
+		client = *m.ClientName
+	}
+	return "[Notice of " + client + ", " + m.CreatedAt.In(loc).Format("15:04") + "]\n" + m.Text
+}
+
+// turnNotices is the block of the notices the agent has not seen before the
+// turn that writes the answer; "" without notices.
+func (e *Engine) turnNotices(ctx context.Context, conv, answer uuid.UUID, tz string) string {
+	ns, err := e.Chat.NoticesForTurn(ctx, conv, answer)
+	if err != nil {
+		slog.WarnContext(ctx, "notices of the turn", "conversation", conv, "err", err)
+		return ""
+	}
+	var b strings.Builder
+	for _, n := range ns {
+		b.WriteString(noticeLine(n, tz))
+		b.WriteString("\n\n")
+	}
+	return b.String()
+}
+
+// history seeds a session without a snapshot: the messages the agent knows,
+// notices of products as user lines with their mark (FTR.NAB.CHAT-0002 arch §4).
+func (e *Engine) history(ctx context.Context, conv uuid.UUID, tz string) []agent.HistoryMessage {
+	hist, _ := e.Chat.History(ctx, conv, 30)
+	var out []agent.HistoryMessage
+	for _, m := range hist {
+		if m.Status != "done" || strings.TrimSpace(m.Text) == "" {
+			continue
+		}
+		if m.Role == "notice" {
+			out = append(out, agent.HistoryMessage{Role: "user", Text: noticeLine(m, tz)})
+			continue
+		}
+		out = append(out, agent.HistoryMessage{Role: m.Role, Text: m.Text})
+	}
+	return out
 }

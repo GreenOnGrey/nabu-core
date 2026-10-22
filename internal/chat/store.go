@@ -75,13 +75,18 @@ type Message struct {
 	// Skill is the skill the user called with the message (R5).
 	Skill *string `json:"skill"`
 	// Voice: the text was recognized from a voice message (R21).
-	Voice      bool       `json:"voice,omitempty"`
-	Model      *string    `json:"model"`
-	ErrorClass *string    `json:"errorClass"`
-	ErrorText  *string    `json:"errorText"`
-	Retryable  bool       `json:"retryable,omitempty"`
-	ReplyTo    *uuid.UUID `json:"replyTo"`
-	CreatedAt  time.Time  `json:"createdAt"`
+	Voice bool `json:"voice,omitempty"`
+	// ClientName and Payload belong to a notice of a product (role
+	// "notice", FTR.NAB.CHAT-0002 R2): the service client that wrote it and
+	// the data the product draws.
+	ClientName *string         `json:"clientName,omitempty"`
+	Payload    json.RawMessage `json:"payload,omitempty"`
+	Model      *string         `json:"model"`
+	ErrorClass *string         `json:"errorClass"`
+	ErrorText  *string         `json:"errorText"`
+	Retryable  bool            `json:"retryable,omitempty"`
+	ReplyTo    *uuid.UUID      `json:"replyTo"`
+	CreatedAt  time.Time       `json:"createdAt"`
 }
 
 // Store is the conversation repository.
@@ -194,14 +199,18 @@ func (s *Store) ArchiveIdle(ctx context.Context, after time.Duration) ([]uuid.UU
 }
 
 const msgCols = `m.id, m.conversation_id, m.role, m.text, m.channel, m.status, m.attachments, m.tool_steps, m.context, m.model,
-	m.error_class, m.error_text, m.reply_to, m.created_at, m.card, m.event, m.skill, m.voice`
+	m.error_class, m.error_text, m.reply_to, m.created_at, m.card, m.event, m.skill, m.voice,
+	(SELECT sc.name FROM service_clients sc WHERE sc.id = m.client_id), m.payload`
 
 func scanMsg(row pgx.Row) (*Message, error) {
 	var m Message
-	var atts, steps, ctxb, card, ev []byte
+	var atts, steps, ctxb, card, ev, payload []byte
 	if err := row.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Text, &m.Channel, &m.Status, &atts, &steps, &ctxb, &m.Model,
-		&m.ErrorClass, &m.ErrorText, &m.ReplyTo, &m.CreatedAt, &card, &ev, &m.Skill, &m.Voice); err != nil {
+		&m.ErrorClass, &m.ErrorText, &m.ReplyTo, &m.CreatedAt, &card, &ev, &m.Skill, &m.Voice, &m.ClientName, &payload); err != nil {
 		return nil, err
+	}
+	if len(payload) > 0 {
+		m.Payload = payload
 	}
 	if len(card) > 0 {
 		m.Card = card
@@ -412,8 +421,12 @@ func (s *Store) SetCard(ctx context.Context, id uuid.UUID, card json.RawMessage)
 // History returns the latest messages of a conversation that the agent
 // knows, oldest first: the messages of the user and the answers after the
 // last reset of the context (FTR.NAB.CHAT-0001 R1); events are not history.
+// Notices of products count up to the last answer: later ones come with the
+// next turn (NoticesForTurn, FTR.NAB.CHAT-0002 arch §4).
 func (s *Store) History(ctx context.Context, conv uuid.UUID, n int) ([]Message, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT `+msgCols+` FROM messages m WHERE m.conversation_id = $1 AND m.role IN ('user','assistant')
+	rows, err := s.Pool.Query(ctx, `SELECT `+msgCols+` FROM messages m WHERE m.conversation_id = $1
+		AND (m.role IN ('user','assistant') OR m.role = 'notice' AND m.created_at < COALESCE((SELECT max(a.created_at) FROM messages a
+			WHERE a.conversation_id = $1 AND a.role = 'assistant' AND a.status = 'done'), '-infinity'::timestamptz))
 		AND m.created_at > COALESCE((SELECT max(e.created_at) FROM messages e WHERE e.conversation_id = $1 AND e.role = 'event'
 			AND e.event->>'kind' = 'reset'), '-infinity'::timestamptz)
 		ORDER BY m.created_at DESC, m.id DESC LIMIT $2`, conv, n)
@@ -523,4 +536,83 @@ func (s *Store) LastUserChannel(ctx context.Context, conv uuid.UUID) string {
 	var ch string
 	_ = s.Pool.QueryRow(ctx, `SELECT channel FROM messages WHERE conversation_id = $1 AND role = 'user' ORDER BY created_at DESC LIMIT 1`, conv).Scan(&ch)
 	return ch
+}
+
+// Notice is a notice of a product to store (FTR.NAB.CHAT-0002 R1).
+type Notice struct {
+	Text           string
+	Payload        json.RawMessage
+	IdempotencyKey string
+}
+
+// AddNotice stores a notice of a service client in a topic of the user, or
+// returns the one stored with the same key (R5); created tells which. A
+// topic of another user or an archived one is not found.
+func (s *Store) AddNotice(ctx context.Context, uid, conv, clientID uuid.UUID, channel string, n Notice) (m *Message, created bool, err error) {
+	err = postgres.InTx(ctx, s.Pool, func(tx pgx.Tx) error {
+		var ok bool
+		if err := tx.QueryRow(ctx, `SELECT true FROM conversations WHERE id = $1 AND user_id = $2 AND kind <> 'task' AND archived_at IS NULL FOR SHARE`,
+			conv, uid).Scan(&ok); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return apperr.NotFound("not_found", "conversation not found")
+			}
+			return err
+		}
+		var payload any
+		if len(n.Payload) > 0 {
+			payload = []byte(n.Payload)
+		}
+		m, err = scanMsg(tx.QueryRow(ctx, `WITH m AS (INSERT INTO messages (conversation_id, role, text, channel, client_id, payload, idempotency_key)
+			VALUES ($1,'notice',$2,$3,$4,$5,$6) ON CONFLICT (client_id, conversation_id, idempotency_key) WHERE idempotency_key IS NOT NULL
+			DO NOTHING RETURNING *) SELECT `+msgCols+` FROM m`, conv, n.Text, channel, clientID, payload, n.IdempotencyKey))
+		if postgres.IsNoRows(err) {
+			m, err = scanMsg(tx.QueryRow(ctx, `SELECT `+msgCols+` FROM messages m WHERE m.client_id = $1 AND m.conversation_id = $2
+				AND m.idempotency_key = $3`, clientID, conv, n.IdempotencyKey))
+			return err
+		}
+		if err != nil {
+			return err
+		}
+		created = true
+		_, err = tx.Exec(ctx, `UPDATE conversations SET last_message_at = now(), unread_count = unread_count + 1 WHERE id = $1`, conv)
+		return err
+	})
+	return m, created, err
+}
+
+// UnreadCount is the unread counter of a conversation.
+func (s *Store) UnreadCount(ctx context.Context, conv uuid.UUID) int {
+	var n int
+	_ = s.Pool.QueryRow(ctx, `SELECT unread_count FROM conversations WHERE id = $1`, conv).Scan(&n)
+	return n
+}
+
+// MaxTurnNotices bounds the notices put into one turn (FTR.NAB.CHAT-0002
+// tech §3.2): a product cannot swell the context of the agent.
+const MaxTurnNotices = 10
+
+// NoticesForTurn returns the notices the agent has not seen before the turn
+// that answers with the message answer: those after the last finished answer
+// and after the last reset, at most MaxTurnNotices of the latest, oldest first.
+func (s *Store) NoticesForTurn(ctx context.Context, conv, answer uuid.UUID) ([]Message, error) {
+	rows, err := s.Pool.Query(ctx, `SELECT `+msgCols+` FROM messages m WHERE m.conversation_id = $1 AND m.role = 'notice'
+		AND m.created_at > COALESCE((SELECT max(a.created_at) FROM messages a WHERE a.conversation_id = $1 AND a.role = 'assistant'
+			AND a.status = 'done' AND a.id <> $2), '-infinity'::timestamptz)
+		AND m.created_at > COALESCE((SELECT max(e.created_at) FROM messages e WHERE e.conversation_id = $1 AND e.role = 'event'
+			AND e.event->>'kind' = 'reset'), '-infinity'::timestamptz)
+		ORDER BY m.created_at DESC, m.id DESC LIMIT $3`, conv, answer, MaxTurnNotices)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Message
+	for rows.Next() {
+		m, err := scanMsg(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *m)
+	}
+	slices.Reverse(out)
+	return out, rows.Err()
 }

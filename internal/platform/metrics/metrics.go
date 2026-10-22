@@ -192,6 +192,13 @@ var (
 	SkillInvocations = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nabu_skill_invocations_total", Help: "Explicit calls of skills by result (ok, unavailable).",
 	}, []string{"result"})
+	// FTR.NAB.CHAT-0002 arch §7.
+	Notices = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_notices_total", Help: "Notices of products in topics by client and result (created, duplicate, not_found, invalid).",
+	}, []string{"client", "result"})
+	ProductMCPCalls = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_product_mcp_calls_total", Help: "Delegated calls of the MCP of products by item and whether they carry the context of a turn (yes, no).",
+	}, []string{"item", "turn_context"})
 	PromptImages = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nabu_prompt_images_total", Help: "Images of user messages by where they went (model, space).",
 	}, []string{"delivered"})
@@ -214,6 +221,6 @@ var (
 )
 
 func init() {
-	Registry.MustRegister(ContextEvents, SkillInvocations, PromptImages, ModelsRefresh, GigaChatBridge, GigaChatTokens,
+	Registry.MustRegister(ContextEvents, SkillInvocations, Notices, ProductMCPCalls, PromptImages, ModelsRefresh, GigaChatBridge, GigaChatTokens,
 		Transcriptions, TranscriptionSeconds)
 }

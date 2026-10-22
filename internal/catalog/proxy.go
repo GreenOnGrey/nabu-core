@@ -50,16 +50,34 @@ func (s *Service) ProxyRoutes(r chi.Router, userEmail UserEmail, hold Hold) {
 func (s *Service) SetUserEmail(fn UserEmail) { s.userEmail = fn }
 
 // delegationHeaders sign a Nabu JWT for the product of a delegation item and
-// name the user (R23: the product checks the signature by Nabu's JWKS).
-func (s *Service) delegationHeaders(it *Item, email string) map[string]string {
+// name the user (R23: the product checks the signature by Nabu's JWKS). In a
+// turn of the agent the JWT names its topic and the channel of the message
+// that began it (FTR.NAB.CHAT-0002 R6, R7).
+func (s *Service) delegationHeaders(ctx context.Context, it *Item, email string) map[string]string {
 	aud := it.PersonalAuth.Audience
 	if aud == "" {
 		aud = it.Name
 	}
+	c := jwt.Claims{Audience: aud, Subject: "nabu", Email: email}
+	turn := "no"
+	if t, ok := ctx.Value(turnKey{}).(turnContext); ok && t.conversation != "" {
+		c.Conversation, c.Channel, turn = t.conversation, t.channel, "yes"
+	}
+	metrics.ProductMCPCalls.WithLabelValues(it.Name, turn).Inc()
 	return map[string]string{
-		"Authorization":  "Bearer " + s.Signer.Issue(jwt.Claims{Audience: aud, Subject: "nabu", Email: email}, 10*time.Minute),
+		"Authorization":  "Bearer " + s.Signer.Issue(c, 10*time.Minute),
 		DelegationHeader: email,
 	}
+}
+
+type turnKey struct{}
+
+type turnContext struct{ conversation, channel string }
+
+// withTurn carries the topic of a turn and the channel of its message to the
+// delegated calls of the request (FTR.NAB.CHAT-0002 arch §5).
+func withTurn(ctx context.Context, conversation, channel string) context.Context {
+	return context.WithValue(ctx, turnKey{}, turnContext{conversation, channel})
 }
 
 // callGranted checks a call against the access of the user of the token or,
@@ -137,7 +155,7 @@ func (s *Service) itemHeaders(ctx context.Context, it *Item, uid uuid.UUID) (map
 	}
 	pa := it.PersonalAuth
 	if pa.Kind == "delegation" {
-		return s.delegationHeaders(it, mail), nil
+		return s.delegationHeaders(ctx, it, mail), nil
 	}
 	tok, err := s.userToken(ctx, uid, it)
 	if err != nil {
@@ -278,7 +296,13 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 	}
 	_ = json.Unmarshal(body, &call)
 	isCall := call.Method == "tools/call"
-	headers, perr := s.itemHeaders(r.Context(), it, uid)
+	ctx := r.Context()
+	// FTR.NAB.CHAT-0002 R6: the topic comes from the token of the session,
+	// the channel from the stored messages — never from the call
+	if conv, err := uuid.Parse(c.Conversation); err == nil && s.ChannelOf != nil {
+		ctx = withTurn(ctx, conv.String(), s.ChannelOf(ctx, conv))
+	}
+	headers, perr := s.itemHeaders(ctx, it, uid)
 	if perr != nil {
 		if isCall {
 			observe(it, call.Params.Name, "auth", 0)

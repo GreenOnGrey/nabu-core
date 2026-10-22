@@ -125,6 +125,9 @@ type Service struct {
 	GitToken string
 
 	userEmail UserEmail
+	// ChannelOf is the channel of the latest user message of a conversation:
+	// the channel of the turn named to products (FTR.NAB.CHAT-0002 R6).
+	ChannelOf func(ctx context.Context, conv uuid.UUID) string
 	// Files copies a file of the user's space for a file argument
 	// (FTR.NAB.CMN-0006 R14); nil — file arguments are refused.
 	Files FileSnapshot
@@ -503,7 +506,7 @@ func (s *Service) Check(ctx context.Context, id uuid.UUID, email string, admin u
 		switch it.PersonalAuth.Kind {
 		case "delegation":
 			if email != "" {
-				headers = s.delegationHeaders(it, email)
+				headers = s.delegationHeaders(ctx, it, email)
 			}
 		case "oauth", "token":
 			tok, err := s.userToken(ctx, admin, it)
