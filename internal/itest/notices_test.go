@@ -244,3 +244,54 @@ func TestProductTurnContext(t *testing.T) {
 		t.Fatalf("NX-05: %+v %v", claims, err)
 	}
 }
+
+// FTR.NAB.CHAT-0002 NX-07: the tools of a catalog item reach an open session.
+// An administrator allows a new tool of a product: the next turn opens the
+// session again from its snapshot, so the agent lists the new tool and keeps
+// the context; without a change the session is kept.
+func TestSessionCatalogChange(t *testing.T) {
+	ctx := context.Background()
+	r := newChatRig(t)
+	uid := newUser(t, "catalog-"+uuid.NewString()[:6]+"@x.org")
+	mode := "personal"
+	it, err := r.cat.Save(ctx, nil, catalog.Input{Type: "mcp", Name: "product-" + uuid.NewString()[:6], Source: &catalog.Source{Kind: "url", URL: "https://p/mcp"},
+		Mode: &mode, Published: ptr(true), PersonalAuth: &catalog.PersonalAuth{Kind: "delegation", Audience: "hammurapi"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.cat.Connect(ctx, uid, it.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = pool.Exec(ctx, `UPDATE catalog_items SET tools = '[{"name":"read_issue"}]', allowed_tools = '["read_issue"]' WHERE id = $1`, it.ID)
+	main, _ := r.api.Store.Main(ctx, uid)
+	turn := func(text string) {
+		t.Helper()
+		if _, err := r.api.Post(ctx, uid, nil, text, domain.ChannelWeb, nil, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		r.drain()
+	}
+	turn("раз")
+	opened := len(r.op.opened)
+	turn("два")
+	if len(r.op.opened) != opened {
+		t.Fatal("NX-07: the session is opened again without a change of the catalog")
+	}
+	// the administrator allows a new tool of the item
+	if _, err := pool.Exec(ctx, `UPDATE catalog_items SET tools = '[{"name":"read_issue"},{"name":"request_discovery_revision"}]',
+		allowed_tools = '["read_issue","request_discovery_revision"]' WHERE id = $1`, it.ID); err != nil {
+		t.Fatal(err)
+	}
+	turn("три")
+	if len(r.op.opened) != opened+1 {
+		t.Fatalf("NX-07: the session is not opened again after the change: %d → %d", opened, len(r.op.opened))
+	}
+	if last := r.op.opened[len(r.op.opened)-1]; len(last.Snapshot) == 0 {
+		t.Fatal("NX-07: the session is not restored from its snapshot — the context is lost")
+	}
+	var open int
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM harness_sessions WHERE conversation_id = $1 AND closed_at IS NULL`, main.ID).Scan(&open)
+	if open != 1 {
+		t.Fatalf("NX-07: %d open sessions", open)
+	}
+}

@@ -124,6 +124,8 @@ type built struct {
 	model   agent.ModelSpec
 	// group is set in the session of a group agent.
 	group *groups.Agent
+	// mcpHash is the fingerprint of the catalog items of the session (FTR.NAB.CHAT-0002 tech §3.3).
+	mcpHash string
 }
 
 // personalRequest builds the session of a personal agent: the model, the
@@ -179,7 +181,7 @@ func (e *Engine) personalRequest(ctx context.Context, u *users.User, conv uuid.U
 	}
 	p := Persona{User: u, Agent: ag, Memory: mem, Spaces: e.Space.Enabled, Now: time.Now(), Catalog: titles}
 	req.SystemAppend = p.Instructions()
-	return &built{req: req, persona: p, secrets: secrets, model: model}, nil
+	return &built{req: req, persona: p, secrets: secrets, model: model, mcpHash: cat.Fingerprint}, nil
 }
 
 func (e *Engine) bundle(hash string) func(ctx context.Context) ([]byte, error) {
@@ -216,6 +218,8 @@ type convSession struct {
 	ContextTokens, ContextWindow int64
 	// Fresh: the session was opened for this turn (the first-token metric).
 	Fresh bool
+	// MCPHash is the fingerprint of the catalog items the session was opened with.
+	MCPHash string
 }
 
 func snapshotKey(conv uuid.UUID) string { return "sessions/" + conv.String() + ".jsonl" }
@@ -224,9 +228,9 @@ func (e *Engine) loadSession(ctx context.Context, conv uuid.UUID) (*convSession,
 	var s convSession
 	var model *string
 	err := e.Pool.QueryRow(ctx, `SELECT id, COALESCE(operator_session,''), COALESCE(persona_hash,''), model, last_active_at, COALESCE(pod_generation, 0),
-		context_tokens, context_window
+		context_tokens, context_window, mcp_hash
 		FROM harness_sessions WHERE conversation_id = $1 AND closed_at IS NULL`, conv).Scan(&s.ID, &s.OpSession, &s.PersonaHash, &model, &s.OpenedAt, &s.Generation,
-		&s.ContextTokens, &s.ContextWindow)
+		&s.ContextTokens, &s.ContextWindow, &s.MCPHash)
 	if postgres.IsNoRows(err) {
 		return nil, nil
 	}
@@ -246,7 +250,10 @@ func (e *Engine) ensureSession(ctx context.Context, lease *agentpods.Lease, conv
 	}
 	// LC-06: a session of a previous start of the pod went with that pod.
 	gone := cur != nil && cur.Generation != lease.Generation()
-	if cur != nil && !fresh && !gone && cur.OpSession != "" && time.Since(cur.OpenedAt) < e.Cfg.SessionMaxAge {
+	// FTR.NAB.CHAT-0002 tech §3.3: the tools of the catalog are listed when a
+	// session opens; a session whose items changed opens again from its snapshot
+	stale := cur != nil && cur.MCPHash != b.mcpHash
+	if cur != nil && !fresh && !gone && !stale && cur.OpSession != "" && time.Since(cur.OpenedAt) < e.Cfg.SessionMaxAge {
 		return cur, nil
 	}
 	if cur != nil {
@@ -277,16 +284,16 @@ func (e *Engine) ensureSession(ctx context.Context, lease *agentpods.Lease, conv
 		return nil, err
 	}
 	s := &convSession{OpSession: resp.SessionID, PersonaHash: b.persona.Hash(), Model: b.model.ConnectionID + "/" + b.model.ModelID + "/" + b.model.Thinking,
-		OpenedAt: time.Now(), Generation: lease.Generation(), Fresh: true}
+		OpenedAt: time.Now(), Generation: lease.Generation(), Fresh: true, MCPHash: b.mcpHash}
 	if req.Snapshot != nil { // the restored session has the context of the closed one
 		s.ContextTokens, s.ContextWindow = carried.Tokens, carried.Window
 	}
-	const ins = `INSERT INTO harness_sessions (conversation_id, harness, operator_session, persona_hash, model, snapshot_key, pod_generation, context_tokens, context_window)
-		VALUES ($1,'pi',$2,$3,$4,$5,$6,$7,$8) RETURNING id`
-	err = e.Pool.QueryRow(ctx, ins, conv, s.OpSession, s.PersonaHash, s.Model, snapshotKey(conv), s.Generation, s.ContextTokens, s.ContextWindow).Scan(&s.ID)
+	const ins = `INSERT INTO harness_sessions (conversation_id, harness, operator_session, persona_hash, model, snapshot_key, pod_generation, context_tokens, context_window, mcp_hash)
+		VALUES ($1,'pi',$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`
+	err = e.Pool.QueryRow(ctx, ins, conv, s.OpSession, s.PersonaHash, s.Model, snapshotKey(conv), s.Generation, s.ContextTokens, s.ContextWindow, s.MCPHash).Scan(&s.ID)
 	if postgres.IsUniqueViolation(err) {
 		_, _ = e.Pool.Exec(ctx, `UPDATE harness_sessions SET closed_at = now() WHERE conversation_id = $1 AND closed_at IS NULL`, conv)
-		err = e.Pool.QueryRow(ctx, ins, conv, s.OpSession, s.PersonaHash, s.Model, snapshotKey(conv), s.Generation, s.ContextTokens, s.ContextWindow).Scan(&s.ID)
+		err = e.Pool.QueryRow(ctx, ins, conv, s.OpSession, s.PersonaHash, s.Model, snapshotKey(conv), s.Generation, s.ContextTokens, s.ContextWindow, s.MCPHash).Scan(&s.ID)
 	}
 	return s, err
 }

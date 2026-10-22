@@ -12,6 +12,8 @@ package catalog
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -712,6 +714,10 @@ type SessionMCP struct {
 	Skills  []string
 	// SkillSnapshots maps a skill to its snapshot hash.
 	SkillSnapshots map[string]string
+	// Fingerprint changes when an MCP item of the session, its tools or the
+	// tools the administrator allowed change: the session is opened again
+	// (FTR.NAB.CHAT-0002 tech §3.3).
+	Fingerprint string
 }
 
 // ForGroup lists the MCP servers and skills of a group agent session
@@ -779,7 +785,8 @@ func (s *Service) ProxyToken(uid uuid.UUID, item uuid.UUID, ch, conv string, ttl
 // ForSession resolves the user's connected items (CAT-01: connections take
 // effect in the next session).
 func (s *Service) ForSession(ctx context.Context, uid uuid.UUID, ch, conv string, ttl time.Duration) (*SessionMCP, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT c.id, c.type, c.name, COALESCE(c.title,''), COALESCE(c.description,''), c.exposure, c.skills, c.skills_snapshot
+	rows, err := s.Pool.Query(ctx, `SELECT c.id, c.type, c.name, COALESCE(c.title,''), COALESCE(c.description,''), c.exposure, c.skills, c.skills_snapshot,
+			md5(COALESCE(c.tools::text, '') || '|' || COALESCE(c.allowed_tools::text, '') || '|' || c.exposure)
 		FROM catalog_items c JOIN user_connections u ON u.item_id = c.id AND u.user_id = $1
 		WHERE c.published AND NOT c.in_development ORDER BY c.name`, uid)
 	if err != nil {
@@ -791,18 +798,21 @@ func (s *Service) ForSession(ctx context.Context, uid uuid.UUID, ch, conv string
 	if err != nil {
 		return nil, err
 	}
+	fp := sha256.New()
+	defer func() { out.Fingerprint = hex.EncodeToString(fp.Sum(nil)) }()
 	for rows.Next() {
 		var id uuid.UUID
-		var typ, name, title, desc, exposure string
+		var typ, name, title, desc, exposure, toolsHash string
 		var skills []byte
 		var snap *string
-		if err := rows.Scan(&id, &typ, &name, &title, &desc, &exposure, &skills, &snap); err != nil {
+		if err := rows.Scan(&id, &typ, &name, &title, &desc, &exposure, &skills, &snap, &toolsHash); err != nil {
 			return nil, err
 		}
 		if g != nil && !g[id] { // FTR.NAB.CMN-0007 R10, R11: connected, but no longer granted
 			continue
 		}
 		if typ == "mcp" {
+			fp.Write([]byte(name + ":" + toolsHash + ";"))
 			d := title
 			if desc != "" {
 				d = strings.TrimSpace(title + ": " + desc)
