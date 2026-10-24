@@ -1,0 +1,20 @@
+# Python libraries of the base sandbox profile (FTR.NAB.CMN-0008 R2). The
+# image installs them from uv.lock with hashes into /opt/py; `make
+# sandbox-lock` updates the lock.
+[project]
+name = "nabu-sandbox-base"
+version = "0"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "charset-normalizer",
+    "jinja2",
+    "openpyxl",
+    "pillow",
+    "pypdf",
+    "python-dateutil",
+    "pyyaml",
+    "tabulate",
+]
+
+[tool.uv]
+package = false

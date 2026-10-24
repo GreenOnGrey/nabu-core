@@ -450,6 +450,23 @@ func TestClientsAndRuns(t *testing.T) {
 	if err != nil || len(sm.Servers) != 1 || !strings.Contains(sm.Servers[0].URL, "/internal/v1/mcp-proxy/") {
 		t.Fatalf("%+v %v", sm, err)
 	}
+	// FTR.NAB.CHAT-0003 R17: the rule of documents follows the tool render_document the agent gets,
+	// also from an item without the list of allowed tools (the old rule of read_only)
+	documents := func(allowed any, readOnly bool) bool {
+		t.Helper()
+		if _, err := pool.Exec(ctx, `UPDATE catalog_items SET tools = '[{"name":"render_document"},{"name":"convert"}]', allowed_tools = $2, read_only = $3
+			WHERE id = $1`, it.ID, allowed, readOnly); err != nil {
+			t.Fatal(err)
+		}
+		sm, err := cat.ForSession(ctx, uid, "web", "", time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sm.Documents
+	}
+	if !documents(nil, false) || documents(nil, true) || !documents(`["render_document"]`, true) || documents(`["convert"]`, false) {
+		t.Fatal("R17: Documents follows render_document")
+	}
 	items, _ := cat.ForUser(ctx, uid)
 	for _, i := range items {
 		if strings.Contains(strings.ToLower(i.Name+i.Title), "hammurapi") {

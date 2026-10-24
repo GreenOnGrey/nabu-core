@@ -49,6 +49,7 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/memory"
 	"github.com/GreenOnGrey/nabu-core/internal/models"
 	"github.com/GreenOnGrey/nabu-core/internal/models/gigachat"
+	"github.com/GreenOnGrey/nabu-core/internal/pkgsignals"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/agent"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/agent/operator"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/crypto"
@@ -62,7 +63,9 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/platform/postgres"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/storage"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/whisper"
+	"github.com/GreenOnGrey/nabu-core/internal/preview"
 	"github.com/GreenOnGrey/nabu-core/internal/relay"
+	"github.com/GreenOnGrey/nabu-core/internal/sandboxprofile"
 	"github.com/GreenOnGrey/nabu-core/internal/services"
 	"github.com/GreenOnGrey/nabu-core/internal/space"
 	"github.com/GreenOnGrey/nabu-core/internal/tasks"
@@ -86,11 +89,14 @@ type core struct {
 	tasks     *tasks.Service
 	space     *space.Service
 	snapshots *space.Snapshots
-	chat      *chat.Store
-	services  *services.Service
-	ledger    *ledger.Ledger
-	clients   *clients.Service
-	producer  *kafka.Producer
+	// FTR.NAB.CMN-0008: sandbox profiles and requests of libraries.
+	profiles *sandboxprofile.Service
+	pkgs     *pkgsignals.Service
+	chat     *chat.Store
+	services *services.Service
+	ledger   *ledger.Ledger
+	clients  *clients.Service
+	producer *kafka.Producer
 	// FTR.NAB.CMN-0002: channels, group agents, accounts.
 	registry *channels.Registry
 	access   *access.Service
@@ -177,16 +183,23 @@ func newCore(ctx context.Context, cfg *config.Config) (*core, error) {
 	}
 	c.space = &space.Service{Pool: pool, S3: s3, Signer: signer, Events: pub, Quota: cfg.SpaceQuota, MaxFile: cfg.UploadMaxBytes,
 		Enabled: cfg.SandboxExecutor == "k8s"}
+	c.profiles = &sandboxprofile.Service{Pool: pool, Cfg: sandboxprofile.Config{Profiles: cfg.SandboxProfiles, Defaults: cfg.SandboxDefaults,
+		LegacyImage: cfg.SandboxImage, CustomImages: cfg.SandboxCustomImages, Prefixes: cfg.SandboxImagePrefixes, ProfilesDir: "/opt/nabu/profiles"}}
+	c.pkgs = &pkgsignals.Service{Pool: pool, Profiles: c.profiles, Signer: signer}
+	if c.space.Enabled {
+		c.space.Profiles = c.profiles
+	}
 	// FTR.NAB.CMN-0006 R14: file arguments of catalog MCP servers
 	c.snapshots = &space.Snapshots{Space: c.space, Relay: &space.RelayStore{Pool: pool, Events: pub}}
 	if c.space.Enabled {
 		c.snapshots.RelayURL = cfg.RelayInternalURL
 	}
 	c.catalog.Files = c.snapshots.Snapshot
+	c.catalog.Results = c.snapshots // FTR.NAB.CHAT-0003 R10
 	c.chat = &chat.Store{Pool: pool}
 	c.services = &services.Service{Pool: pool, Models: c.models, Signer: signer, Bus: producer, Events: pub,
 		RelayPublicURL: cfg.RelayPublicWSURL, PublicAPIURL: cfg.PublicAPIURL, WorkspaceTTL: 12 * time.Hour,
-		Harnesses: []services.Harness{{Name: "pi", Version: cfg.PiVersion, Status: "ok"}}}
+		Harnesses: []services.Harness{{Name: "pi", Version: cfg.PiVersion, Status: "ok"}}, ProfileReady: c.profiles.Ready}
 	c.ledger = &ledger.Ledger{Pool: pool}
 	c.clients = &clients.Service{Pool: pool, Signer: signer}
 
@@ -411,10 +424,12 @@ type PublicConfig struct {
 	UploadMaxBytes  int64    `json:"uploadMaxBytes"`
 	Voice           bool     `json:"voice"`
 	// VoiceMaxSeconds bounds a recording of the site (FTR.NAB.CHAT-0001 R20).
-	VoiceMaxSeconds int             `json:"voiceMaxSeconds"`
-	Spaces          bool            `json:"spaces"`
-	Channels        map[string]bool `json:"channels"`
-	Version         string          `json:"version"`
+	VoiceMaxSeconds int  `json:"voiceMaxSeconds"`
+	Spaces          bool `json:"spaces"`
+	// PreviewOffice: documents and spreadsheets open in the preview (FTR.NAB.CHAT-0003 R22).
+	PreviewOffice bool            `json:"previewOffice"`
+	Channels      map[string]bool `json:"channels"`
+	Version       string          `json:"version"`
 	// BootstrapAdminsConfigured lets deploy checks confirm the first administrator.
 	BootstrapAdminsConfigured bool `json:"bootstrapAdminsConfigured"`
 }
@@ -437,9 +452,40 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 	if err := c.models.Bootstrap(ctx, cfg.BootstrapLLMType, cfg.BootstrapLLMURL, cfg.BootstrapLLMKey); err != nil {
 		slog.Error("bootstrap model connection", "err", err)
 	}
+	// FTR.NAB.CMN-0008 tech §5.2: the built-in profiles of this version.
+	c.profiles.Cfg.Version = version
+	if ms, err := c.profiles.SyncBuiltins(ctx); err != nil {
+		slog.Error("sync sandbox profiles", "err", err)
+	} else {
+		for _, m := range ms {
+			if err := c.pkgs.MarkAdded(ctx, m); err != nil {
+				slog.Warn("mark added packages", "profile", m.Name, "err", err)
+			}
+		}
+	}
 	if err := c.catalog.StarterCatalog(ctx); err != nil {
 		slog.Error("starter catalog", "err", err)
 	}
+	// FTR.NAB.CHAT-0003 tech §6: previews of office files
+	previews := &preview.Service{Pool: c.pool, S3: c.s3, Cfg: preview.Config{ConvertURL: cfg.PreviewConvertURL, ConvertUser: cfg.PreviewConvertUser,
+		ConvertPassword: cfg.PreviewConvertPassword, LegacyURL: cfg.PreviewLegacyURL, DocgenURL: cfg.PreviewDocgenURL, DocgenKey: cfg.PreviewDocgenKey,
+		MaxBytes: cfg.PreviewMaxBytes, Parallel: cfg.PreviewParallel}}
+	go func() {
+		t := time.NewTicker(time.Hour)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if n, err := previews.Sweep(ctx); err != nil {
+					slog.Warn("sweep previews", "err", err)
+				} else if n > 0 {
+					slog.Info("cleaned", "what", "previews", "objects", n)
+				}
+			}
+		}
+	}()
 	// FTR.NAB.CMN-0006 tech §3.6: copies of files for MCP servers live an hour
 	go func() {
 		t := time.NewTicker(10 * time.Minute)
@@ -489,7 +535,7 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 			}
 		}}
 	pubCfg := PublicConfig{AuthProvider: prov.Kind(), ProviderLabel: prov.Label(), AllowedOrg: cfg.GitHubAllowedOrg, Languages: domain.Languages,
-		DefaultLanguage: cfg.DefaultLanguage, UploadMaxBytes: cfg.UploadMaxBytes, Voice: c.chatAPI.Whisper != nil,
+		DefaultLanguage: cfg.DefaultLanguage, UploadMaxBytes: cfg.UploadMaxBytes, Voice: c.chatAPI.Whisper != nil, PreviewOffice: previews.Cfg.Enabled(),
 		VoiceMaxSeconds: c.chatAPI.MaxVoiceSeconds, Spaces: c.space.Enabled,
 		Version: version, BootstrapAdminsConfigured: len(cfg.BootstrapAdmins) > 0}
 	if prov.Kind() == "oidc" {
@@ -545,6 +591,7 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 			r.Group(func(r chi.Router) {
 				r.Use(auth.RequireActive)
 				chatAPI.Routes(r, true)
+				previews.Routes(r)
 				c.memory.Routes(r)
 				c.commAPI(cfg).Routes(r)
 				c.tasks.Routes(r)
@@ -578,6 +625,8 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 		r.Get("/voice", whisper.StatusHandler(cfg.WhisperURL, wc))
 		c.catalog.AdminRoutes(r, cfg.SecretsKey)
 		c.services.AdminRoutes(r)
+		c.profiles.AdminRoutes(r)
+		c.pkgs.AdminRoutes(r)
 		c.clients.AdminRoutes(r)
 		c.ledger.AdminRoutes(r)
 		c.chanAPI.AdminRoutes(r)
@@ -620,6 +669,9 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 
 	builtin.Register(c.memory.Tools()...)
 	builtin.Register(c.space.Tool())
+	if c.space.Enabled {
+		builtin.Register(c.pkgs.Tool()) // FTR.NAB.CMN-0008 R10
+	}
 	builtin.Register(chatAPI.AttachTool(func(ctx context.Context, uid uuid.UUID, p string, max int64) ([]byte, error) {
 		data, err := c.snapshots.Read(ctx, uid, p, max)
 		switch {
@@ -654,6 +706,8 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 		return confirms.Hold(ctx, conv, uid, &item, server, tool, args)
 	})
 	c.space.InternalRoutes(internal)
+	c.profiles.InternalRoutes(internal, c.signer)
+	c.pkgs.InternalRoutes(internal)
 
 	api := &http.Server{Addr: cfg.HTTPAddr, Handler: otelhttp.NewHandler(r, "http"), ReadHeaderTimeout: 15 * time.Second}
 	internalHTTP := &http.Server{Addr: cfg.InternalAddr, Handler: otelhttp.NewHandler(internal, "internal"), ReadHeaderTimeout: 15 * time.Second}
@@ -678,7 +732,8 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 	if cfg.SandboxExecutor == "k8s" {
 		sandboxes = &space.Sandboxes{Pool: c.pool, K8s: k8s.NewInCluster(), Space: c.space, Events: c.events, Cfg: space.SandboxConfig{
 			Namespace: cfg.SandboxNamespace, Image: cfg.SandboxImage, CPU: cfg.SandboxCPU, Memory: cfg.SandboxMemory, Quota: cfg.SpaceQuota,
-			IdleTimeout: cfg.SandboxIdleTimeout, RelayURL: cfg.RelaySandboxWSURL, APIURL: cfg.InternalURL, Exclude: cfg.SandboxExclude, TokenTTL: 7 * 24 * time.Hour}}
+			IdleTimeout: cfg.SandboxIdleTimeout, RelayURL: cfg.RelaySandboxWSURL, APIURL: cfg.InternalURL, Exclude: cfg.SandboxExclude, TokenTTL: 7 * 24 * time.Hour,
+			InitImage: cfg.SandboxInitImage, PullSecrets: cfg.SandboxPullSecrets}, Profiles: c.profiles}
 	}
 	hub := events.NewHub()
 	go hub.Listen(ctx, c.pool)
@@ -782,6 +837,20 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 	g.Go(func() error { pods.Run(gctx); return nil }) // one manager of agent pods per instance (advisory lock)
 	if sandboxes != nil {
 		g.Go(func() error { sandboxes.Run(gctx); return nil })
+		// FTR.NAB.CMN-0008 tech §5.6, §5.7: checks of custom images and the
+		// preloading of the images of assigned profiles.
+		profiles := &sandboxprofile.Worker{Profiles: c.profiles, K8s: sandboxes.K8s, Signer: c.signer,
+			Cfg: sandboxprofile.WorkerConfig{Namespace: cfg.SandboxNamespace, InitImage: cfg.SandboxInitImage, PullSecrets: cfg.SandboxPullSecrets,
+				ProbeTimeout: cfg.SandboxProbeTimeout, APIURL: cfg.InternalURL},
+			OnReady: func(ctx context.Context, m sandboxprofile.Manifest) {
+				if err := c.pkgs.MarkAdded(ctx, m); err != nil {
+					slog.Warn("mark added packages", "profile", m.Name, "err", err)
+				}
+			}}
+		g.Go(func() error {
+			postgres.RunLocked(gctx, c.pool, "sandbox-profiles", time.Minute, profiles.Run)
+			return nil
+		})
 	}
 	g.Go(func() error {
 		maintenance := func() {
@@ -938,8 +1007,10 @@ func RunCleaner(ctx context.Context, cfg *config.Config) error {
 		"jobs":        `DELETE FROM account_jobs WHERE finished_at < now() - interval '30 days'`,
 		"oauth":       `DELETE FROM oauth_states WHERE expires_at < now()`,
 		"run events":  `DELETE FROM run_events WHERE created_at < now() - interval '30 days'`,
-		"connections": `DELETE FROM workspace_connections WHERE last_ping_at < now() - interval '10 minutes'`,
-		"harness":     `DELETE FROM harness_sessions WHERE closed_at < now() - interval '30 days'`,
+		// FTR.NAB.CMN-0008 R12
+		"package signals": `DELETE FROM package_signals WHERE day < current_date - 180`,
+		"connections":     `DELETE FROM workspace_connections WHERE last_ping_at < now() - interval '10 minutes'`,
+		"harness":         `DELETE FROM harness_sessions WHERE closed_at < now() - interval '30 days'`,
 	} {
 		tag, err := pool.Exec(ctx, q)
 		if err != nil {

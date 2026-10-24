@@ -106,6 +106,21 @@ type Config struct {
 	SpaceQuota         int64
 	SandboxEgressAllow []string
 	SandboxExclude     []string
+	// FTR.NAB.CMN-0008: built-in profiles (name → image), default
+	// assignments (personal, group, service → profile), the image of the
+	// init container that puts the nabu binary into a sandbox, custom images.
+	SandboxProfiles      map[string]string
+	SandboxDefaults      map[string]string
+	SandboxInitImage     string
+	SandboxCustomImages  bool
+	SandboxImagePrefixes []string
+	SandboxPullSecrets   []string
+	SandboxProbeTimeout  time.Duration
+	// FTR.NAB.CHAT-0003 tech §6.1: the converters of previews of office files.
+	PreviewConvertURL, PreviewConvertUser, PreviewConvertPassword string
+	PreviewLegacyURL, PreviewDocgenURL, PreviewDocgenKey          string
+	PreviewMaxBytes                                               int64
+	PreviewParallel                                               int
 
 	AuditRetention    time.Duration
 	TopicArchiveAfter time.Duration
@@ -213,6 +228,25 @@ func (p *parser) bool(k string, def bool) bool {
 	return b
 }
 
+// pairs reads a list of name=value (SANDBOX_PROFILES=base=ghcr.io/…,documents=…).
+func (p *parser) pairs(k string) map[string]string {
+	out := map[string]string{}
+	for _, f := range list(k) {
+		name, value, ok := strings.Cut(f, "=")
+		name, value = strings.TrimSpace(name), strings.TrimSpace(value)
+		if !ok || name == "" || value == "" {
+			p.errs = append(p.errs, fmt.Errorf("%s: %q is not name=value", k, f))
+			continue
+		}
+		if _, dup := out[name]; dup {
+			p.errs = append(p.errs, fmt.Errorf("%s: %s is given twice", k, name))
+			continue
+		}
+		out[name] = value
+	}
+	return out
+}
+
 func (p *parser) bytes(k, def string) int64 {
 	n, err := ParseBytes(env(k, def))
 	if err != nil {
@@ -305,7 +339,15 @@ func Load() (*Config, error) {
 		SandboxImage: os.Getenv("SANDBOX_IMAGE"), SandboxIdleTimeout: p.dur("SANDBOX_IDLE_TIMEOUT", "30m"),
 		SandboxCPU: env("SANDBOX_CPU", "1"), SandboxMemory: env("SANDBOX_MEMORY", "1Gi"),
 		SpaceQuota: p.bytes("SPACE_QUOTA", "5GB"), SandboxEgressAllow: list("SANDBOX_EGRESS_ALLOW"),
-		SandboxExclude: append([]string{"node_modules/", ".venv/", "__pycache__/", "*.tmp"}, list("SANDBOX_EXCLUDE")...),
+		SandboxExclude:  append([]string{"node_modules/", ".venv/", "__pycache__/", "*.tmp"}, list("SANDBOX_EXCLUDE")...),
+		SandboxProfiles: p.pairs("SANDBOX_PROFILES"), SandboxDefaults: p.pairs("SANDBOX_DEFAULTS"),
+		SandboxInitImage: os.Getenv("SANDBOX_INIT_IMAGE"), SandboxCustomImages: p.bool("SANDBOX_CUSTOM_IMAGES", false),
+		SandboxImagePrefixes: list("SANDBOX_IMAGE_PREFIXES"), SandboxPullSecrets: list("SANDBOX_PULL_SECRETS"),
+		SandboxProbeTimeout: p.dur("SANDBOX_PROBE_TIMEOUT", "5m"),
+		PreviewConvertURL:   os.Getenv("PREVIEW_CONVERT_URL"), PreviewConvertUser: os.Getenv("PREVIEW_CONVERT_USER"),
+		PreviewConvertPassword: os.Getenv("PREVIEW_CONVERT_PASSWORD"), PreviewLegacyURL: os.Getenv("PREVIEW_LEGACY_URL"),
+		PreviewDocgenURL: os.Getenv("PREVIEW_DOCGEN_URL"), PreviewDocgenKey: os.Getenv("PREVIEW_DOCGEN_KEY"),
+		PreviewMaxBytes: p.bytes("PREVIEW_MAX_BYTES", "25MB"), PreviewParallel: p.int("PREVIEW_PARALLEL", 2),
 
 		AuditRetention: p.dur("AUDIT_RETENTION", "365d"), TopicArchiveAfter: p.dur("TOPIC_ARCHIVE_AFTER", "14d"),
 
@@ -328,6 +370,17 @@ func Load() (*Config, error) {
 
 		BootstrapLLMKey: os.Getenv("BOOTSTRAP_LLM_API_KEY"), BootstrapLLMURL: env("BOOTSTRAP_LLM_BASE_URL", "https://api.deepseek.com"),
 		BootstrapLLMType: env("BOOTSTRAP_LLM_TYPE", "deepseek"),
+	}
+	if len(c.SandboxPullSecrets) == 0 {
+		c.SandboxPullSecrets = []string{"ghcr-pull"}
+	}
+	if c.SandboxInitImage == "" {
+		c.SandboxInitImage = c.AgentImage
+	}
+	for _, t := range []string{"personal", "group", "service"} {
+		if c.SandboxDefaults[t] == "" {
+			c.SandboxDefaults[t] = "base"
+		}
 	}
 	c.RelayInternalURL = strings.TrimRight(env("RELAY_INTERNAL_URL", "http://localhost"+c.RelayAddr), "/")
 	c.RelaySandboxWSURL = env("RELAY_SANDBOX_WS_URL", strings.Replace(c.RelayInternalURL, "http", "ws", 1)+"/v1/workspaces/connect")
@@ -393,10 +446,63 @@ func (c *Config) Validate(mode string) error {
 			errs = append(errs, fmt.Errorf("AGENT_POD_MIN_IDLE must be less than AGENT_POD_IDLE_TIMEOUT"))
 		}
 		if c.SandboxExecutor == "k8s" {
-			need("SANDBOX_IMAGE", c.SandboxImage)
+			if len(c.SandboxProfiles) == 0 {
+				need("SANDBOX_IMAGE", c.SandboxImage)
+			} else {
+				need("SANDBOX_INIT_IMAGE", c.SandboxInitImage)
+			}
 		} else if c.SandboxExecutor != "none" {
 			errs = append(errs, fmt.Errorf("SANDBOX_EXECUTOR must be k8s or none"))
 		}
 	}
+	errs = append(errs, c.validateSandboxProfiles()...)
 	return errors.Join(errs...)
+}
+
+// validateSandboxProfiles checks the profiles of FTR.NAB.CMN-0008: defaults
+// name declared profiles (base without SANDBOX_PROFILES), custom images need
+// prefixes that end with a slash.
+func (c *Config) validateSandboxProfiles() []error {
+	var errs []error
+	for t, name := range c.SandboxDefaults {
+		switch t {
+		case "personal", "group", "service":
+		default:
+			errs = append(errs, fmt.Errorf("SANDBOX_DEFAULTS: unknown target %q (personal, group, service)", t))
+			continue
+		}
+		if _, ok := c.SandboxProfiles[name]; !ok && !(len(c.SandboxProfiles) == 0 && name == "base") {
+			errs = append(errs, fmt.Errorf("SANDBOX_DEFAULTS: %s=%s is not in SANDBOX_PROFILES", t, name))
+		}
+	}
+	for name := range c.SandboxProfiles {
+		if !ProfileName(name) {
+			errs = append(errs, fmt.Errorf("SANDBOX_PROFILES: bad profile name %q", name))
+		}
+	}
+	if c.SandboxCustomImages {
+		if len(c.SandboxImagePrefixes) == 0 {
+			errs = append(errs, errors.New("SANDBOX_IMAGE_PREFIXES is required with SANDBOX_CUSTOM_IMAGES"))
+		}
+		for _, pfx := range c.SandboxImagePrefixes {
+			if !strings.HasSuffix(pfx, "/") {
+				errs = append(errs, fmt.Errorf("SANDBOX_IMAGE_PREFIXES: %q must end with /", pfx))
+			}
+		}
+	}
+	return errs
+}
+
+// ProfileName tells a valid name of a sandbox profile: lower case letters,
+// digits and dashes, up to 40 characters (FTR.NAB.CMN-0008 tech §4).
+func ProfileName(s string) bool {
+	if s == "" || len(s) > 40 || s[0] == '-' {
+		return false
+	}
+	for _, r := range s {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+			return false
+		}
+	}
+	return true
 }

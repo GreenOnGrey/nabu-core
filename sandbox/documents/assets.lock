@@ -1,0 +1,7 @@
+# Binary tools and HTML assets of the documents sandbox profile (FTR.NAB.CMN-0008 R3, R4).
+# name	version	sha256	url	members (comma-separated paths inside the archive)	destination
+typst	0.15.1	a6d077d0a95eed5a2eba715b2dae06be954f624ccbf85758a03f389ded33118c	https://github.com/typst/typst/releases/download/v0.15.1/typst-x86_64-unknown-linux-musl.tar.xz	typst-x86_64-unknown-linux-musl/typst	/usr/local/bin
+chart.js	4.6.1	9345dacdf4bb4c5d40321f4b9aafab6fe676d37a534fc0bc2d17c4c4e29c4f00	https://registry.npmjs.org/chart.js/-/chart.js-4.6.1.tgz	package/dist/chart.umd.min.js	/opt/nabu/assets/chart.js
+echarts	6.1.0	681aff88cc1038c3fa941a3a53d1b177a52250b05335efc607d6105ae13be481	https://registry.npmjs.org/echarts/-/echarts-6.1.0.tgz	package/dist/echarts.min.js	/opt/nabu/assets/echarts
+mermaid	12.2.0	071914164d0f6d53e5c26a10a220230d4ae8d37ed0f2263fbf072266f0af3a0a	https://registry.npmjs.org/mermaid/-/mermaid-12.2.0.tgz	package/dist/mermaid.min.js	/opt/nabu/assets/mermaid
+katex	0.19.0	d8e49f2fea6eeed7cdae2cf4fd48e2f1d348758aa9e5740715e4533c2c96d1ee	https://registry.npmjs.org/katex/-/katex-0.19.0.tgz	package/dist/katex.min.js,package/dist/katex.min.css,package/dist/fonts	/opt/nabu/assets/katex

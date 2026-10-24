@@ -84,6 +84,11 @@ type Item struct {
 	AllowedTools []string  `json:"allowedTools"`
 	FileArgs     []FileArg `json:"fileArgs"`
 	FileMaxBytes int64     `json:"fileMaxBytes"`
+	// FTR.NAB.CHAT-0003: arguments that are paths of result files, their
+	// limit and the tools that write only to the space (R10, R25).
+	ResultArgs     []FileArg `json:"resultArgs"`
+	ResultMaxBytes int64     `json:"resultMaxBytes"`
+	SpaceOnlyTools []string  `json:"spaceOnlyTools"`
 	// NewTools appeared at a check after the list was saved and are not
 	// allowed yet (FTR.NAB.CMN-0006 design §3).
 	NewTools []string `json:"newTools"`
@@ -133,6 +138,8 @@ type Service struct {
 	// Files copies a file of the user's space for a file argument
 	// (FTR.NAB.CMN-0006 R14); nil — file arguments are refused.
 	Files FileSnapshot
+	// Results moves result files of tools to the space (FTR.NAB.CHAT-0003 R10).
+	Results ResultStore
 	// MemoryRun checks a call of a run of the collector of communications
 	// (FTR.NAB.CMN-0003 tech §6.4): it returns the tools the run may see, or
 	// the reason the call is refused.
@@ -146,16 +153,16 @@ var nameRe = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
 const itemCols = `id, type, name, COALESCE(title,''), COALESCE(description,''), source, mode, personal_auth, personal_auth_secret_enc IS NOT NULL,
 	platform_auth_enc, read_only, exposure, published, in_development, status, status_reason, tools, skills, skills_snapshot, synced_at, created_at,
-	allowed_tools, file_args, file_max_bytes, new_tools, checked_at`
+	allowed_tools, file_args, file_max_bytes, new_tools, checked_at, result_args, result_max_bytes, space_only_tools`
 
 func (s *Service) scan(row pgx.Row) (*Item, error) {
 	var it Item
-	var src, pa, tools, skills, allowed, fileArgs, newTools []byte
+	var src, pa, tools, skills, allowed, fileArgs, newTools, resultArgs, spaceOnly []byte
 	var hasSecret bool
 	var platEnc []byte
 	if err := row.Scan(&it.ID, &it.Type, &it.Name, &it.Title, &it.Description, &src, &it.Mode, &pa, &hasSecret, &platEnc, &it.ReadOnly,
 		&it.Exposure, &it.Published, &it.InDevelopment, &it.Status, &it.StatusReason, &tools, &skills, &it.snapshot, &it.SyncedAt, &it.CreatedAt,
-		&allowed, &fileArgs, &it.FileMaxBytes, &newTools, &it.CheckedAt); err != nil {
+		&allowed, &fileArgs, &it.FileMaxBytes, &newTools, &it.CheckedAt, &resultArgs, &it.ResultMaxBytes, &spaceOnly); err != nil {
 		return nil, err
 	}
 	if len(allowed) > 0 {
@@ -166,6 +173,14 @@ func (s *Service) scan(row pgx.Row) (*Item, error) {
 	}
 	if it.FileArgs == nil {
 		it.FileArgs = []FileArg{}
+	}
+	_ = json.Unmarshal(resultArgs, &it.ResultArgs)
+	if it.ResultArgs == nil {
+		it.ResultArgs = []FileArg{}
+	}
+	_ = json.Unmarshal(spaceOnly, &it.SpaceOnlyTools)
+	if it.SpaceOnlyTools == nil {
+		it.SpaceOnlyTools = []string{}
 	}
 	_ = json.Unmarshal(newTools, &it.NewTools)
 	if it.NewTools == nil {
@@ -258,21 +273,25 @@ func (s *Service) ByName(ctx context.Context, name string) (*Item, error) {
 
 // Input is POST /catalog and PATCH /catalog/{id} (absent fields keep values).
 type Input struct {
-	Type          string             `json:"type"`
-	Name          string             `json:"name"`
-	Title         *string            `json:"title"`
-	Description   *string            `json:"description"`
-	Source        *Source            `json:"source"`
-	Mode          *string            `json:"mode"`
-	PersonalAuth  *PersonalAuth      `json:"personalAuth"`
-	PlatformAuth  *map[string]string `json:"platformAuth"` // header → value; "" keeps the stored value
-	ReadOnly      *bool              `json:"readOnly"`
-	AllowedTools  *[]string          `json:"allowedTools"`
-	FileArgs      *[]FileArg         `json:"fileArgs"`
-	FileMaxBytes  *int64             `json:"fileMaxBytes"`
-	Exposure      *string            `json:"exposure"`
-	Published     *bool              `json:"published"`
-	InDevelopment *bool              `json:"inDevelopment"`
+	Type         string             `json:"type"`
+	Name         string             `json:"name"`
+	Title        *string            `json:"title"`
+	Description  *string            `json:"description"`
+	Source       *Source            `json:"source"`
+	Mode         *string            `json:"mode"`
+	PersonalAuth *PersonalAuth      `json:"personalAuth"`
+	PlatformAuth *map[string]string `json:"platformAuth"` // header → value; "" keeps the stored value
+	ReadOnly     *bool              `json:"readOnly"`
+	AllowedTools *[]string          `json:"allowedTools"`
+	FileArgs     *[]FileArg         `json:"fileArgs"`
+	FileMaxBytes *int64             `json:"fileMaxBytes"`
+	// FTR.NAB.CHAT-0003 tech §4.2
+	ResultArgs     *[]FileArg `json:"resultArgs"`
+	ResultMaxBytes *int64     `json:"resultMaxBytes"`
+	SpaceOnlyTools *[]string  `json:"spaceOnlyTools"`
+	Exposure       *string    `json:"exposure"`
+	Published      *bool      `json:"published"`
+	InDevelopment  *bool      `json:"inDevelopment"`
 }
 
 func validURL(u string) bool {
@@ -333,7 +352,8 @@ func (s *Service) Save(ctx context.Context, id *uuid.UUID, in Input) (*Item, err
 	var platEnc []byte
 	var paSecret []byte
 	if id == nil {
-		it = &Item{Type: in.Type, Name: strings.TrimSpace(in.Name), ReadOnly: true, Exposure: "deferred", FileMaxBytes: DefaultFileMaxBytes}
+		it = &Item{Type: in.Type, Name: strings.TrimSpace(in.Name), ReadOnly: true, Exposure: "deferred", FileMaxBytes: DefaultFileMaxBytes,
+			ResultMaxBytes: DefaultResultMaxBytes}
 	} else {
 		var err error
 		if it, err = s.Get(ctx, *id); err != nil {
@@ -425,6 +445,8 @@ func (s *Service) Save(ctx context.Context, id *uuid.UUID, in Input) (*Item, err
 		allowed, _ = json.Marshal(it.AllowedTools)
 	}
 	fileArgs, _ := json.Marshal(it.FileArgs)
+	resultArgs, _ := json.Marshal(nonNil(it.ResultArgs))
+	spaceOnly, _ := json.Marshal(nonNilS(it.SpaceOnlyTools))
 	if in.AllowedTools != nil {
 		it.NewTools = []string{} // the administrator has seen the list
 	}
@@ -436,10 +458,11 @@ func (s *Service) Save(ctx context.Context, id *uuid.UUID, in Input) (*Item, err
 	if id == nil {
 		var nid uuid.UUID
 		err = s.Pool.QueryRow(ctx, `INSERT INTO catalog_items (type, name, title, description, source, mode, personal_auth, personal_auth_secret_enc,
-			platform_auth_enc, read_only, exposure, published, in_development, allowed_tools, file_args, file_max_bytes)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`,
+			platform_auth_enc, read_only, exposure, published, in_development, allowed_tools, file_args, file_max_bytes,
+			result_args, result_max_bytes, space_only_tools)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING id`,
 			it.Type, it.Name, it.Title, it.Description, src, it.Mode, pa, paSecret, platEnc, it.ReadOnly, it.Exposure, it.Published, it.InDevelopment,
-			allowed, fileArgs, it.FileMaxBytes).Scan(&nid)
+			allowed, fileArgs, it.FileMaxBytes, resultArgs, it.ResultMaxBytes, spaceOnly).Scan(&nid)
 		if postgres.IsUniqueViolation(err) {
 			return nil, apperr.Conflict("name_taken", "an item with this name exists").With("field", "name")
 		}
@@ -447,9 +470,10 @@ func (s *Service) Save(ctx context.Context, id *uuid.UUID, in Input) (*Item, err
 	} else {
 		_, err = s.Pool.Exec(ctx, `UPDATE catalog_items SET title = $2, description = $3, source = $4, mode = $5, personal_auth = $6,
 			personal_auth_secret_enc = $7, platform_auth_enc = $8, read_only = $9, exposure = $10, published = $11, in_development = $12,
-			allowed_tools = $13, file_args = $14, file_max_bytes = $15, new_tools = $16, updated_at = now()
+			allowed_tools = $13, file_args = $14, file_max_bytes = $15, new_tools = $16,
+			result_args = $17, result_max_bytes = $18, space_only_tools = $19, updated_at = now()
 			WHERE id = $1`, *id, it.Title, it.Description, src, it.Mode, pa, paSecret, platEnc, it.ReadOnly, it.Exposure, it.Published, it.InDevelopment,
-			allowed, fileArgs, it.FileMaxBytes, nt)
+			allowed, fileArgs, it.FileMaxBytes, nt, resultArgs, it.ResultMaxBytes, spaceOnly)
 	}
 	if err != nil {
 		return nil, err
@@ -555,9 +579,12 @@ func (s *Service) Check(ctx context.Context, id uuid.UUID, email string, admin u
 	keepFileArgs(it)
 	allowed, _ := json.Marshal(it.AllowedTools)
 	fileArgs, _ := json.Marshal(it.FileArgs)
+	resultArgs, _ := json.Marshal(nonNil(it.ResultArgs))
+	spaceOnly, _ := json.Marshal(nonNilS(it.SpaceOnlyTools))
 	nt, _ := json.Marshal(it.NewTools)
 	_, err = s.Pool.Exec(ctx, `UPDATE catalog_items SET status = 'ok', status_reason = NULL, tools = $2, allowed_tools = $3, read_only = $4, file_args = $5,
-		new_tools = $6, checked_at = now(), updated_at = now() WHERE id = $1`, id, tools, allowed, it.ReadOnly, fileArgs, nt)
+		new_tools = $6, result_args = $7, space_only_tools = $8, checked_at = now(), updated_at = now() WHERE id = $1`,
+		id, tools, allowed, it.ReadOnly, fileArgs, nt, resultArgs, spaceOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -718,7 +745,19 @@ type SessionMCP struct {
 	// tools the administrator allowed change: the session is opened again
 	// (FTR.NAB.CHAT-0002 tech §3.3).
 	Fingerprint string
+	// Documents: a server of the session gives render_document, so the
+	// instructions carry the rule of documents (FTR.NAB.CHAT-0003 R17).
+	Documents bool
 }
+
+// documentsTool is the tool that marks the service of documents.
+const documentsTool = "render_document"
+
+// givesTool is the SQL of «the item gives the agent the tool %s»: the
+// allowed tools, or — an item without the list (allowed_tools NULL, the old
+// rule) — the tools of its check unless it is read-only.
+const givesTool = `CASE WHEN c.allowed_tools IS NOT NULL THEN c.allowed_tools ? %[1]s
+	ELSE NOT c.read_only AND jsonb_typeof(c.tools) = 'array' AND EXISTS (SELECT 1 FROM jsonb_array_elements(c.tools) t WHERE t->>'name' = %[1]s) END`
 
 // ForGroup lists the MCP servers and skills of a group agent session
 // (FTR.NAB.CMN-0002 R16, GR-07): only published platform items, no personal
@@ -731,8 +770,9 @@ func (s *Service) ForGroup(ctx context.Context, groupID uuid.UUID, skills []stri
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.Pool.Query(ctx, `SELECT c.id, c.type, c.name, COALESCE(c.title,''), COALESCE(c.description,''), c.exposure, c.skills, c.skills_snapshot
-		FROM catalog_items c WHERE c.published AND NOT c.in_development AND (c.type = 'skill' OR c.mode = 'platform') ORDER BY c.name`)
+	rows, err := s.Pool.Query(ctx, `SELECT c.id, c.type, c.name, COALESCE(c.title,''), COALESCE(c.description,''), c.exposure, c.skills, c.skills_snapshot,
+			COALESCE(`+fmt.Sprintf(givesTool, "$1")+`, false)
+		FROM catalog_items c WHERE c.published AND NOT c.in_development AND (c.type = 'skill' OR c.mode = 'platform') ORDER BY c.name`, documentsTool)
 	if err != nil {
 		return nil, err
 	}
@@ -747,13 +787,15 @@ func (s *Service) ForGroup(ctx context.Context, groupID uuid.UUID, skills []stri
 		var typ, name, title, desc, exposure string
 		var raw []byte
 		var snap *string
-		if err := rows.Scan(&id, &typ, &name, &title, &desc, &exposure, &raw, &snap); err != nil {
+		var docs bool
+		if err := rows.Scan(&id, &typ, &name, &title, &desc, &exposure, &raw, &snap, &docs); err != nil {
 			return nil, err
 		}
 		if g != nil && !g[id] {
 			continue
 		}
 		if typ == "mcp" {
+			out.Documents = out.Documents || docs
 			d := title
 			if desc != "" {
 				d = strings.TrimSpace(title + ": " + desc)
@@ -786,9 +828,10 @@ func (s *Service) ProxyToken(uid uuid.UUID, item uuid.UUID, ch, conv string, ttl
 // effect in the next session).
 func (s *Service) ForSession(ctx context.Context, uid uuid.UUID, ch, conv string, ttl time.Duration) (*SessionMCP, error) {
 	rows, err := s.Pool.Query(ctx, `SELECT c.id, c.type, c.name, COALESCE(c.title,''), COALESCE(c.description,''), c.exposure, c.skills, c.skills_snapshot,
-			md5(COALESCE(c.tools::text, '') || '|' || COALESCE(c.allowed_tools::text, '') || '|' || c.exposure)
+			md5(COALESCE(c.tools::text, '') || '|' || COALESCE(c.allowed_tools::text, '') || '|' || c.exposure),
+			COALESCE(`+fmt.Sprintf(givesTool, "$2")+`, false)
 		FROM catalog_items c JOIN user_connections u ON u.item_id = c.id AND u.user_id = $1
-		WHERE c.published AND NOT c.in_development ORDER BY c.name`, uid)
+		WHERE c.published AND NOT c.in_development ORDER BY c.name`, uid, documentsTool)
 	if err != nil {
 		return nil, err
 	}
@@ -805,13 +848,15 @@ func (s *Service) ForSession(ctx context.Context, uid uuid.UUID, ch, conv string
 		var typ, name, title, desc, exposure, toolsHash string
 		var skills []byte
 		var snap *string
-		if err := rows.Scan(&id, &typ, &name, &title, &desc, &exposure, &skills, &snap, &toolsHash); err != nil {
+		var docs bool
+		if err := rows.Scan(&id, &typ, &name, &title, &desc, &exposure, &skills, &snap, &toolsHash, &docs); err != nil {
 			return nil, err
 		}
 		if g != nil && !g[id] { // FTR.NAB.CMN-0007 R10, R11: connected, but no longer granted
 			continue
 		}
 		if typ == "mcp" {
+			out.Documents = out.Documents || docs
 			fp.Write([]byte(name + ":" + toolsHash + ";"))
 			d := title
 			if desc != "" {

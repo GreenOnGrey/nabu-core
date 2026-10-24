@@ -36,6 +36,8 @@ modes:
   agent     the agent operator: Pi sessions behind the internal API (:8090)
   relay     channels of workspaces and the agent's tool calls (:8085)
   sandbox   a personal space of one user (started by the worker)
+  sandbox-init   puts this binary and the profile into /nabu (the init container of a sandbox)
+  sandbox-probe  checks a custom sandbox image and reports its contents (a probe pod)
   migrate   apply database migrations
   cleaner   one maintenance pass (a CronJob)
   version   print the version`
@@ -58,6 +60,15 @@ func main() {
 		return
 	case "sandbox":
 		exit(runSandbox(ctx))
+		return
+	case "sandbox-init":
+		// FTR.NAB.CMN-0008 tech §5.3.
+		exit(sandbox.Init(ctx, sandbox.InitConfig{BinaryOnly: len(os.Args) > 2 && os.Args[2] == "--binary-only",
+			Profile: os.Getenv("NABU_SANDBOX_PROFILE"), APIURL: strings.TrimRight(os.Getenv("NABU_API_INTERNAL_URL"), "/"),
+			Token: firstNonEmpty(os.Getenv("NABU_SANDBOX_TOKEN"), os.Getenv("NABU_SANDBOX_RUN_TOKEN"))}))
+		return
+	case "sandbox-probe":
+		exit(sandbox.Probe(ctx, strings.TrimRight(os.Getenv("NABU_API_INTERNAL_URL"), "/"), os.Getenv("NABU_PROBE_TOKEN")))
 		return
 	case "api", "worker", "relay", "cleaner", "migrate":
 	default:
@@ -168,9 +179,20 @@ func runSandbox(ctx context.Context) error {
 		SandboxToken: os.Getenv("NABU_SANDBOX_TOKEN"), WorkspaceToken: os.Getenv("NABU_WORKSPACE_TOKEN"),
 		RelayURL: os.Getenv("NABU_RELAY_URL"), APIURL: strings.TrimRight(os.Getenv("NABU_API_INTERNAL_URL"), "/"),
 		Exclude: strings.Split(os.Getenv("NABU_SANDBOX_EXCLUDE"), ","), Ephemeral: os.Getenv("NABU_SANDBOX_EPHEMERAL") == "1",
-		WorkspaceID: os.Getenv("NABU_SANDBOX_WORKSPACE")}
+		WorkspaceID: os.Getenv("NABU_SANDBOX_WORKSPACE"), Profile: os.Getenv("NABU_SANDBOX_PROFILE"),
+		RunToken: os.Getenv("NABU_SANDBOX_RUN_TOKEN")}
+	sandbox.PrepareProfile()
 	if cfg.WorkspaceToken == "" || cfg.RelayURL == "" || (!cfg.Ephemeral && (cfg.UserID == "" || cfg.SandboxToken == "" || cfg.APIURL == "")) {
 		return fmt.Errorf("sandbox: NABU_SANDBOX_USER, NABU_SANDBOX_TOKEN, NABU_WORKSPACE_TOKEN, NABU_RELAY_URL and NABU_API_INTERNAL_URL are required")
 	}
 	return sandbox.Run(ctx, cfg)
+}
+
+func firstNonEmpty(v ...string) string {
+	for _, s := range v {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
 }

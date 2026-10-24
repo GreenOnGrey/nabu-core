@@ -50,6 +50,20 @@ jobs:
           go test -count=1 ./pkg/pirpc/ ./internal/platform/agent/... ./internal/relay/ ./internal/workspace/
           go test -tags integration -count=1 -run TestEngineWithPi ./internal/itest/
 
+  # FTR.NAB.CMN-0008: the images of the built-in sandbox profiles build and
+  # pass their checks (qa PRF-01…07).
+  sandbox-images:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Сборка профилей base и documents
+        run: |
+          docker buildx build --load --target sandbox-base --build-arg VERSION=ci -t nabu-sandbox-base:ci .
+          docker buildx build --load --target sandbox-documents --build-arg VERSION=ci -t nabu-sandbox-documents:ci .
+      - name: Проверки профилей
+        run: bash sandbox/test.sh nabu-sandbox-base:ci nabu-sandbox-documents:ci
+
   workflows:
     runs-on: ubuntu-24.04
     steps:

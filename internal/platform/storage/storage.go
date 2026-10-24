@@ -100,6 +100,35 @@ func (s *S3) List(ctx context.Context, prefix string) ([]Object, error) {
 // Presigner gives temporary links to objects; S3 implements it.
 type Presigner interface {
 	PresignGet(ctx context.Context, key string, ttl time.Duration) (string, error)
+	// PresignPut is a link to upload one object (FTR.NAB.CHAT-0003: result
+	// files of MCP tools).
+	PresignPut(ctx context.Context, key string, ttl time.Duration) (string, error)
+}
+
+// Statter reads the size of an object without reading it; S3 implements it.
+type Statter interface {
+	Stat(ctx context.Context, key string) (Object, error)
+}
+
+// PresignPut returns a PUT URL of an object valid for ttl.
+func (s *S3) PresignPut(ctx context.Context, key string, ttl time.Duration) (string, error) {
+	u, err := s.c.PresignedPutObject(ctx, s.bucket, key, ttl)
+	if err != nil {
+		return "", err
+	}
+	return u.String(), nil
+}
+
+// Stat implements Statter.
+func (s *S3) Stat(ctx context.Context, key string) (Object, error) {
+	info, err := s.c.StatObject(ctx, s.bucket, key, minio.StatObjectOptions{})
+	if err != nil {
+		if minio.ToErrorResponse(err).Code == "NoSuchKey" {
+			return Object{}, ErrNotFound
+		}
+		return Object{}, err
+	}
+	return Object{Key: key, Size: info.Size, LastModified: info.LastModified}, nil
 }
 
 // PresignGet returns a GET URL of an object valid for ttl, signed for the

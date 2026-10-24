@@ -343,14 +343,15 @@ func (e *Engine) serviceTurn(ctx context.Context, runID uuid.UUID, ag *services.
 			return "", "workspace_not_connected", "temporary sandboxes are not enabled in this deployment", total, false
 		}
 		wsID := services.WorkspaceID(runID)
-		if err := e.Sandboxes.StartEphemeral(ctx, wsID); err != nil {
+		if err := e.Sandboxes.StartEphemeral(ctx, wsID, runID.String(), ag.WorkspaceProfile); err != nil {
 			return "", "workspace_not_connected", err.Error(), total, false
 		}
 		defer e.Sandboxes.StopEphemeral(context.WithoutCancel(ctx), wsID)
 		call := e.Signer.Issue(jwt.Claims{Audience: jwt.AudCall, Workspace: wsID}, tokenTTL)
 		secrets = append(secrets, call)
 		req.Workspace = &agent.Workspace{ID: wsID, URL: e.Cfg.RelayInternalURL + "/internal/v1/workspaces/" + wsID, Token: call,
-			Note: "The working directory is a temporary sandbox of this run; its files are deleted after the run."}
+			Note: "The working directory is a temporary sandbox of this run; its files are deleted after the run. " +
+				"It has a fixed set of tools: see /nabu/sandbox-profile.json; packages cannot be installed."}
 	}
 	resp, err := e.open(ctx, e.Op, req)
 	if err != nil {

@@ -224,3 +224,47 @@ func init() {
 	Registry.MustRegister(ContextEvents, SkillInvocations, Notices, ProductMCPCalls, PromptImages, ModelsRefresh, GigaChatBridge, GigaChatTokens,
 		Transcriptions, TranscriptionSeconds)
 }
+
+// FTR.NAB.CMN-0008 tech §7.10: sandbox profiles and requests of libraries.
+// profile is the name of a profile: a stand has a handful of them.
+var (
+	SandboxStartSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "nabu_sandbox_start_seconds", Help: "From the creation of a sandbox pod to its connection to the relay.",
+		Buckets: []float64{1, 2, 5, 10, 15, 20, 30, 45, 60, 120},
+	}, []string{"profile", "profile_kind", "kind"})
+	SandboxStartFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_sandbox_start_failures_total", Help: "Sandbox pods that did not start by profile and reason (pull, crash, timeout).",
+	}, []string{"profile", "profile_kind", "reason"})
+	SandboxPrepullNodes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "nabu_sandbox_prepull_nodes", Help: "Nodes where the image of a profile is preloaded (ready) or not yet (pending).",
+	}, []string{"profile", "state"})
+	SandboxProbes = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_sandbox_probe_total", Help: "Checks of custom sandbox images by result.",
+	}, []string{"result"})
+	SandboxPackageSignals = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_sandbox_package_signals_total", Help: "Signals of missing packages by ecosystem, source, profile and result (ok, duplicate, rate_limited, invalid).",
+	}, []string{"ecosystem", "source", "profile", "result"})
+	SandboxImageRestarts = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_sandbox_image_restarts_total", Help: "Idle sandboxes restarted on a new image of their profile.",
+	}, []string{"profile"})
+)
+
+func init() {
+	Registry.MustRegister(SandboxStartSeconds, SandboxStartFailures, SandboxPrepullNodes, SandboxProbes,
+		SandboxPackageSignals, SandboxImageRestarts)
+}
+
+// FTR.NAB.CHAT-0003 tech §6.4: previews of office files.
+var (
+	PreviewRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_preview_requests_total", Help: "Requests of previews by kind (doc, sheet) and result (ok, pending, too_large, timeout, broken, busy, disabled).",
+	}, []string{"kind", "result"})
+	PreviewSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "nabu_preview_seconds", Help: "Time to a ready preview: the conversion (miss) or the cache (hit).",
+		Buckets: []float64{.1, .5, 1, 2, 5, 10, 20, 30},
+	}, []string{"kind", "cache"})
+)
+
+func init() {
+	Registry.MustRegister(PreviewRequests, PreviewSeconds)
+}

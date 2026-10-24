@@ -52,8 +52,11 @@ type Config struct {
 	MCP            []string      `json:"mcp"`
 	AcceptCallerMC bool          `json:"acceptCallerMcp"`
 	Workspace      string        `json:"workspace"`
-	Limits         Limits        `json:"limits"`
-	Clients        []string      `json:"clients"`
+	// WorkspaceProfile is the sandbox profile of a workspace in Nabu; "" —
+	// the default of the stand (FTR.NAB.CMN-0008 R6).
+	WorkspaceProfile string   `json:"workspaceProfile,omitempty"`
+	Limits           Limits   `json:"limits"`
+	Clients          []string `json:"clients"`
 }
 
 // Agent is a stored service agent with run statistics.
@@ -113,6 +116,8 @@ type Service struct {
 	Harnesses []Harness
 	// WorkspaceTTL is the lifetime of a workspace token.
 	WorkspaceTTL time.Duration
+	// ProfileReady checks a workspaceProfile (FTR.NAB.CMN-0008); nil — any.
+	ProfileReady func(ctx context.Context, name string) (bool, error)
 }
 
 // Harness is an installed harness (tech §4: GET /harnesses).
@@ -148,6 +153,18 @@ func (s *Service) validate(ctx context.Context, c *Config) error {
 	case WorkspaceNone, WorkspaceNabu, WorkspaceExternal:
 	default:
 		return apperr.Unprocessable("invalid_workspace", "workspace is none, nabu or external").With("field", "workspace")
+	}
+	if c.Workspace != WorkspaceNabu {
+		c.WorkspaceProfile = ""
+	}
+	if c.WorkspaceProfile != "" && s.ProfileReady != nil {
+		ok, err := s.ProfileReady(ctx, c.WorkspaceProfile)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return apperr.BadRequest("service_agent_profile_unknown", "no such sandbox profile on this stand").With("field", "workspaceProfile")
+		}
 	}
 	if c.Limits.TimeoutSec <= 0 {
 		c.Limits.TimeoutSec = 1800

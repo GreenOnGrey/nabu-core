@@ -100,6 +100,7 @@ type Pod struct {
 	Metadata struct {
 		Name              string            `json:"name"`
 		Labels            map[string]string `json:"labels"`
+		Annotations       map[string]string `json:"annotations"`
 		CreationTimestamp *time.Time        `json:"creationTimestamp"`
 		DeletionTimestamp *time.Time        `json:"deletionTimestamp"`
 	} `json:"metadata"`
@@ -110,15 +111,51 @@ type Pod struct {
 		} `json:"containers"`
 	} `json:"spec"`
 	Status struct {
-		Phase      string `json:"phase"`
-		PodIP      string `json:"podIP"`
-		Conditions []struct {
+		Phase                 string            `json:"phase"`
+		Reason                string            `json:"reason"`
+		PodIP                 string            `json:"podIP"`
+		InitContainerStatuses []ContainerStatus `json:"initContainerStatuses"`
+		ContainerStatuses     []ContainerStatus `json:"containerStatuses"`
+		Conditions            []struct {
 			Type               string     `json:"type"`
 			Status             string     `json:"status"`
 			Reason             string     `json:"reason"`
 			LastTransitionTime *time.Time `json:"lastTransitionTime"`
 		} `json:"conditions"`
 	} `json:"status"`
+}
+
+// ContainerStatus is the state of a container of a pod: its image by digest
+// once pulled, why it waits (ErrImagePull, CrashLoopBackOff) and its exit code.
+type ContainerStatus struct {
+	Name    string `json:"name"`
+	ImageID string `json:"imageID"`
+	State   struct {
+		Waiting *struct {
+			Reason  string `json:"reason"`
+			Message string `json:"message"`
+		} `json:"waiting"`
+		Terminated *struct {
+			ExitCode int    `json:"exitCode"`
+			Reason   string `json:"reason"`
+		} `json:"terminated"`
+	} `json:"state"`
+}
+
+// Waiting is the reason a container waits, or "".
+func (s ContainerStatus) Waiting() string {
+	if s.State.Waiting == nil {
+		return ""
+	}
+	return s.State.Waiting.Reason
+}
+
+// Exited reports that the container finished and with which code.
+func (s ContainerStatus) Exited() (int, bool) {
+	if s.State.Terminated == nil {
+		return 0, false
+	}
+	return s.State.Terminated.ExitCode, true
 }
 
 // Ready reports the Ready condition of a running pod with an address.
@@ -208,4 +245,32 @@ func (c *Client) ListPods(ctx context.Context, ns, selector string) ([]Pod, erro
 	}
 	err := c.Do(ctx, http.MethodGet, "/api/v1/namespaces/"+ns+"/pods?labelSelector="+selector, nil, &l)
 	return l.Items, err
+}
+
+// GetDaemonSet loads a DaemonSet as a raw object; nil when it does not exist.
+func (c *Client) GetDaemonSet(ctx context.Context, ns, name string) (map[string]any, error) {
+	var ds map[string]any
+	err := c.Do(ctx, http.MethodGet, "/apis/apps/v1/namespaces/"+ns+"/daemonsets/"+name, nil, &ds)
+	if NotFound(err) {
+		return nil, nil
+	}
+	return ds, err
+}
+
+// PutDaemonSet creates a DaemonSet or replaces the existing one (its
+// resourceVersion is taken from the cluster).
+func (c *Client) PutDaemonSet(ctx context.Context, ns string, ds map[string]any) error {
+	meta, _ := ds["metadata"].(map[string]any)
+	name, _ := meta["name"].(string)
+	cur, err := c.GetDaemonSet(ctx, ns, name)
+	if err != nil {
+		return err
+	}
+	if cur == nil {
+		return c.Do(ctx, http.MethodPost, "/apis/apps/v1/namespaces/"+ns+"/daemonsets", ds, nil)
+	}
+	if cm, ok := cur["metadata"].(map[string]any); ok {
+		meta["resourceVersion"] = cm["resourceVersion"]
+	}
+	return c.Do(ctx, http.MethodPut, "/apis/apps/v1/namespaces/"+ns+"/daemonsets/"+name, ds, nil)
 }

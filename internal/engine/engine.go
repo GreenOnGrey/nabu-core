@@ -179,7 +179,7 @@ func (e *Engine) personalRequest(ctx context.Context, u *users.User, conv uuid.U
 		req.Workspace = &agent.Workspace{ID: wsID, URL: e.Cfg.RelayInternalURL + "/internal/v1/workspaces/" + wsID, Token: call,
 			Note: "The working directory is the user's personal space in Nabu: files persist between conversations and the user sees them in the Space section. Paths are relative to its root."}
 	}
-	p := Persona{User: u, Agent: ag, Memory: mem, Spaces: e.Space.Enabled, Now: time.Now(), Catalog: titles}
+	p := Persona{User: u, Agent: ag, Memory: mem, Spaces: e.Space.Enabled, Now: time.Now(), Catalog: titles, Documents: cat.Documents}
 	req.SystemAppend = p.Instructions()
 	return &built{req: req, persona: p, secrets: secrets, model: model, mcpHash: cat.Fingerprint}, nil
 }

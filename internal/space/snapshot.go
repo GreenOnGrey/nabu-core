@@ -50,24 +50,25 @@ type Snapshots struct {
 }
 
 // Snapshot implements catalog.FileSnapshot.
-func (s *Snapshots) Snapshot(ctx context.Context, uid uuid.UUID, p string, max int64) (string, error) {
+func (s *Snapshots) Snapshot(ctx context.Context, uid uuid.UUID, p string, max int64) (string, int64, error) {
 	p, err := CleanPath(p)
 	if err != nil {
-		return "", catalog.ErrFileInvalid
+		return "", 0, catalog.ErrFileInvalid
 	}
 	pre, ok := s.Space.S3.(storage.Presigner)
 	if !ok {
-		return "", errors.New("the object store gives no links")
+		return "", 0, errors.New("the object store gives no links")
 	}
 	data, err := s.read(ctx, uid, p, max)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	key := SnapshotPrefix + uuid.NewString() + "/" + path.Base(p)
 	if err := s.Space.S3.Put(ctx, key, bytes.NewReader(data), int64(len(data)), "application/octet-stream"); err != nil {
-		return "", err
+		return "", 0, err
 	}
-	return pre.PresignGet(ctx, key, SnapshotTTL)
+	u, err := pre.PresignGet(ctx, key, SnapshotTTL)
+	return u, int64(len(data)), err
 }
 
 // Read reads the current version of a file of the space: the working copy of

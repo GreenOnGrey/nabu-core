@@ -328,6 +328,7 @@ func listTools(ctx context.Context, url string, headers map[string]string) ([]ag
 			mt.Destructive = false
 		}
 		mt.StringArgs = agent.StringArgs(t.InputSchema)
+		mt.StringListArgs = agent.StringListArgs(t.InputSchema)
 		out = append(out, mt)
 	}
 	return out, nil

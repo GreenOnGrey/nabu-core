@@ -1,0 +1,30 @@
+# Python libraries of the documents sandbox profile: everything of base and
+# the libraries of documents, data and charts (FTR.NAB.CMN-0008 R3).
+[project]
+name = "nabu-sandbox-documents"
+version = "0"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "charset-normalizer",
+    "jinja2",
+    "openpyxl",
+    "pillow",
+    "pypdf",
+    "python-dateutil",
+    "pyyaml",
+    "tabulate",
+    # documents
+    "docxtpl",
+    "lxml",
+    "python-docx",
+    "python-pptx",
+    # data and charts
+    "matplotlib",
+    "numpy",
+    "pandas",
+    # HTML and CSS to PDF without JavaScript
+    "weasyprint",
+]
+
+[tool.uv]
+package = false

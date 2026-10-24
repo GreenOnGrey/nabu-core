@@ -35,6 +35,11 @@ type Workspace struct {
 	// Env is the environment of shell commands: never the runner's own
 	// (it holds the task token).
 	Env []string
+	// OnMissing gets the modules and commands a finished command could not
+	// find (FTR.NAB.CMN-0008 R11); Heartbeat is called every 30 seconds while
+	// a command runs (tech §5.4). Both run outside the request and may be nil.
+	OnMissing func([]Missing)
+	Heartbeat func()
 
 	run    sync.Mutex // one bash at a time; the others wait
 	mu     sync.Mutex
@@ -47,6 +52,7 @@ const (
 	bashMaxTimeout     = 1800 * time.Second
 	bashMaxOutput      = 16 << 20 // streamed; Pi keeps the tail and the full log on its side
 	readMaxBytes       = 64 << 20
+	writeMaxBody       = 73 << 20
 	grepMaxFiles       = 20000
 )
 
@@ -169,7 +175,13 @@ type pathReq struct {
 }
 
 func decodeReq(r *http.Request, v any) error {
-	return json.NewDecoder(io.LimitReader(r.Body, readMaxBytes+(1<<20))).Decode(v)
+	limit := int64(readMaxBytes + (1 << 20))
+	if strings.HasSuffix(r.URL.Path, "/fs/write") {
+		// FTR.NAB.CHAT-0003 tech §4.5: a result file of up to 50 MB is one
+		// fs/write; its base64 is about 67 MB
+		limit = writeMaxBody
+	}
+	return json.NewDecoder(io.LimitReader(r.Body, limit)).Decode(v)
 }
 
 func (w *Workspace) resolveReq(r *http.Request) (pathReq, string, error) {
@@ -552,6 +564,9 @@ func (w *Workspace) exec(rw http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 	done := make(chan struct{})
+	tail := &tailBuffer{max: missingTail}
+	stopBeat := w.beat()
+	defer stopBeat()
 	go func() {
 		defer close(done)
 		br := bufio.NewReaderSize(pr, 32<<10)
@@ -559,6 +574,9 @@ func (w *Workspace) exec(rw http.ResponseWriter, r *http.Request) error {
 		sent := 0
 		for {
 			n, err := br.Read(buf)
+			if n > 0 && w.OnMissing != nil {
+				tail.Write(buf[:n])
+			}
 			if n > 0 && sent < bashMaxOutput {
 				_ = enc.Encode(map[string]string{"data": base64.StdEncoding.EncodeToString(buf[:n])})
 				sent += n
@@ -585,7 +603,33 @@ func (w *Workspace) exec(rw http.ResponseWriter, r *http.Request) error {
 	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
 	aborted := errors.Is(ctx.Err(), context.Canceled)
 	_ = enc.Encode(map[string]any{"exitCode": code, "timedOut": timedOut, "aborted": aborted, "timeoutSec": int(timeout.Seconds())})
+	if w.OnMissing != nil {
+		if items := FindMissing(tail.Bytes()); len(items) > 0 {
+			go w.OnMissing(items)
+		}
+	}
 	return nil
+}
+
+// beat calls Heartbeat every 30 seconds until the returned stop.
+func (w *Workspace) beat() func() {
+	if w.Heartbeat == nil {
+		return func() {}
+	}
+	stop := make(chan struct{})
+	go func() {
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				w.Heartbeat()
+			}
+		}
+	}()
+	return func() { close(stop) }
 }
 
 func (w *Workspace) abort(rw http.ResponseWriter, _ *http.Request) error {
@@ -596,6 +640,26 @@ func (w *Workspace) abort(rw http.ResponseWriter, _ *http.Request) error {
 	w.mu.Unlock()
 	rw.WriteHeader(http.StatusNoContent)
 	return nil
+}
+
+// SandboxEnv is the environment of commands in a sandbox: the environment of
+// the profile image (its PATH, caches of Python and matplotlib, variables a
+// custom image needs, FTR.NAB.CMN-0008) without the tokens of the sandbox.
+func SandboxEnv(root string) []string {
+	env := []string{"HOME=" + root, "CI=true"}
+	hasLang := false
+	for _, kv := range os.Environ() {
+		k, _, _ := strings.Cut(kv, "=")
+		if strings.HasPrefix(k, "NABU_") || k == "HOME" || k == "CI" {
+			continue
+		}
+		hasLang = hasLang || k == "LANG"
+		env = append(env, kv)
+	}
+	if !hasLang {
+		env = append(env, "LANG=C.UTF-8")
+	}
+	return env
 }
 
 // CommandEnv is the environment of the agent's commands: a clean set, not

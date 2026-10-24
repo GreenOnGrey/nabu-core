@@ -209,7 +209,8 @@ func (e *Engine) groupRequest(ctx context.Context, u *users.User, ga *groups.Age
 		ownerEmail = ga.Owner.Email
 	}
 	p := Persona{User: u, Agent: users.Agent{Name: ga.Name, Tone: ga.Tone}, Memory: mem, Spaces: e.Space.Enabled, Now: time.Now(), Catalog: titles,
-		Group: &GroupInfo{Title: ga.ChatTitle, Channel: ga.Channel, Owner: ownerEmail}}
+		Documents: cat.Documents,
+		Group:     &GroupInfo{Title: ga.ChatTitle, Channel: ga.Channel, Owner: ownerEmail}}
 	req.SystemAppend = p.Instructions()
 	return &built{req: req, persona: p, secrets: secrets, model: model, group: ga}, nil
 }

@@ -157,18 +157,18 @@ func TestRewriteFileArgs(t *testing.T) {
 	it.AllowedTools = []string{"convert"}
 	it.FileArgs = []FileArg{{Tool: "convert", Arg: "source"}}
 	var asked []string
-	s := &Service{Files: func(_ context.Context, u uuid.UUID, p string, max int64) (string, error) {
+	s := &Service{Files: func(_ context.Context, u uuid.UUID, p string, max int64) (string, int64, error) {
 		asked = append(asked, p)
 		switch p {
 		case "big.pdf":
-			return "", ErrFileTooLarge
+			return "", 0, ErrFileTooLarge
 		case "missing.pdf":
-			return "", ErrFileNotFound
+			return "", 0, ErrFileNotFound
 		}
-		return "http://s3/mcp-files/x/" + p + "?sig", nil
+		return "http://s3/mcp-files/x/" + p + "?sig", 1, nil
 	}}
 	args, fr := s.rewriteFileArgs(context.Background(), it, uid, "convert", json.RawMessage(`{"source":"docs/a.pdf","other":"x"}`))
-	if fr != nil || !strings.Contains(string(args), `"source":"http://s3/mcp-files/x/docs/a.pdf?sig"`) || !strings.Contains(string(args), `"other":"x"`) {
+	if fr != nil || !strings.Contains(string(args), `"source":"http://s3/mcp-files/x/docs/a.pdf?sig#nabu-path=docs/a.pdf"`) || !strings.Contains(string(args), `"other":"x"`) {
 		t.Fatalf("rewrite: %s %v", args, fr)
 	}
 	for _, v := range []string{"https://x/a.pdf", "s3://b/k", "file:///etc/passwd", "/etc/passwd", ""} {

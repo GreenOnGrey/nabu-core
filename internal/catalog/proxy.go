@@ -198,8 +198,24 @@ func (s *Service) CallTool(ctx context.Context, uid, itemID uuid.UUID, tool stri
 		observe(it, tool, fr.result, 0)
 		return fr.text, true, nil
 	}
+	// FTR.NAB.CHAT-0003 R10: the path and the file are checked at the moment of the call
+	args, plans, fr := s.rewriteResultArgs(ctx, it, uid, tool, args)
+	if fr != nil {
+		observe(it, tool, fr.result, 0)
+		return fr.text, true, nil
+	}
 	start := time.Now()
 	text, isErr, err := mcp.CallTool(ctx, it.Source.URL, headers, tool, args)
+	if len(plans) > 0 {
+		note, fr := s.finishResults(ctx, uid, plans, isErr || err != nil)
+		if fr != nil {
+			observe(it, tool, fr.result, time.Since(start))
+			return fr.text, true, nil
+		}
+		if note != "" {
+			text = strings.TrimSpace(text + "\n" + note)
+		}
+	}
 	observe(it, tool, callResult(statusOf(err), isErr, err), time.Since(start))
 	return text, isErr, err
 }
@@ -339,7 +355,9 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 		only = tools
 	}
 	conv, _ := uuid.Parse(c.Conversation)
-	if hold != nil && conv != uuid.Nil && uid != uuid.Nil && isCall && !s.readOnlyTool(it, call.Params.Name) {
+	// FTR.NAB.CHAT-0003 R25: a tool that only writes a new file of the space needs no confirmation
+	writesOnlySpace := it.spaceOnly(call.Params.Name) && !overwriteRequested(call.Params.Arguments)
+	if hold != nil && conv != uuid.Nil && uid != uuid.Nil && isCall && !s.readOnlyTool(it, call.Params.Name) && !writesOnlySpace {
 		// R9: in a mail topic a call that changes data waits for the user (ML-17, ML-20)
 		if answer, held := hold(r.Context(), conv, uid, it.ID, it.Name, call.Params.Name, call.Params.Arguments); held {
 			w.Header().Set("Content-Type", "application/json")
@@ -350,6 +368,18 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 	}
 	if isCall && len(it.fileArgsOf(call.Params.Name)) > 0 {
 		args, fr := s.rewriteFileArgs(r.Context(), it, uid, call.Params.Name, call.Params.Arguments)
+		if fr != nil {
+			observe(it, call.Params.Name, fr.result, 0)
+			toolError(w, call.ID, fr.text)
+			return
+		}
+		body = withArguments(body, args)
+	}
+	var plans []resultPlan
+	if isCall && len(it.resultArgsOf(call.Params.Name)) > 0 {
+		var fr *fileRefusal
+		var args json.RawMessage
+		args, plans, fr = s.rewriteResultArgs(r.Context(), it, uid, call.Params.Name, mustArgs(body))
 		if fr != nil {
 			observe(it, call.Params.Name, fr.result, 0)
 			toolError(w, call.ID, fr.text)
@@ -377,16 +407,44 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 		if isCall {
 			observe(it, call.Params.Name, "transport_error", time.Since(start))
 		}
+		if len(plans) > 0 {
+			s.discard(r.Context(), plans)
+		}
 		rpcError(w, http.StatusBadGateway, "the MCP server is unreachable")
 		return
 	}
 	defer resp.Body.Close()
+	if len(plans) > 0 {
+		// the answer is read whole: the result is moved before the agent learns of it (tech §4.4)
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+		for _, h := range []string{"Content-Type", "Mcp-Session-Id", "Cache-Control"} {
+			if v := resp.Header.Get(h); v != "" {
+				w.Header().Set(h, v)
+			}
+		}
+		var seen resultSniffer
+		seen.write(raw)
+		failed := seen.isError() || resp.StatusCode >= 300
+		note, fr := s.finishResults(r.Context(), uid, plans, failed)
+		result := callResult(resp.StatusCode, seen.isError(), nil)
+		if fr != nil {
+			result = fr.result
+		}
+		observe(it, call.Params.Name, result, time.Since(start))
+		w.WriteHeader(resp.StatusCode)
+		if failed {
+			_, _ = w.Write(raw)
+			return
+		}
+		_, _ = w.Write(withResultNote(raw, note, fr))
+		return
+	}
 	for _, h := range []string{"Content-Type", "Mcp-Session-Id", "Cache-Control"} {
 		if v := resp.Header.Get(h); v != "" {
 			w.Header().Set(h, v)
 		}
 	}
-	filter := call.Method == "tools/list" && (it.AllowedTools != nil || it.ReadOnly || only != nil || len(it.FileArgs) > 0)
+	filter := call.Method == "tools/list" && (it.AllowedTools != nil || it.ReadOnly || only != nil || len(it.FileArgs) > 0 || len(it.ResultArgs) > 0)
 	filterTools := func(raw []byte) []byte { return filterToolsList(raw, it, only) }
 	w.WriteHeader(resp.StatusCode)
 	if !filter {
@@ -428,6 +486,18 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 	}
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	_, _ = w.Write(filterTools(raw))
+}
+
+// mustArgs is params.arguments of a JSON-RPC message.
+func mustArgs(body []byte) []byte {
+	var msg struct {
+		Params struct {
+			Arguments json.RawMessage `json:"arguments"`
+		} `json:"params"`
+	}
+	_ = json.Unmarshal(body, &msg)
+	b, _ := json.Marshal(msg.Params.Arguments)
+	return b
 }
 
 // withArguments replaces params.arguments of a JSON-RPC message.

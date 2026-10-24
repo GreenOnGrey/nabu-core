@@ -365,6 +365,9 @@ type MCPTool struct {
 	// arguments an administrator may mark as files of the space
 	// (FTR.NAB.CMN-0006 R14, tech §3.2).
 	StringArgs []string `json:"stringArgs,omitempty"`
+	// StringListArgs are the properties that are arrays of strings: a list of
+	// files of the space (FTR.NAB.CHAT-0003 R11).
+	StringListArgs []string `json:"stringListArgs,omitempty"`
 }
 
 // MCPCheckResponse is the answer of POST /v1/checks/mcp.
@@ -377,6 +380,35 @@ type MCPCheckResponse struct {
 // ConnectionProblem reports whether the class marks the connection as broken
 // (shown to administrators in the connection's state).
 func (c ErrorClass) ConnectionProblem() bool { return c == ErrInsufficientBalance || c == ErrAuth }
+
+// StringListArgs lists the properties of a JSON schema of tool input that
+// are arrays of strings, sorted (FTR.NAB.CHAT-0003 R11).
+func StringListArgs(schema json.RawMessage) []string {
+	var s struct {
+		Properties map[string]struct {
+			Type  json.RawMessage `json:"type"`
+			Items struct {
+				Type json.RawMessage `json:"type"`
+			} `json:"items"`
+		} `json:"properties"`
+	}
+	if json.Unmarshal(schema, &s) != nil {
+		return nil
+	}
+	is := func(raw json.RawMessage, want string) bool {
+		var one string
+		var many []string
+		return (json.Unmarshal(raw, &one) == nil && one == want) || (json.Unmarshal(raw, &many) == nil && slices.Contains(many, want))
+	}
+	var out []string
+	for name, p := range s.Properties {
+		if is(p.Type, "array") && is(p.Items.Type, "string") {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
 
 // StringArgs lists the properties of a JSON schema of tool input whose type is
 // string, sorted (FTR.NAB.CMN-0006 CAT-15).

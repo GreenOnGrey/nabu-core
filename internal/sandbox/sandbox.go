@@ -44,6 +44,10 @@ type Config struct {
 	Quiet       time.Duration // 5 s
 	Batch       int           // 50 files
 	PullEvery   time.Duration
+	// FTR.NAB.CMN-0008: the profile the sandbox runs and the token of a run's
+	// temporary sandbox; with them the sandbox reports missing packages.
+	Profile  string
+	RunToken string
 }
 
 type entry struct {
@@ -447,7 +451,11 @@ func Run(ctx context.Context, cfg Config) error {
 			return err
 		}
 	}
-	ws := &workspace.Workspace{Root: cfg.Root, Token: cfg.WorkspaceToken, Env: workspace.CommandEnv(cfg.Root)}
+	ws := &workspace.Workspace{Root: cfg.Root, Token: cfg.WorkspaceToken, Env: workspace.SandboxEnv(cfg.Root),
+		OnMissing: s.reportMissing}
+	if !cfg.Ephemeral {
+		ws.Heartbeat = s.heartbeat
+	}
 	wsID := cfg.WorkspaceID
 	if wsID == "" {
 		wsID = "sandbox-" + cfg.UserID
@@ -471,4 +479,40 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	slog.Info("final upload done")
 	return nil
+}
+
+// reportMissing sends the modules and commands a command did not find to the
+// api (FTR.NAB.CMN-0008 R11). It never affects the command.
+func (s *Sandbox) reportMissing(items []workspace.Missing) {
+	tok := s.cfg.SandboxToken
+	if s.cfg.Ephemeral {
+		tok = s.cfg.RunToken
+	}
+	if tok == "" || s.cfg.APIURL == "" {
+		return
+	}
+	b, _ := json.Marshal(map[string]any{"profile": s.cfg.Profile, "items": items})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.APIURL+"/internal/v1/sandbox/signals", bytes.NewReader(b))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := s.http.Do(req)
+	if err != nil {
+		slog.Debug("missing packages not reported", "err", err)
+		return
+	}
+	resp.Body.Close()
+}
+
+// heartbeat keeps the space active while a command runs (tech §5.4).
+func (s *Sandbox) heartbeat() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if resp, err := s.api(ctx, http.MethodPost, "heartbeat", "", nil, nil); err == nil {
+		resp.Body.Close()
+	}
 }

@@ -2,6 +2,8 @@ package chat
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -102,7 +104,9 @@ func (a *API) storeAttachment(ctx context.Context, uid uuid.UUID, name, mime str
 	}
 	id := uuid.New()
 	key := "attachments/" + uid.String() + "/" + id.String()
-	cr := &counter{r: io.LimitReader(r, a.MaxFile+1)}
+	// FTR.NAB.CHAT-0003 tech §5: the hash of the content keys the cache of previews
+	h := sha256.New()
+	cr := &counter{r: io.TeeReader(io.LimitReader(r, a.MaxFile+1), h)}
 	if err := a.S3.Put(ctx, key, cr, size, mime); err != nil {
 		return uuid.Nil, err
 	}
@@ -110,8 +114,8 @@ func (a *API) storeAttachment(ctx context.Context, uid uuid.UUID, name, mime str
 		_ = a.S3.Delete(ctx, key)
 		return uuid.Nil, apperr.TooLarge("too_large", fmt.Sprintf("the file is larger than %d MB", a.MaxFile>>20))
 	}
-	_, err := a.Pool.Exec(ctx, `INSERT INTO attachments (id, user_id, file_name, mime_type, size_bytes, s3_key) VALUES ($1,$2,$3,$4,$5,$6)`,
-		id, uid, name, mime, cr.n, key)
+	_, err := a.Pool.Exec(ctx, `INSERT INTO attachments (id, user_id, file_name, mime_type, size_bytes, s3_key, sha256) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+		id, uid, name, mime, cr.n, key, hex.EncodeToString(h.Sum(nil)))
 	return id, err
 }
 

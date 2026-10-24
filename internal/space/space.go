@@ -28,8 +28,10 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/platform/httpx"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/jwt"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/mcp"
+	"github.com/GreenOnGrey/nabu-core/internal/platform/metrics"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/postgres"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/storage"
+	"github.com/GreenOnGrey/nabu-core/internal/sandboxprofile"
 )
 
 // WorkspaceID is the relay id of a user's sandbox.
@@ -78,6 +80,8 @@ type Service struct {
 	MaxFile int64
 	// Enabled reports whether personal sandboxes run in this deployment.
 	Enabled bool
+	// Profiles tells space_info the profile of the sandbox (FTR.NAB.CMN-0008 R5).
+	Profiles *sandboxprofile.Service
 }
 
 // Key is the S3 key of a file.
@@ -380,13 +384,22 @@ func (s *Service) InternalRoutes(r chi.Router) {
 			httpx.NoContent(w)
 			return nil
 		}))
+		// FTR.NAB.CMN-0008 tech §5.4: a running command keeps the sandbox
+		// active, so neither the idle stop nor a restart on a new image cuts it.
+		r.Post("/heartbeat", httpx.Handler(func(w http.ResponseWriter, r *http.Request) error {
+			if _, err := s.Pool.Exec(r.Context(), `UPDATE spaces SET last_activity_at = now() WHERE user_id = $1`, uidOf(r)); err != nil {
+				return err
+			}
+			httpx.NoContent(w)
+			return nil
+		}))
 	})
 }
 
 // Tool is space_info of the built-in MCP.
 func (s *Service) Tool() mcp.Tool {
 	return mcp.Tool{Name: "space_info", ReadOnly: true,
-		Description: "State of the user's personal space: whether it runs, used and quota bytes, number of files. Your file and shell tools work in this space.",
+		Description: "State of the user's personal space: whether it runs, used and quota bytes, number of files, and the sandbox profile with its tools. Your file and shell tools work in this space.",
 		InputSchema: mcp.Schema(map[string]any{}),
 		Handler: func(ctx context.Context, g mcp.Grant, _ json.RawMessage) (string, error) {
 			i, err := s.Info(ctx, g.UserID)
@@ -396,7 +409,13 @@ func (s *Service) Tool() mcp.Tool {
 			if !s.Enabled {
 				return "Personal spaces are not enabled in this deployment.", nil
 			}
-			return fmt.Sprintf("State: %s; used %d of %d bytes; %d files.", i.State, i.UsedBytes, i.QuotaBytes, i.Files), nil
+			out := fmt.Sprintf("State: %s; used %d of %d bytes; %d files.", i.State, i.UsedBytes, i.QuotaBytes, i.Files)
+			if s.Profiles != nil {
+				if m, err := s.Profiles.ManifestFor(ctx, sandboxprofile.Caller{UserID: g.UserID}); err == nil {
+					out += "\n" + ProfileSummary(m)
+				}
+			}
+			return out, nil
 		}}
 }
 
@@ -416,6 +435,9 @@ type RelayStore struct {
 
 // Register implements relay.Store.
 func (r *RelayStore) Register(ctx context.Context, id, kind, pod string) error {
+	if uid, ok := UserOfWorkspace(id); ok {
+		r.observeStart(ctx, uid)
+	}
 	_, err := r.Pool.Exec(ctx, `INSERT INTO workspace_connections (workspace_id, kind, relay_pod) VALUES ($1,$2,$3)
 		ON CONFLICT (workspace_id) DO UPDATE SET kind = EXCLUDED.kind, relay_pod = EXCLUDED.relay_pod, connected_at = now(), last_ping_at = now()`, id, kind, pod)
 	if uid, ok := UserOfWorkspace(id); ok && err == nil {
@@ -423,6 +445,20 @@ func (r *RelayStore) Register(ctx context.Context, id, kind, pod string) error {
 		r.publish(ctx, uid, "running")
 	}
 	return err
+}
+
+// observeStart records how long a starting sandbox took to connect
+// (FTR.NAB.CMN-0008 R20).
+func (r *RelayStore) observeStart(ctx context.Context, uid uuid.UUID) {
+	var (
+		secs          float64
+		profile, kind string
+	)
+	err := r.Pool.QueryRow(ctx, `SELECT extract(epoch FROM now() - s.state_changed_at), coalesce(s.profile, 'base'), coalesce(p.kind, 'builtin')
+		FROM spaces s LEFT JOIN sandbox_profiles p ON p.name = s.profile WHERE s.user_id = $1 AND s.state = 'starting'`, uid).Scan(&secs, &profile, &kind)
+	if err == nil {
+		metrics.SandboxStartSeconds.WithLabelValues(profile, kind, "sandbox").Observe(secs)
+	}
 }
 
 // Unregister implements relay.Store.
@@ -474,4 +510,45 @@ func (r *RelayStore) publish(ctx context.Context, uid uuid.UUID, state string) {
 	if r.Events != nil {
 		r.Events.Publish(ctx, events.Event{Type: events.SpaceState, UserID: &uid, Data: map[string]string{"state": state}})
 	}
+}
+
+// ProfileSummary is the profile for space_info: the name, the version or the
+// digest, the description and a compact list of tools (the full one is in
+// /nabu/sandbox-profile.json).
+func ProfileSummary(m *sandboxprofile.Manifest) string {
+	var b strings.Builder
+	b.WriteString("Sandbox profile: " + m.Name + " (" + m.Kind)
+	if m.Digest != "" {
+		b.WriteString(", " + m.Digest)
+	} else if m.Version != "" {
+		b.WriteString(", " + m.Version)
+	}
+	b.WriteString("). Packages cannot be installed; the full list is in /nabu/sandbox-profile.json.")
+	if m.Description != "" {
+		b.WriteString("\nAbout this profile: " + m.Description)
+	}
+	var tools []string
+	for _, t := range m.Tools {
+		tools = append(tools, t.Name)
+	}
+	if len(tools) == 0 {
+		tools = m.Commands
+	}
+	if len(tools) > 0 {
+		if len(tools) > 120 {
+			tools = tools[:120]
+		}
+		b.WriteString("\nTools: " + strings.Join(tools, ", "))
+	}
+	if len(m.Python) > 0 {
+		py := make([]string, 0, len(m.Python))
+		for _, p := range m.Python {
+			py = append(py, p.Name+" "+p.Version)
+		}
+		if len(py) > 120 {
+			py = py[:120]
+		}
+		b.WriteString("\nPython packages: " + strings.Join(py, ", "))
+	}
+	return b.String()
 }

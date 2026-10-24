@@ -40,11 +40,19 @@ func (p presignMem) PresignGet(_ context.Context, key string, ttl time.Duration)
 	return "http://s3.test/" + key + "?ttl=" + ttl.String(), nil
 }
 
+func (p presignMem) PresignPut(_ context.Context, key string, ttl time.Duration) (string, error) {
+	return "http://s3.test/put/" + key + "?ttl=" + ttl.String(), nil
+}
+
 // fakeMCP is an MCP server with fixed tools that records the arguments of calls.
 type fakeMCP struct {
 	mu    sync.Mutex
 	calls []map[string]any
 	tools []map[string]any
+	// store, when set, takes the uploads of results: a dest of
+	// http://s3.test/put/<key> gets result (FTR.NAB.CHAT-0003).
+	store  *mem
+	result []byte
 }
 
 func (f *fakeMCP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -66,6 +74,12 @@ func (f *fakeMCP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.calls = append(f.calls, map[string]any{"name": req.Params.Name, "args": req.Params.Arguments})
 		f.mu.Unlock()
+		if dest, ok := req.Params.Arguments["dest"].(string); ok && f.store != nil && f.result != nil {
+			if k, ok := strings.CutPrefix(dest, "http://s3.test/put/"); ok {
+				k, _, _ = strings.Cut(k, "?")
+				_ = f.store.Put(r.Context(), k, bytes.NewReader(f.result), int64(len(f.result)), "")
+			}
+		}
 		result = map[string]any{"content": []map[string]string{{"type": "text", "text": "done"}}, "isError": req.Params.Name == "fails"}
 	default:
 		result = map[string]any{}
@@ -279,7 +293,8 @@ func TestMCPProxyFiles(t *testing.T) {
 	n := len(srv.calls)
 	got, _ := srv.calls[n-1]["args"].(map[string]any)["source"].(string)
 	srv.mu.Unlock()
-	m := regexp.MustCompile(`^http://s3\.test/(mcp-files/[0-9a-f-]{36}/a\.pdf)\?ttl=5m0s$`).FindStringSubmatch(got)
+	// FTR.NAB.CHAT-0003 tech §4.3: the path of the space travels in the fragment
+	m := regexp.MustCompile(`^http://s3\.test/(mcp-files/[0-9a-f-]{36}/a\.pdf)\?ttl=5m0s#nabu-path=docs/a\.pdf$`).FindStringSubmatch(got)
 	if m == nil || string(s3.m[m[1]]) != "%PDF-a" {
 		t.Fatalf("the server got %q", got)
 	}
@@ -361,18 +376,18 @@ func TestSpaceSnapshots(t *testing.T) {
 		}
 		return string(s3.m[m[1]])
 	}
-	u, err := snaps.Snapshot(ctx, uid, "docs/a.pdf", 1<<20)
-	if err != nil || copyOf(u) != "new version" {
-		t.Fatalf("FIL-01: %q %v", u, err)
+	u, size, err := snaps.Snapshot(ctx, uid, "docs/a.pdf", 1<<20)
+	if err != nil || copyOf(u) != "new version" || size != int64(len("new version")) {
+		t.Fatalf("FIL-01: %q %d %v", u, size, err)
 	}
-	if _, err := snaps.Snapshot(ctx, uid, "docs", 1<<20); !errors.Is(err, catalog.ErrFileNotFound) {
+	if _, _, err := snaps.Snapshot(ctx, uid, "docs", 1<<20); !errors.Is(err, catalog.ErrFileNotFound) {
 		t.Fatalf("FIL-06: a directory: %v", err)
 	}
-	if _, err := snaps.Snapshot(ctx, uid, "big.bin", 1024); !errors.Is(err, catalog.ErrFileTooLarge) {
+	if _, _, err := snaps.Snapshot(ctx, uid, "big.bin", 1024); !errors.Is(err, catalog.ErrFileTooLarge) {
 		t.Fatalf("FIL-14: %v", err)
 	}
 	relay.delay = time.Second
-	if u, err = snaps.Snapshot(ctx, uid, "docs/a.pdf", 1<<20); err != nil || copyOf(u) != "old" {
+	if u, _, err = snaps.Snapshot(ctx, uid, "docs/a.pdf", 1<<20); err != nil || copyOf(u) != "old" {
 		t.Fatalf("FIL-03: %q %v", u, err)
 	}
 	// FIL-08
@@ -564,4 +579,116 @@ func proxyCalls(t *testing.T, item, tool string, result ...string) float64 {
 		}
 	}
 	return sum
+}
+
+// FTR.NAB.CHAT-0003 RES-01 (S3 path), RES-02, RES-04, RES-05, RES-07, RES-08, CNF-01: a result file
+// of a tool reaches the space through the proxy.
+func TestMCPProxyResults(t *testing.T) {
+	ctx := context.Background()
+	box, _ := crypto.NewBox(key)
+	signer := jwt.NewSigner("https://n", key)
+	store := &mem{m: map[string][]byte{}}
+	srv := &fakeMCP{store: store, result: []byte("%PDF-result"), tools: []map[string]any{
+		{"name": "render_document", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{
+			"markdown": stringProp("Markdown"), "dest": stringProp("where to upload")}}},
+	}}
+	mcpSrv := httptest.NewServer(srv)
+	defer mcpSrv.Close()
+	s3 := presignMem{store}
+	sp := &space.Service{Pool: pool, S3: s3, Signer: signer, Quota: 1 << 20, MaxFile: 1 << 20}
+	snaps := &space.Snapshots{Space: sp}
+	cat := &catalog.Service{Pool: pool, Box: box, Signer: signer, InternalURL: "http://api:8081", Files: snaps.Snapshot, Results: snaps}
+	cat.CheckMCP = func(context.Context, agent.MCPCheckRequest) (*agent.MCPCheckResponse, error) {
+		return &agent.MCPCheckResponse{OK: true, Tools: []agent.MCPTool{{Name: "render_document", StringArgs: []string{"dest", "markdown"}}}}, nil
+	}
+	mode := "platform"
+	it, err := cat.Save(ctx, nil, catalog.Input{Type: "mcp", Name: "docgen-it", Source: &catalog.Source{Kind: "url", URL: mcpSrv.URL}, Mode: &mode, Published: ptr(true)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.Check(ctx, it.ID, "", uuid.Nil); err != nil {
+		t.Fatal(err)
+	}
+	if it, err = cat.Save(ctx, &it.ID, catalog.Input{AllowedTools: &[]string{"render_document"},
+		ResultArgs: &[]catalog.FileArg{{Tool: "render_document", Arg: "dest"}}, SpaceOnlyTools: &[]string{"render_document"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(it.ResultArgs) != 1 || it.ResultMaxBytes != catalog.DefaultResultMaxBytes || len(it.SpaceOnlyTools) != 1 {
+		t.Fatalf("saved item: %+v", it)
+	}
+	uid := newUser(t, "results@x.org")
+	if _, err := cat.Connect(ctx, uid, it.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	r := chi.NewRouter()
+	held := 0
+	cat.ProxyRoutes(r, func(context.Context, uuid.UUID) (string, bool) { return "results@x.org", true },
+		func(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, string, string, json.RawMessage) (string, bool) {
+			held++
+			return "held", true
+		})
+	api := httptest.NewServer(r)
+	defer api.Close()
+	conv := uuid.New()
+	tok := signer.Issue(jwt.Claims{Audience: jwt.AudMCP, Subject: "proxy:" + it.ID.String(), User: uid.String(), Channel: "email", Conversation: conv.String()}, time.Hour)
+	call := func(args map[string]any) (string, bool) {
+		b, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": map[string]any{"name": "render_document", "arguments": args}})
+		req, _ := http.NewRequest(http.MethodPost, api.URL+"/internal/v1/mcp-proxy/"+it.ID.String(), bytes.NewReader(b))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out struct {
+			Result struct {
+				Content []struct{ Text string } `json:"content"`
+				IsError bool                    `json:"isError"`
+			} `json:"result"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		var texts []string
+		for _, c := range out.Result.Content {
+			texts = append(texts, c.Text)
+		}
+		return strings.Join(texts, " | "), out.Result.IsError
+	}
+	// CNF-01, RES-02: a new file — no confirmation in a mail topic; the sandbox sleeps — S3 of the space
+	text, isErr := call(map[string]any{"markdown": "# Q3", "dest": "reports/q3.pdf"})
+	if isErr || held != 0 || !strings.Contains(text, "Saved to reports/q3.pdf") {
+		t.Fatalf("RES-02: %q %v held=%d", text, isErr, held)
+	}
+	rc, f, err := sp.Open(ctx, uid, "reports/q3.pdf")
+	if err != nil || f.Size != int64(len("%PDF-result")) {
+		t.Fatalf("RES-02: the file is not in the space: %v", err)
+	}
+	rc.Close()
+	for k := range store.m {
+		if strings.HasPrefix(k, space.ResultPrefix) {
+			t.Fatalf("the upload %s stays", k)
+		}
+	}
+	// RES-04: the file exists, no overwrite — refused before the server
+	before := len(srv.calls)
+	if text, isErr := call(map[string]any{"markdown": "# Q3", "dest": "reports/q3.pdf"}); !isErr || !strings.Contains(text, "exists") || len(srv.calls) != before {
+		t.Fatalf("RES-04: %q", text)
+	}
+	// CNF-02: an overwrite waits for the user in a mail topic
+	if text, _ := call(map[string]any{"markdown": "# Q3", "dest": "reports/q3.pdf", "overwrite": true}); text != "held" || held != 1 {
+		t.Fatalf("CNF-02: %q held=%d", text, held)
+	}
+	// RES-08: the server did not upload
+	srv.result = nil
+	if text, isErr := call(map[string]any{"markdown": "# x", "dest": "reports/none.pdf"}); !isErr || !strings.Contains(text, "did not save") {
+		t.Fatalf("RES-08: %q", text)
+	}
+	// RES-07: the space is full
+	srv.result = []byte(strings.Repeat("x", 4096))
+	if _, err := pool.Exec(ctx, `UPDATE spaces SET quota_bytes = 2048 WHERE user_id = $1`, uid); err != nil {
+		t.Fatal(err)
+	}
+	if text, isErr := call(map[string]any{"markdown": "# x", "dest": "reports/big.pdf"}); !isErr || !strings.Contains(text, "space left") {
+		t.Fatalf("RES-07: %q", text)
+	}
 }

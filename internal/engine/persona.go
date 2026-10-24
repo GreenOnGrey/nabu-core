@@ -33,6 +33,8 @@ type Persona struct {
 	Spaces  bool
 	Now     time.Time
 	Catalog []string // titles of the connected tools
+	// Documents: the service of documents is among the tools (FTR.NAB.CHAT-0003 R17).
+	Documents bool
 	// Group is set for a group agent (FTR.NAB.CMN-0002 R16).
 	Group *GroupInfo
 }
@@ -45,7 +47,7 @@ type GroupInfo struct {
 // Hash changes when the instructions must change: the profile or the memory.
 func (p Persona) Hash() string {
 	h := sha256.New()
-	fmt.Fprintf(h, "%s|%s|%s|%s|%s|%v", p.Agent.Name, p.Agent.Tone, p.User.Timezone, p.User.Language, memory.Hash(p.Memory), p.Catalog)
+	fmt.Fprintf(h, "%s|%s|%s|%s|%s|%v|%v", p.Agent.Name, p.Agent.Tone, p.User.Timezone, p.User.Language, memory.Hash(p.Memory), p.Catalog, p.Documents)
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
@@ -71,6 +73,10 @@ func (p Persona) Instructions() string {
 		"When the user asks to do something later or regularly, create a task: ask for a missing time or channel, then confirm the schedule, the first run and the channel.\n")
 	if p.Spaces {
 		b.WriteString("Your file and shell tools (read, write, edit, bash, ls, find, grep) work in the user's personal space: an isolated workspace whose files persist between conversations.\n")
+		b.WriteString(SandboxRule)
+		if p.Documents {
+			b.WriteString(DocumentsRule)
+		}
 	} else {
 		b.WriteString("You have no file system or shell in this deployment.\n")
 	}
@@ -95,6 +101,10 @@ func (p Persona) groupInstructions() string {
 		"space_info shows the space of the group. Do not create scheduled tasks.\n")
 	if p.Spaces {
 		b.WriteString("Your file and shell tools work in the space of the group: files persist between conversations of the chat.\n")
+		b.WriteString(SandboxRule)
+		if p.Documents {
+			b.WriteString(DocumentsRule)
+		}
 	}
 	if len(p.Catalog) > 0 {
 		b.WriteString("Platform tools: " + strings.Join(p.Catalog, "; ") + ". They work with platform credentials, the same for every member.\n")
@@ -150,3 +160,16 @@ func channelRules(ch string, now time.Time, tz string) string {
 		return "[Channel: Nabu website, " + t + ". Markdown is rendered.]"
 	}
 }
+
+// SandboxRule is how an agent works with the fixed set of tools of its
+// sandbox (FTR.NAB.CMN-0008 R19).
+const SandboxRule = "Your sandbox has a fixed set of tools (its profile): check space_info or /nabu/sandbox-profile.json before writing code. " +
+	"Packages cannot be installed: pip, npm and apt are unavailable and there is no internet. If a task needs something missing, " +
+	"call sandbox_request_package with the reason, tell the user it cannot be done right now and offer a workaround.\n"
+
+// DocumentsRule is how an agent makes documents (FTR.NAB.CHAT-0003 R17).
+const DocumentsRule = "For documents use the tools of the service of documents first: render_document (Markdown → DOCX, PDF, PPTX), " +
+	"render_spreadsheet, fill_template, edit_document, convert (also HTML → PDF) and pdf_tools; pass dest — the path of the result in the space — " +
+	"and send the file with chat_attach. Write code in the sandbox only when no tool fits, then convert its result with a tool. " +
+	"For HTML → PDF embed styles, images and scripts into the page or pass a .zip; take chart libraries from /opt/nabu/assets, never from a CDN; " +
+	"set window.status = 'ready' when the charts are drawn.\n"
