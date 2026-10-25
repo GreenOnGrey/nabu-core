@@ -12,27 +12,27 @@ import shutil
 import subprocess
 import sys
 
-# Group, tool, command printing the version (None — no version), profile.
+# Group (a key: the panel translates it), tool, command printing the version (None — no version), profile.
 TOOLS = [
-    ("Архивы", "zip", ["zip", "-v"], "base"),
-    ("Архивы", "unzip", ["unzip", "-v"], "base"),
-    ("Архивы", "xz", ["xz", "--version"], "base"),
-    ("Архивы", "bzip2", None, "base"),
-    ("Утилиты", "jq", ["jq", "--version"], "base"),
-    ("Утилиты", "rg", ["rg", "--version"], "base"),
-    ("Утилиты", "file", ["file", "--version"], "base"),
-    ("Утилиты", "tree", ["tree", "--version"], "base"),
-    ("Утилиты", "patch", ["patch", "--version"], "base"),
-    ("Утилиты", "less", ["less", "--version"], "base"),
-    ("Утилиты", "bc", ["bc", "--version"], "base"),
-    ("Утилиты", "sqlite3", ["sqlite3", "--version"], "base"),
-    ("Python", "python3", ["python3", "--version"], "base"),
-    ("Node.js и git", "node", ["node", "--version"], "base"),
-    ("Node.js и git", "git", ["git", "--version"], "base"),
-    ("PDF", "typst", ["typst", "--version"], "documents"),
-    ("PDF", "pdftotext", ["pdftotext", "-v"], "documents"),
-    ("PDF", "pdftoppm", ["pdftoppm", "-v"], "documents"),
-    ("PDF", "qpdf", ["qpdf", "--version"], "documents"),
+    ("archives", "zip", ["zip", "-v"], "base"),
+    ("archives", "unzip", ["unzip", "-v"], "base"),
+    ("archives", "xz", ["xz", "--version"], "base"),
+    ("archives", "bzip2", None, "base"),
+    ("utilities", "jq", ["jq", "--version"], "base"),
+    ("utilities", "rg", ["rg", "--version"], "base"),
+    ("utilities", "file", ["file", "--version"], "base"),
+    ("utilities", "tree", ["tree", "--version"], "base"),
+    ("utilities", "patch", ["patch", "--version"], "base"),
+    ("utilities", "less", ["less", "--version"], "base"),
+    ("utilities", "bc", ["bc", "--version"], "base"),
+    ("utilities", "sqlite3", ["sqlite3", "--version"], "base"),
+    ("python", "python3", ["python3", "--version"], "base"),
+    ("node-git", "node", ["node", "--version"], "base"),
+    ("node-git", "git", ["git", "--version"], "base"),
+    ("pdf", "typst", ["typst", "--version"], "documents"),
+    ("pdf", "pdftotext", ["pdftotext", "-v"], "documents"),
+    ("pdf", "pdftoppm", ["pdftoppm", "-v"], "documents"),
+    ("pdf", "qpdf", ["qpdf", "--version"], "documents"),
 ]
 
 PROFILES = {"base": {"base"}, "documents": {"base", "documents"}}
@@ -92,7 +92,7 @@ def assets():
             for line in f:
                 name, _, version = line.strip().partition("\t")
                 if name and name != "typst":
-                    out.append({"group": "Ресурсы для HTML", "name": name, "version": version})
+                    out.append({"group": "html-assets", "name": name, "version": version})
     except OSError:
         pass
     return out
