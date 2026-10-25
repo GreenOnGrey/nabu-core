@@ -471,7 +471,9 @@ func (c *Config) validateSandboxProfiles() []error {
 			errs = append(errs, fmt.Errorf("SANDBOX_DEFAULTS: unknown target %q (personal, group, service)", t))
 			continue
 		}
-		if _, ok := c.SandboxProfiles[name]; !ok && !(len(c.SandboxProfiles) == 0 && name == "base") {
+		// without profiles the single image is the profile base
+		legacyBase := len(c.SandboxProfiles) == 0 && name == "base"
+		if _, ok := c.SandboxProfiles[name]; !ok && !legacyBase {
 			errs = append(errs, fmt.Errorf("SANDBOX_DEFAULTS: %s=%s is not in SANDBOX_PROFILES", t, name))
 		}
 	}
@@ -500,7 +502,8 @@ func ProfileName(s string) bool {
 		return false
 	}
 	for _, r := range s {
-		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+		allowed := r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-'
+		if !allowed {
 			return false
 		}
 	}

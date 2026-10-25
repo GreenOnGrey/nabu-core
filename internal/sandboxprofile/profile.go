@@ -245,7 +245,8 @@ func (s *Service) load(ctx context.Context, name string) (Profile, error) {
 		return p, err
 	}
 	// A custom profile being refreshed stays ready on its old digest.
-	if state != StateReady && !(p.Kind == KindCustom && digest != nil && *digest != "") {
+	onOldDigest := p.Kind == KindCustom && digest != nil && *digest != ""
+	if state != StateReady && !onOldDigest {
 		return p, errNotReady
 	}
 	p.Image = ref
