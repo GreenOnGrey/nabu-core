@@ -129,6 +129,12 @@ func ModelsJSON(m agent.ModelSpec) map[string]any {
 		"baseUrl": m.BaseURL, "api": m.API, "apiKey": "${NABU_LLM_KEY}", "models": models}}}
 }
 
+// MCPCallTimeout is how long Pi waits for an answer of an MCP server, in
+// seconds. Pi's default is 60 s, shorter than a conversion of the service of
+// documents (its own limit is 120 s, FTR.NAB.CHAT-0003 R12): the agent got
+// «MCP request timed out» instead of the answer of the server.
+const MCPCallTimeout = 180
+
 // MCPJSON lists the MCP servers of the session with headers from the environment.
 func MCPJSON(req agent.SessionRequest) map[string]any {
 	servers := map[string]any{}
@@ -137,7 +143,7 @@ func MCPJSON(req agent.SessionRequest) map[string]any {
 		for _, name := range s.HeaderNames {
 			h[name] = "${" + HeaderEnv(i+1, name) + "}"
 		}
-		e := map[string]any{"url": s.URL, "exposure": exposure(s.Exposure)}
+		e := map[string]any{"url": s.URL, "exposure": exposure(s.Exposure), "timeout": MCPCallTimeout}
 		if len(h) > 0 {
 			e["headers"] = h
 		}

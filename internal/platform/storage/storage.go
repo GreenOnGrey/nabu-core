@@ -60,8 +60,21 @@ func NewS3(ctx context.Context, endpoint, accessKey, secretKey, bucket string, u
 
 // Put stores an object; size -1 streams with an unknown length.
 func (s *S3) Put(ctx context.Context, key string, r io.Reader, size int64, contentType string) error {
-	_, err := s.c.PutObject(ctx, s.bucket, key, r, size, minio.PutObjectOptions{ContentType: contentType})
+	_, err := s.c.PutObject(ctx, s.bucket, key, r, size, putOptions(size, contentType))
 	return err
+}
+
+// unknownSizePart is the part of an upload of unknown size. Without it
+// minio-go sizes the part for 5 TiB (~550 MiB) and holds a buffer of that
+// size per upload: a few uploads of a sandbox in a row killed the api by OOM.
+const unknownSizePart = 16 << 20
+
+func putOptions(size int64, contentType string) minio.PutObjectOptions {
+	o := minio.PutObjectOptions{ContentType: contentType}
+	if size < 0 {
+		o.PartSize = unknownSizePart
+	}
+	return o
 }
 
 // Get opens an object; a missing object is ErrNotFound.

@@ -117,6 +117,12 @@ func (s *Sandbox) api(ctx context.Context, method, op, p string, body io.Reader,
 	if err != nil {
 		return nil, err
 	}
+	// a file goes with its length: the api then streams it to S3 with a known size
+	if f, ok := body.(*os.File); ok {
+		if st, err := f.Stat(); err == nil {
+			req.ContentLength = st.Size()
+		}
+	}
 	req.Header.Set("Authorization", "Bearer "+s.cfg.SandboxToken)
 	for k, v := range hdr {
 		req.Header.Set(k, v)
