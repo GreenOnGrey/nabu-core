@@ -2,4 +2,13 @@
 # Code scanning report still lists everything. Every entry has a reason and an
 # expiry: after expired_at the finding blocks the release again.
 
-vulnerabilities: []
+vulnerabilities:
+  # undici 8.10.2 → 8.12.2: denial of service on a response with excess content.
+  # Pinned by the Pi agent 1.4.0 (deploy/versions.env, PI_VERSION), the latest
+  # Pi; by the expiry — a Pi with the fixed undici.
+  - id: CVE-2026-109869
+    paths: ["usr/local/lib/node_modules/@earendil-works/**"]
+    statement: >-
+      undici in Pi talks only to the models and the MCP servers of the catalog;
+      a failed stream ends one turn of the agent, not the api of Nabu.
+    expired_at: 2026-11-25

@@ -33,11 +33,11 @@ sandbox-lock:
 	cd sandbox/base && uv lock --upgrade --python 3.13
 	cd sandbox/documents && uv lock --upgrade --python 3.13
 
-# The Debian of sandboxes: the latest dated trixie-slim image and the apt archive of its day (FTR.NAB.CMN-0008 R4).
+# The Debian of sandboxes: the latest dated trixie-slim image and the apt archive of today (FTR.NAB.CMN-0008 R4).
 debian-snapshot:
 	tag=$$(curl -fsSL "https://hub.docker.com/v2/repositories/library/debian/tags?page_size=100&name=trixie-20" \
 	  | python3 -c 'import json,sys; print(sorted(t["name"] for t in json.load(sys.stdin)["results"] if t["name"].endswith("-slim"))[-1])') \
-	&& day=$$(echo "$$tag" | sed -E 's/^trixie-([0-9]{8})-slim$$/\1/') \
+	&& day=$$(date -u +%Y%m%d) \
 	&& sed -i -E "s/^ARG DEBIAN_IMAGE=.*/ARG DEBIAN_IMAGE=debian:$$tag/; s/^ARG DEBIAN_SNAPSHOT=.*/ARG DEBIAN_SNAPSHOT=$${day}T000000Z/" Dockerfile \
 	&& grep -E '^ARG DEBIAN_(IMAGE|SNAPSHOT)=' Dockerfile
 

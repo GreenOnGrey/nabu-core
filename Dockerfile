@@ -4,13 +4,15 @@
 # sandbox-documents are the images of the built-in sandbox profiles
 # (FTR.NAB.CMN-0008).
 
-# The Debian of sandboxes (FTR.NAB.CMN-0008 R4): a dated image and the apt
-# archive of the same day from snapshot.debian.org. The nabu-core build (the
-# manifests of profiles) and the build of the published sandbox images get the
-# same system packages, whenever each of them runs. `make debian-snapshot`
-# moves both to the latest dated image.
+# The Debian of sandboxes (FTR.NAB.CMN-0008 R4): a dated image and a fixed day
+# of the apt archive on snapshot.debian.org. The nabu-core build (the manifests
+# of profiles) and the build of the published sandbox images get the same
+# system packages, whenever each of them runs. The day of the archive may be
+# later than the image: apt-get upgrade brings the security fixes of that day.
+# `make debian-snapshot` moves the image to the latest dated one and the
+# archive to today.
 ARG DEBIAN_IMAGE=debian:trixie-20261020-slim
-ARG DEBIAN_SNAPSHOT=20261020T000000Z
+ARG DEBIAN_SNAPSHOT=20261025T000000Z
 
 FROM golang:1.27-alpine AS build
 WORKDIR /src

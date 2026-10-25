@@ -25,8 +25,10 @@ builds two built-in profiles from this repository's `Dockerfile`:
 
 `make sandbox-images` builds and checks them (`sandbox/test.sh`), `make sandbox-lock` updates the Python
 libraries, `sandbox/documents/assets.lock` pins the tools and assets by sha256. System packages are pinned by
-`DEBIAN_IMAGE` (a dated `debian:trixie-<date>-slim`) and `DEBIAN_SNAPSHOT` (the apt archive of the same day on
-snapshot.debian.org) at the top of the `Dockerfile`; `make debian-snapshot` moves both to the latest dated image.
+`DEBIAN_IMAGE` (a dated `debian:trixie-<date>-slim`) and `DEBIAN_SNAPSHOT` (a day of the apt archive on
+snapshot.debian.org, possibly later than the image: `apt-get upgrade` brings its security fixes) at the top of the
+`Dockerfile`. When the scan of a sandbox image finds a fixed Debian package, `make debian-snapshot` moves the image to
+the latest dated one and the archive to today.
 
 ### Custom images
 
