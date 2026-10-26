@@ -16,6 +16,7 @@ dependencies = [
     # documents
     "docxtpl",
     "lxml",
+    "markdown",
     "python-docx",
     "python-pptx",
     # data and charts
@@ -24,6 +25,9 @@ dependencies = [
     "pandas",
     # HTML and CSS to PDF without JavaScript
     "weasyprint",
+    # PDF from code, asked by agents (FTR.NAB.CMN-0008 R3)
+    "fpdf2",
+    "reportlab",
 ]
 
 [tool.uv]

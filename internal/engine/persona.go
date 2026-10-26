@@ -168,7 +168,8 @@ const SandboxRule = "Your sandbox has a fixed set of tools (its profile): check 
 	"call sandbox_request_package with the reason, tell the user it cannot be done right now and offer a workaround.\n"
 
 // DocumentsRule is how an agent makes documents (FTR.NAB.CHAT-0003 R17).
-const DocumentsRule = "For documents use the tools of the service of documents first: render_document (Markdown → DOCX, PDF, PPTX), " +
+const DocumentsRule = "For documents use the tools of the service of documents first: render_document (Markdown → DOCX, PDF, PPTX; a Markdown file of the space goes in source, " +
+	"never as $(cat …) in markdown — tools do not run the shell), " +
 	"render_spreadsheet, fill_template, edit_document, convert (also HTML → PDF) and pdf_tools; pass dest — the path of the result in the space — " +
 	"and send the file with chat_attach. Write code in the sandbox only when no tool fits, then convert its result with a tool. " +
 	"For HTML → PDF embed styles, images and scripts into the page or pass a .zip; take chart libraries from /opt/nabu/assets, never from a CDN; " +

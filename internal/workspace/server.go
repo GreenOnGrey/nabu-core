@@ -61,13 +61,19 @@ var ErrOutside = errors.New("path_outside_workspace")
 
 // Resolve maps a path relative to the checkout (or "/"-rooted inside it) to
 // an absolute path, refusing ".." escapes and symlinks that lead outside —
-// also for files that do not exist yet.
+// also for files that do not exist yet. An absolute path under the root, as
+// the shell of the workspace shows it (/work/report.md), is the same file
+// (FTR.NAB.CMN-0001 tech, decision 19).
 func (w *Workspace) Resolve(p string) (string, error) {
 	root, err := filepath.Abs(w.Root)
 	if err != nil {
 		return "", err
 	}
-	p = strings.TrimPrefix(filepath.ToSlash(p), "/")
+	p = filepath.ToSlash(p)
+	if r := filepath.ToSlash(root); p == r || strings.HasPrefix(p, strings.TrimSuffix(r, "/")+"/") {
+		p = strings.TrimPrefix(p, r)
+	}
+	p = strings.TrimPrefix(p, "/")
 	clean := filepath.Clean(filepath.Join(root, filepath.FromSlash(p)))
 	if !inside(root, clean) {
 		return "", ErrOutside

@@ -15,6 +15,8 @@
  * administration.
  */
 
+import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
@@ -53,11 +55,49 @@ class WorkspaceError extends Error {
 	}
 }
 
-/** Paths are relative to the checkout; the local working directory is only a mount point. */
+/**
+ * Paths are relative to the checkout; the local working directory is only a mount point. An
+ * absolute path elsewhere is the workspace's own (the shell there shows /work/report.md): the
+ * workspace server resolves it against its root.
+ */
 function remotePath(localCwd: string, p: string): string {
-	const rel = path.relative(localCwd, path.resolve(localCwd, p));
+	const abs = path.resolve(localCwd, p);
+	const rel = path.relative(localCwd, abs);
+	if (path.isAbsolute(p) && (rel === ".." || rel.startsWith(`..${path.sep}`))) return abs.split(path.sep).join("/");
 	return rel.split(path.sep).join("/");
 }
+
+/** Folder of the workspace for the files Pi writes for the model (FTR.NAB.CMN-0001 tech, decision 18). */
+const OUTPUT_DIR = ".pi-output";
+/** Files of OUTPUT_DIR older than this are removed: they served sessions that are over. */
+const OUTPUT_KEEP_MINUTES = 24 * 60;
+
+/**
+ * Pi saves the full text of a truncated result (bash, MCP) to its own temporary directory and
+ * names it in details.fullOutputPath and in the text; the model reads it with read or bash, which
+ * run in the workspace, where the file is not. The file is moved to OUTPUT_DIR of the workspace.
+ * Returns the new path, or undefined when the file stays where Pi wrote it.
+ */
+async function moveOutputFile(local: string): Promise<string | undefined> {
+	if (!local.startsWith(path.join(os.tmpdir(), "pi-"))) return undefined;
+	const remote = `${OUTPUT_DIR}/${path.basename(local)}`;
+	try {
+		const data = await fs.readFile(local);
+		await call("fs/write", { path: remote, content: data.toString("base64") });
+		await fs.rm(local, { force: true });
+		return remote;
+	} catch {
+		return undefined; // the model keeps the truncated text; the note stays as Pi wrote it
+	}
+}
+
+/**
+ * «Tool mcp__docgen__convert not found»: the model called a deferred tool before tool_search loaded
+ * it (FTR.NAB.CMN-0001 tech, decision 20). The mark in details tells the agent operator the call was
+ * a load, not a failure.
+ */
+const NOT_LOADED = /^Tool (\S+) not found$/;
+const LOADED_MARK = { nabuToolLoaded: true };
 
 async function call<T>(op: string, body: unknown, signal?: AbortSignal): Promise<T> {
 	const res = await fetch(`${URL_BASE}/v1/${op}`, {
@@ -245,6 +285,44 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params, signal) {
 			return grep(localCwd, params as GrepToolInput, signal);
 		},
+	});
+
+	let pruned = false;
+	pi.on("tool_result", async (event) => {
+		const details = (event as { details?: unknown }).details;
+		const local = (details as { fullOutputPath?: unknown } | undefined)?.fullOutputPath;
+		if (typeof local !== "string") return undefined;
+		const remote = await moveOutputFile(local);
+		if (!remote) return undefined;
+		if (!pruned) {
+			pruned = true;
+			void bashOps(localCwd)
+				.exec(`find ${OUTPUT_DIR} -type f -mmin +${OUTPUT_KEEP_MINUTES} -delete 2>/dev/null; true`, localCwd, { onData: () => { }, timeout: 30 })
+				.catch(() => { });
+		}
+		const content = event.content.map((block) => (block.type === "text" ? { ...block, text: block.text.split(local).join(remote) } : block));
+		return { content, structuredContent: event.structuredContent, details: { ...(details as object), fullOutputPath: remote } };
+	});
+
+	// A deferred tool called before tool_search loaded it is loaded at once, one time per tool: the
+	// model is told to repeat the call instead of searching for a tool it already knows the name of.
+	const autoLoaded = new Set<string>();
+	pi.on("message_end", async (event) => {
+		const msg = event.message as { role?: string; isError?: boolean; content?: { type: string; text?: string }[] };
+		if (msg.role !== "toolResult" || !msg.isError || msg.content?.length !== 1) return undefined;
+		const name = NOT_LOADED.exec(msg.content[0].text ?? "")?.[1];
+		const tool = name ? pi.getAllTools().find((t) => t.name === name) : undefined;
+		if (!name || tool?.exposure !== "deferred" || autoLoaded.has(name)) return undefined;
+		autoLoaded.add(name);
+		const active = pi.getActiveTools();
+		if (!active.includes(name)) pi.setActiveTools([...active, name]);
+		return {
+			message: {
+				...event.message,
+				content: [{ type: "text", text: `The tool ${name} is loaded now. Call it again with the same arguments.` }],
+				details: LOADED_MARK,
+			} as typeof event.message,
+		};
 	});
 
 	// The model must not believe the files are on its machine.

@@ -48,6 +48,10 @@ type Message struct {
 	Usage        *Usage          `json:"usage,omitempty"`
 	StopReason   string          `json:"stopReason,omitempty"` // stop, length, toolUse, error, aborted, ...
 	ErrorMessage string          `json:"errorMessage,omitempty"`
+	// Of a tool result message (role toolResult).
+	ToolCallID string          `json:"toolCallId,omitempty"`
+	IsError    bool            `json:"isError,omitempty"`
+	Details    json.RawMessage `json:"details,omitempty"`
 }
 
 // Text returns the concatenated text blocks of the message.

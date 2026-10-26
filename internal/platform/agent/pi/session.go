@@ -202,6 +202,9 @@ func (s *Session) run(ctx context.Context, p pirpc.PromptParams, emit func(agent
 	var lastErr string // provider error of the last assistant message, if it failed
 	var finalErr string
 	aborted := false
+	// Results «Tool … not found» wait for their tool result message: the
+	// nabu-workspace extension marks there a deferred tool it has loaded.
+	notFound := map[string]agent.Event{}
 	err := s.cl().PromptAndWait(ctx, p, func(e pirpc.Event) {
 		switch e.Type {
 		case pirpc.EventMessageUpdate:
@@ -217,7 +220,20 @@ func (s *Session) run(ctx context.Context, p pirpc.PromptParams, emit func(agent
 			}
 		case pirpc.EventMessageEnd:
 			var me pirpc.MessageEnd
-			if e.Decode(&me) != nil || me.Message.Role != "assistant" {
+			if e.Decode(&me) != nil {
+				return
+			}
+			if me.Message.Role == "toolResult" {
+				if ev, ok := notFound[me.Message.ToolCallID]; ok {
+					delete(notFound, me.Message.ToolCallID)
+					if toolLoaded(me.Message.Details) {
+						ev.IsError, ev.Summary = false, ToolLoaded
+					}
+					emit(ev)
+				}
+				return
+			}
+			if me.Message.Role != "assistant" {
 				return
 			}
 			switch me.Message.StopReason {
@@ -236,8 +252,14 @@ func (s *Session) run(ctx context.Context, p pirpc.PromptParams, emit func(agent
 		case pirpc.EventToolExecutionEnd:
 			var te pirpc.ToolExecution
 			if e.Decode(&te) == nil {
-				emit(agent.Event{Type: agent.EventToolResult, ID: te.ToolCallID, Name: te.ToolName, IsError: te.IsError,
-					Summary: clip(resultText(te.Result), maxFieldBytes)})
+				text := resultText(te.Result)
+				ev := agent.Event{Type: agent.EventToolResult, ID: te.ToolCallID, Name: te.ToolName, IsError: te.IsError,
+					Summary: clip(text, maxFieldBytes)}
+				if te.IsError && text == "Tool "+te.ToolName+" not found" {
+					notFound[te.ToolCallID] = ev
+					return
+				}
+				emit(ev)
 			}
 		case pirpc.EventAutoRetryStart:
 			var r pirpc.AutoRetry
@@ -256,6 +278,9 @@ func (s *Session) run(ctx context.Context, p pirpc.PromptParams, emit func(agent
 			}
 		}
 	})
+	for _, ev := range notFound { // no tool result message came: the error as it was
+		emit(ev)
+	}
 	if err != nil {
 		return res, err
 	}
@@ -413,6 +438,20 @@ func historyBlock(h []agent.HistoryMessage) string {
 		fmt.Fprintf(&b, "%s: %s\n", who, clip(m.Text, 2000))
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// ToolLoaded is the result of a call of a deferred MCP tool made before
+// tool_search loaded it: the extension loads the tool, the model repeats the
+// call (FTR.NAB.CMN-0001 tech, decision 20).
+const ToolLoaded = "The tool is loaded; the call is repeated."
+
+// toolLoaded reports the mark of the nabu-workspace extension in the details
+// of a tool result: it loaded the deferred tool the model called.
+func toolLoaded(details json.RawMessage) bool {
+	var d struct {
+		NabuToolLoaded bool `json:"nabuToolLoaded"`
+	}
+	return json.Unmarshal(details, &d) == nil && d.NabuToolLoaded
 }
 
 func resultText(raw json.RawMessage) string {

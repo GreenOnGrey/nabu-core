@@ -17,7 +17,7 @@ echo "PRF-02: Python libraries of base"
 run "$base" 'python3 -c "import yaml, jinja2, dateutil, charset_normalizer, tabulate, openpyxl, PIL, pypdf"' || fail PRF-02
 
 echo "PRF-03: libraries and tools of documents"
-run "$documents" 'python3 -c "import docx, pptx, docxtpl, lxml, pandas, numpy, matplotlib, weasyprint" &&
+run "$documents" 'python3 -c "import docx, pptx, docxtpl, lxml, pandas, numpy, matplotlib, weasyprint, fpdf, markdown, reportlab" &&
   typst --version && pdftotext -v 2>&1 | head -1 && pdftoppm -v 2>&1 | head -1 && qpdf --version | head -1' || fail PRF-03
 
 echo "PRF-04: HTML assets"

@@ -21,7 +21,7 @@ builds two built-in profiles from this repository's `Dockerfile`:
 | Profile | Image | Contents |
 | --- | --- | --- |
 | `base` | `ghcr.io/greenongrey/nabu-sandbox-base:<version>` | archives, jq, ripgrep, sqlite3, Node.js 24, git, Python 3 with `sandbox/base/uv.lock`, fonts with Cyrillic |
-| `documents` | `ghcr.io/greenongrey/nabu-sandbox-documents:<version>` | `base` + `sandbox/documents/uv.lock` (python-docx, python-pptx, pandas, matplotlib, WeasyPrint…), Typst, poppler, qpdf, Chart.js, ECharts, Mermaid, KaTeX in `/opt/nabu/assets` |
+| `documents` | `ghcr.io/greenongrey/nabu-sandbox-documents:<version>` | `base` + `sandbox/documents/uv.lock` (python-docx, python-pptx, pandas, matplotlib, WeasyPrint, fpdf2, reportlab, markdown…), Typst, poppler, qpdf, Chart.js, ECharts, Mermaid, KaTeX in `/opt/nabu/assets` |
 
 `make sandbox-images` builds and checks them (`sandbox/test.sh`), `make sandbox-lock` updates the Python
 libraries, `sandbox/documents/assets.lock` pins the tools and assets by sha256. System packages are pinned by

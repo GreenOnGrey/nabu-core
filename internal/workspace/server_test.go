@@ -96,6 +96,23 @@ func TestWorkspacePathEscape(t *testing.T) {
 	}
 }
 
+// RLY-11: an absolute path under the root, as the shell shows it, is a path
+// of the working copy; another absolute path is "/"-rooted inside it.
+func TestWorkspaceAbsoluteRoot(t *testing.T) {
+	ws, _, root := wsServer(t)
+	for p, want := range map[string]string{
+		filepath.Join(root, "src", "a.txt"): filepath.Join(root, "src", "a.txt"),
+		root:                                root,
+		"/src/a.txt":                        filepath.Join(root, "src", "a.txt"),
+		root + "x/a.txt":                    filepath.Join(root, root+"x", "a.txt"), // a sibling of the root is not under it
+	} {
+		got, err := ws.Resolve(p)
+		if err != nil || got != want {
+			t.Fatalf("%s: %q %v, want %q", p, got, err, want)
+		}
+	}
+}
+
 func execLines(t *testing.T, srv *httptest.Server, body map[string]any) (string, map[string]any) {
 	t.Helper()
 	bodyJSON, _ := json.Marshal(body)
