@@ -43,6 +43,9 @@ import {
 const URL_BASE = (process.env.NABU_WORKSPACE_URL ?? "").replace(/\/+$/, "");
 const TOKEN = process.env.NABU_WORKSPACE_TOKEN ?? "";
 const NOTE = process.env.NABU_WORKSPACE_NOTE ?? "";
+// The working directory as the commands of the workspace see it (/work); "."
+// when the engine does not know it.
+const ROOT = process.env.NABU_WORKSPACE_ROOT || ".";
 const IMAGE_TYPES: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp" };
 
 class WorkspaceError extends Error {
@@ -330,6 +333,8 @@ export default function (pi: ExtensionAPI) {
 		const note =
 			NOTE ||
 			"The working directory is an isolated workspace. Your read, write, edit, bash, ls, find and grep tools operate there; paths are relative to its root.";
-		return { systemPrompt: `${event.systemPrompt}\n\n${note}` };
+		// Pi names its own local directory as the working one: the model must see the workspace's.
+		const prompt = event.systemPrompt.split(localCwd).join(ROOT);
+		return { systemPrompt: `${prompt}\n\n${note}` };
 	});
 }

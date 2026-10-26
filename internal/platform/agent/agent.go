@@ -166,6 +166,10 @@ type Workspace struct {
 	Token string `json:"token"`
 	// Note is appended to the system prompt: where the files are.
 	Note string `json:"note,omitempty"`
+	// Root is the working directory as the commands of the workspace see it
+	// (/work in a sandbox); the model is shown it instead of the local one of
+	// Pi. Empty when unknown, as in a workspace of a service client.
+	Root string `json:"root,omitempty"`
 }
 
 // HistoryMessage seeds a session that has no snapshot.

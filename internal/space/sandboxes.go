@@ -16,6 +16,10 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/sandboxprofile"
 )
 
+// SandboxRoot is the working directory of a sandbox: the commands and the
+// agent see the files of the space there.
+const SandboxRoot = "/work"
+
 // SandboxConfig configures sandbox pods (tech §7).
 type SandboxConfig struct {
 	Namespace   string
@@ -138,7 +142,7 @@ func (m *Sandboxes) manifest(uid uuid.UUID, p sandboxprofile.Profile) map[string
 		secrets = []string{"ghcr-pull"}
 	}
 	c := map[string]any{
-		"name": "sandbox", "image": p.Image, "args": []string{"sandbox"}, "env": env, "workingDir": "/work",
+		"name": "sandbox", "image": p.Image, "args": []string{"sandbox"}, "env": env, "workingDir": SandboxRoot,
 		"resources": map[string]any{
 			"requests": map[string]string{"cpu": "50m", "memory": "64Mi"},
 			"limits":   map[string]string{"cpu": m.Cfg.CPU, "memory": m.Cfg.Memory, "ephemeral-storage": formatBytes(work + (512 << 20))},

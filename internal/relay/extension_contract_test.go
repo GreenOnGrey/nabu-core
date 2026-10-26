@@ -72,7 +72,7 @@ func TestExtensionThroughRelay(t *testing.T) {
 		Model: agent.ModelSpec{Provider: "nabu-k", API: "openai-completions", BaseURL: lsrv.URL, ModelID: "m", Thinking: "off",
 			Models: []agent.ModelDef{{ID: "m", ContextWindow: 100000, MaxTokens: 8000, Input: []string{"text"}}}},
 		Secrets: agent.Secrets{LLMKey: "sk-k"},
-		Workspace: &agent.Workspace{ID: "run-k", URL: hs.URL + "/internal/v1/workspaces/run-k",
+		Workspace: &agent.Workspace{ID: "run-k", URL: hs.URL + "/internal/v1/workspaces/run-k", Root: "/work",
 			Token: signer.Issue(jwt.Claims{Audience: jwt.AudCall, Workspace: "run-k"}, time.Hour)}}
 	s, err := pi.Start(ctx, rt, t.TempDir(), req)
 	if err != nil {
@@ -106,6 +106,16 @@ func TestExtensionThroughRelay(t *testing.T) {
 	}
 	if !strings.Contains(results[6].Summary, "hi from the agent") {
 		t.Fatalf("read by the absolute path: %s", results[6].Summary)
+	}
+	// RLY-13: the model sees the working directory of the workspace, not the local one of Pi.
+	sys := ""
+	for _, m := range llm.Requests()[0].Messages {
+		if m.Role == "system" {
+			sys += m.Text()
+		}
+	}
+	if !strings.Contains(sys, "<cwd>\n/work\n</cwd>") || strings.Contains(sys, "/cwd\n") {
+		t.Fatalf("working directory in the system prompt: %q", sys)
 	}
 	full, _ := filepath.Glob(filepath.Join(root, ".pi-output", "pi-*"))
 	if len(full) != 1 {

@@ -202,7 +202,7 @@ func (e *Engine) groupRequest(ctx context.Context, u *users.User, ga *groups.Age
 		call := e.Signer.Issue(jwt.Claims{Audience: jwt.AudCall, Workspace: wsID}, tokenTTL)
 		secrets = append(secrets, call)
 		req.Workspace = &agent.Workspace{ID: wsID, URL: e.Cfg.RelayInternalURL + "/internal/v1/workspaces/" + wsID, Token: call,
-			Note: "The working directory is the space of the group in Nabu: files persist between conversations of the group."}
+			Note: "The working directory is the space of the group in Nabu: files persist between conversations of the group.", Root: space.SandboxRoot}
 	}
 	ownerEmail := ""
 	if ga.Owner != nil {

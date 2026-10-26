@@ -333,8 +333,24 @@ func (s *Service) Map(ctx context.Context, ecosystem, name, pkgEcosystem, pkgNam
 	if tag.RowsAffected() == 0 {
 		return apperr.Conflict("sandbox_alias_exists", "the module is already mapped")
 	}
-	_, err = s.Pool.Exec(ctx, `INSERT INTO package_status (package_ecosystem, package_name, status) VALUES ($1, $2, 'new') ON CONFLICT DO NOTHING`, pkgEcosystem, p)
-	return err
+	if _, err = s.Pool.Exec(ctx, `INSERT INTO package_status (package_ecosystem, package_name, status) VALUES ($1, $2, 'new') ON CONFLICT DO NOTHING`, pkgEcosystem, p); err != nil {
+		return err
+	}
+	// A package that a profile has already is «added» at once, not after
+	// the next start (FTR.NAB.CMN-0008 tech, decision 27).
+	if s.Profiles == nil {
+		return nil
+	}
+	ms, err := s.Profiles.Manifests(ctx)
+	if err != nil {
+		return err
+	}
+	for _, m := range ms {
+		if m.Has(pkgEcosystem, p) {
+			return s.MarkAdded(ctx, m)
+		}
+	}
+	return nil
 }
 
 // Unmap removes a mapping of the administrator; built-in ones stay.

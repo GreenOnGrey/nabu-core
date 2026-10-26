@@ -177,7 +177,7 @@ func (e *Engine) personalRequest(ctx context.Context, u *users.User, conv uuid.U
 		call := e.Signer.Issue(jwt.Claims{Audience: jwt.AudCall, Workspace: wsID}, tokenTTL)
 		secrets = append(secrets, call)
 		req.Workspace = &agent.Workspace{ID: wsID, URL: e.Cfg.RelayInternalURL + "/internal/v1/workspaces/" + wsID, Token: call,
-			Note: "The working directory is the user's personal space in Nabu: files persist between conversations and the user sees them in the Space section. Paths are relative to its root."}
+			Note: "The working directory is the user's personal space in Nabu: files persist between conversations and the user sees them in the Space section. Paths are relative to its root.", Root: space.SandboxRoot}
 	}
 	p := Persona{User: u, Agent: ag, Memory: mem, Spaces: e.Space.Enabled, Now: time.Now(), Catalog: titles, Documents: cat.Documents}
 	req.SystemAppend = p.Instructions()

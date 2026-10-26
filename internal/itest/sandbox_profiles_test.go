@@ -182,6 +182,14 @@ func TestPackageSignals(t *testing.T) {
 	if err != nil || c.Status != "added" || c.Profile != "documents" || c.Version != "v2" || len(c.History) != 1 {
 		t.Fatalf("ADM-05: %+v %v", c, err)
 	}
+	// ADM-13: a module mapped to a package that a profile has is added at once.
+	sig(users[2], "python-module", "pandaz", "auto")
+	if err := s.Map(ctx, "python-module", "pandaz", "pypi", "pandas"); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := s.CardOf(ctx, "pypi", "pandas", 30); err != nil || c.Status != "added" || c.Profile != "documents" {
+		t.Fatalf("ADM-13: %+v %v", c, err)
+	}
 	// The tool answers an agent of a user with a sandbox.
 	tool := s.Tool()
 	out, err := tool.Handler(ctx, mcp.Grant{UserID: users[2]}, json.RawMessage(`{"ecosystem":"pypi","name":"pandas","reason":"tables"}`))

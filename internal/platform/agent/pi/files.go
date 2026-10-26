@@ -232,7 +232,7 @@ func Env(l Layout, req agent.SessionRequest, o Options) []string {
 	}
 	if req.Workspace != nil {
 		env = append(env, "NABU_WORKSPACE_URL="+req.Workspace.URL, "NABU_WORKSPACE_TOKEN="+req.Workspace.Token,
-			"NABU_WORKSPACE_NOTE="+oneLine(req.Workspace.Note))
+			"NABU_WORKSPACE_NOTE="+oneLine(req.Workspace.Note), "NABU_WORKSPACE_ROOT="+req.Workspace.Root)
 	}
 	return append(env, o.ExtraEnv...)
 }

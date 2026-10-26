@@ -21,6 +21,7 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/platform/kafka"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/metrics"
 	"github.com/GreenOnGrey/nabu-core/internal/services"
+	"github.com/GreenOnGrey/nabu-core/internal/space"
 	"github.com/GreenOnGrey/nabu-core/internal/tasks"
 )
 
@@ -351,7 +352,7 @@ func (e *Engine) serviceTurn(ctx context.Context, runID uuid.UUID, ag *services.
 		secrets = append(secrets, call)
 		req.Workspace = &agent.Workspace{ID: wsID, URL: e.Cfg.RelayInternalURL + "/internal/v1/workspaces/" + wsID, Token: call,
 			Note: "The working directory is a temporary sandbox of this run; its files are deleted after the run. " +
-				"It has a fixed set of tools: see /nabu/sandbox-profile.json; packages cannot be installed."}
+				"It has a fixed set of tools: see /nabu/sandbox-profile.json; packages cannot be installed.", Root: space.SandboxRoot}
 	}
 	resp, err := e.open(ctx, e.Op, req)
 	if err != nil {
