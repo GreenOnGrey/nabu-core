@@ -42,6 +42,8 @@ type fakeGmail struct {
 	threads map[string][]gmailMsg // thread → messages
 	calls   map[string]int
 	read    []string // threads read with get_thread
+	// failSearch: how many next search_threads calls answer with an error
+	failSearch int
 }
 
 type gmailMsg struct {
@@ -99,6 +101,11 @@ func (f *fakeGmail) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.calls[req.Params.Name]++
 		switch req.Params.Name {
 		case "search_threads":
+			if f.failSearch > 0 {
+				f.failSearch--
+				answer(map[string]any{"content": []map[string]string{{"type": "text", "text": "IMAP timeout"}}, "isError": true})
+				return
+			}
 			type m struct {
 				ID           string   `json:"id"`
 				Sender       string   `json:"sender"`
@@ -575,6 +582,20 @@ func TestCollect(t *testing.T) {
 	runsBefore := len(op.requests)
 	if o = tick(); o.status != "succeeded" || o.summary != "new:0" || o.batches != 0 || len(op.requests) != runsBefore {
 		t.Fatalf("idle tick: %+v", o)
+	}
+
+	// TASK-20: a failed search is tried again — the tick is not lost; the audit keeps the error of the server.
+	eng.CollectCfg.RetryWait = time.Millisecond
+	gmail.mu.Lock()
+	gmail.failSearch = 1
+	gmail.mu.Unlock()
+	if o = tick(); o.status != "succeeded" || o.summary != "new:0" {
+		t.Fatalf("tick with a failed search: %+v", o)
+	}
+	var searchErr string
+	_ = pool.QueryRow(ctx, `SELECT COALESCE(error,'') FROM audit WHERE agent = 'memory-collector' AND user_id = $1 AND tool = 'search_threads' AND result = 'error'`, a).Scan(&searchErr)
+	if !strings.Contains(searchErr, "IMAP timeout") {
+		t.Fatalf("the error of the search in the audit: %q", searchErr)
 	}
 
 	// NOTE-02, CMT-06: a new letter in the thread — the same note, the commitment is closed by the collector.

@@ -56,7 +56,11 @@ func TestExtensionThroughRelay(t *testing.T) {
 		{Name: "read", Args: map[string]any{"path": filepath.Join(root, "notes", "a.txt")}},
 		// RLY-10: truncated output: Pi saves it in full, the extension moves the file into the workspace
 		{Name: "bash", Args: map[string]any{"command": "seq 1 200000"}},
+		// RLY-14: the folder of Pi's output is not for the agent's own files
+		{Name: "write", Args: map[string]any{"path": ".pi-output/build_deck.py", "content": "print(1)\n"}},
+		{Name: "write", Args: map[string]any{"path": "/work/.pi-output/deck.md", "content": "# deck\n"}},
 	}
+	refused := map[int]bool{8: true, 9: true}
 	llm := &fakellm.Server{Key: "sk-k", Script: func(r fakellm.Request) *fakellm.Reply {
 		if n := r.ToolResults(); n < len(steps) {
 			return &fakellm.Reply{ToolCalls: []fakellm.ToolCall{steps[n]}}
@@ -94,8 +98,11 @@ func TestExtensionThroughRelay(t *testing.T) {
 		t.Fatalf("tool results %d: %+v", len(results), results)
 	}
 	for i, r := range results {
-		if r.IsError {
-			t.Errorf("%s failed: %s", steps[i].Name, r.Summary)
+		if r.IsError != refused[i] {
+			t.Errorf("%s: error %v: %s", steps[i].Name, r.IsError, r.Summary)
+		}
+		if refused[i] && !strings.Contains(r.Summary, "output_dir_reserved") {
+			t.Errorf("RLY-14: %s", r.Summary)
 		}
 	}
 	if b, _ := os.ReadFile(filepath.Join(root, "notes", "a.txt")); string(b) != "hi from the agent\n" {
@@ -116,6 +123,12 @@ func TestExtensionThroughRelay(t *testing.T) {
 	}
 	if !strings.Contains(sys, "<cwd>\n/work\n</cwd>") || strings.Contains(sys, "/cwd\n") {
 		t.Fatalf("working directory in the system prompt: %q", sys)
+	}
+	if !strings.Contains(sys, ".pi-output holds the full output of your tools") {
+		t.Fatalf("RLY-14: the rule of .pi-output in the system prompt: %q", sys)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".pi-output", "build_deck.py")); err == nil {
+		t.Fatal("RLY-14: the agent's file was written to .pi-output")
 	}
 	full, _ := filepath.Glob(filepath.Join(root, ".pi-output", "pi-*"))
 	if len(full) != 1 {

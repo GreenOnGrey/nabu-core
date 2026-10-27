@@ -74,6 +74,22 @@ function remotePath(localCwd: string, p: string): string {
 const OUTPUT_DIR = ".pi-output";
 /** Files of OUTPUT_DIR older than this are removed: they served sessions that are over. */
 const OUTPUT_KEEP_MINUTES = 24 * 60;
+/** What the model is told of OUTPUT_DIR: its own files there would be removed (tech, decision 24). */
+const OUTPUT_RULE = `${OUTPUT_DIR} holds the full output of your tools and is cleaned after a day: never keep your own files there (scripts, drafts, previews), put them in the working directory.`;
+
+/** outputPath tells whether a path of the workspace is inside OUTPUT_DIR. */
+function outputPath(remote: string): boolean {
+	let p = remote;
+	if (ROOT !== "." && (p === ROOT || p.startsWith(`${ROOT}/`))) p = p.slice(ROOT.length).replace(/^\/+/, "");
+	return p === OUTPUT_DIR || p.startsWith(`${OUTPUT_DIR}/`);
+}
+
+/** The write and edit tools refuse OUTPUT_DIR: only Pi writes there. */
+function ownPath(localCwd: string, p: string): string {
+	const remote = remotePath(localCwd, p);
+	if (outputPath(remote)) throw new WorkspaceError(403, "output_dir_reserved", `output_dir_reserved: ${OUTPUT_RULE}`);
+	return remote;
+}
 
 /**
  * Pi saves the full text of a truncated result (bash, MCP) to its own temporary directory and
@@ -142,10 +158,10 @@ function readOps(localCwd: string): ReadOperations {
 function writeOps(localCwd: string): WriteOperations {
 	return {
 		writeFile: async (p, content) => {
-			await call("fs/write", { path: remotePath(localCwd, p), content: Buffer.from(content).toString("base64") });
+			await call("fs/write", { path: ownPath(localCwd, p), content: Buffer.from(content).toString("base64") });
 		},
 		mkdir: async (dir) => {
-			await call("fs/mkdir", { path: remotePath(localCwd, dir) });
+			await call("fs/mkdir", { path: ownPath(localCwd, dir) });
 		},
 	};
 }
@@ -156,7 +172,7 @@ function editOps(localCwd: string): EditOperations {
 		readFile: r.readFile,
 		writeFile: writeOps(localCwd).writeFile,
 		access: async (p) => {
-			await call("fs/access", { path: remotePath(localCwd, p), write: true });
+			await call("fs/access", { path: ownPath(localCwd, p), write: true });
 		},
 	};
 }
@@ -335,6 +351,6 @@ export default function (pi: ExtensionAPI) {
 			"The working directory is an isolated workspace. Your read, write, edit, bash, ls, find and grep tools operate there; paths are relative to its root.";
 		// Pi names its own local directory as the working one: the model must see the workspace's.
 		const prompt = event.systemPrompt.split(localCwd).join(ROOT);
-		return { systemPrompt: `${prompt}\n\n${note}` };
+		return { systemPrompt: `${prompt}\n\n${note} ${OUTPUT_RULE}` };
 	});
 }

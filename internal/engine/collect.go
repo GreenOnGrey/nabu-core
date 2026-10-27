@@ -77,6 +77,9 @@ type CollectConfig struct {
 	// BotAddresses are the addresses of the Nabu bot: letters to and from it
 	// are not collected (R4).
 	BotAddresses func(ctx context.Context) []string
+	// RetryWait is the pause before the second call of a source tool that
+	// failed; the third waits five times longer. 0 — 2 s.
+	RetryWait time.Duration
 }
 
 // CollectMessage is the payload of nabu.memory.collect: a batch to process.
@@ -120,13 +123,28 @@ func (e *Engine) Collect(ctx context.Context, u *users.User, ri *tasks.RunInfo) 
 		item := src.ItemID
 		call := func(ctx context.Context, tool string, args any) (json.RawMessage, error) {
 			raw, _ := json.Marshal(args)
-			text, err := e.Catalog.CallSource(ctx, u.ID, item, tool, raw)
-			if errors.Is(err, catalog.ErrSourceAccess) {
-				return nil, collect.ErrAccess
+			// The collector only reads: a failed call is tried again, so one
+			// slow answer of the source does not lose the tick (tech, decision 24).
+			wait := e.CollectCfg.RetryWait
+			if wait <= 0 {
+				wait = 2 * time.Second
 			}
-			e.Ledger.Audit(ctx, ledger.Entry{AgentKind: "service", Agent: CollectorAgent, UserID: &u.ID, Channel: "task:" + ri.TaskID.String(),
-				Server: &src.Source, Tool: tool, Result: resultOf(err)}, "", nil) // R30: no arguments, no text
-			return json.RawMessage(text), err
+			for attempt := 0; ; attempt++ {
+				text, err := e.Catalog.CallSource(ctx, u.ID, item, tool, raw)
+				if errors.Is(err, catalog.ErrSourceAccess) {
+					return nil, collect.ErrAccess
+				}
+				e.Ledger.Audit(ctx, ledger.Entry{AgentKind: "service", Agent: CollectorAgent, UserID: &u.ID, Channel: "task:" + ri.TaskID.String(),
+					Server: &src.Source, Tool: tool, Result: resultOf(err), Error: sourceError(err)}, "", nil) // R30: no arguments, no text
+				if err == nil || attempt == 2 || ctx.Err() != nil {
+					return json.RawMessage(text), err
+				}
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(wait * time.Duration(1+4*attempt)):
+				}
+			}
 		}
 		cs, err := ad.Changes(ctx, call, src.Source, cursor, since, now, ex)
 		if errors.Is(err, collect.ErrAccess) {
@@ -187,6 +205,19 @@ func failedErr(failed bool) error {
 		return errors.New("failed")
 	}
 	return nil
+}
+
+// sourceError is the error of a source call for the audit: the error of the
+// server, never the mail it read, cut to 300 characters.
+func sourceError(err error) *string {
+	if err == nil {
+		return nil
+	}
+	t := err.Error()
+	if r := []rune(t); len(r) > 300 {
+		t = string(r[:300])
+	}
+	return &t
 }
 
 func resultOf(err error) string {
