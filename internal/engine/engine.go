@@ -431,7 +431,7 @@ func (c *collector) handle(ev agent.Event) {
 		if sa := ev.Subagent; sa != nil {
 			c.subagent(*sa)
 		}
-		if !ev.Usage.IsZero() {
+		if !ev.IsZero() {
 			c.handle(agent.Event{Type: agent.EventUsage, Usage: ev.Usage})
 		}
 	case agent.EventError:
