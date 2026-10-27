@@ -74,13 +74,42 @@ func (p *PGPublisher) Publish(ctx context.Context, e Event) {
 		slog.ErrorContext(ctx, "encode event", "err", err)
 		return
 	}
-	if len(b) > 7900 {
-		slog.WarnContext(ctx, "event too large for NOTIFY, dropping data", "type", e.Type)
-		b, _ = json.Marshal(Event{Type: e.Type, UserID: e.UserID, RunID: e.RunID})
+	if len(b) > maxNotify {
+		slog.WarnContext(ctx, "event too large for NOTIFY, sending its ids", "type", e.Type)
+		b, _ = json.Marshal(Event{Type: e.Type, UserID: e.UserID, RunID: e.RunID, Data: Stub(e.Data)})
 	}
 	if _, err := p.pool.Exec(context.WithoutCancel(ctx), "SELECT pg_notify($1, $2)", channel, string(b)); err != nil {
 		slog.ErrorContext(ctx, "publish event", "err", err, "type", e.Type)
 	}
+}
+
+// maxNotify is the limit of a NOTIFY payload (8000 bytes) with a margin.
+const maxNotify = 7900
+
+// stubKeys are the fields an event keeps when its data does not fit NOTIFY:
+// enough for a client to tell what changed and to read it again.
+var stubKeys = []string{"id", "conversationId", "messageId", "taskId", "runId", "role", "status"}
+
+// Stub is the data of an event too large for NOTIFY: its ids and status with
+// "truncated": true, so the client reads the object again instead of waiting
+// for it (FTR.NAB.CMN-0001 tech, decision 23). Data that is not an object
+// gives nil.
+func Stub(data any) any {
+	b, err := json.Marshal(data)
+	if err != nil {
+		return nil
+	}
+	var m map[string]json.RawMessage
+	if json.Unmarshal(b, &m) != nil || m == nil {
+		return nil
+	}
+	out := map[string]any{"truncated": true}
+	for _, k := range stubKeys {
+		if v, ok := m[k]; ok && len(v) <= 100 {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // Hub fans events out to local SSE subscribers.
