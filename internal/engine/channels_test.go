@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/GreenOnGrey/nabu-core/internal/users"
 )
 
 // R9, tech §13 #4: a letter goes to the agent as a data block.
@@ -52,5 +54,20 @@ func TestGroupPromptAndRules(t *testing.T) {
 		if !strings.Contains(strings.ToLower(gi.Instructions()), strings.ToLower(want)) {
 			t.Fatalf("%q is not in the group instructions:\n%s", want, gi.Instructions())
 		}
+	}
+}
+
+// The personal agent keeps the user's language after tool output in another
+// one: the rule is given at the top and repeated last (tech, decision 22).
+func TestPersonaLanguageRule(t *testing.T) {
+	p := Persona{User: &users.User{Email: "zakhar@x.org", Timezone: "Europe/Moscow"}}
+	p.Agent.Name, p.Agent.Tone = "Захар", "business"
+	in := p.Instructions()
+	if strings.Count(in, LanguageRule) != 2 || !strings.HasSuffix(strings.TrimSpace(in), LanguageRule) {
+		t.Fatalf("language rule:\n%s", in)
+	}
+	gi := Persona{Group: &GroupInfo{Title: "Платформа", Channel: "telegram"}}
+	if !strings.Contains(gi.Instructions(), GroupLanguageRule) {
+		t.Fatal(gi.Instructions())
 	}
 }

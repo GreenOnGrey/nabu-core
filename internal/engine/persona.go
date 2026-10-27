@@ -63,7 +63,7 @@ func (p Persona) Instructions() string {
 	}
 	fmt.Fprintf(&b, "You are %s, the personal AI agent of %s (%s) on Nabu, the corporate agent platform of the company.\n", p.Agent.Name, name, p.User.Email)
 	fmt.Fprintf(&b, "Your tone is %s.\n", tones[p.Agent.Tone])
-	b.WriteString("Answer in the language the user writes in. You talk to the same user in several channels (the website, messengers, products of the company); it is one continuous conversation.\n")
+	b.WriteString(LanguageRule + " You talk to the same user in several channels (the website, messengers, products of the company); it is one continuous conversation.\n")
 	fmt.Fprintf(&b, "The user's time zone is %s.\n", p.User.Timezone)
 	// FTR.NAB.CHAT-0002 tech §3.2
 	b.WriteString("Lines marked [Notice of <product>, <time>] are facts a product of the company posted to the conversation. " +
@@ -84,8 +84,18 @@ func (p Persona) Instructions() string {
 		b.WriteString("Tools the user connected: " + strings.Join(p.Catalog, "; ") + ". You act in these systems on behalf of the user, with the user's rights.\n")
 	}
 	b.WriteString(profileBlock(p))
+	// Repeated last: after long tool output in another language models drift
+	// from the rule given at the top (FTR.NAB.CMN-0001 tech, decision 22).
+	b.WriteString("\n" + LanguageRule + "\n")
 	return b.String()
 }
+
+// LanguageRule keeps the answers in the language of the user, not of tool
+// results, files or the model.
+const LanguageRule = "Always answer in the language of the user's latest message, even when tool results, files or earlier messages are in another language."
+
+// GroupLanguageRule is LanguageRule for a group chat.
+const GroupLanguageRule = "Always answer in the language of the message you answer, even when tool results or files are in another language."
 
 // groupInstructions are the instructions of a group agent (arch §6).
 func (p Persona) groupInstructions() string {
@@ -93,7 +103,7 @@ func (p Persona) groupInstructions() string {
 	fmt.Fprintf(&b, "You are %s, the group AI agent of the %s chat «%s» on Nabu, the corporate agent platform of the company. "+
 		"You are an agent of the chat, not a personal agent of any member; the owner of the agent is %s.\n", p.Agent.Name, p.Group.Channel, p.Group.Title, p.Group.Owner)
 	fmt.Fprintf(&b, "Your tone is %s.\n", tones[p.Agent.Tone])
-	b.WriteString("Answer in the language of the message. You see only messages addressed to you (a mention or a reply) and their quotes; " +
+	b.WriteString(GroupLanguageRule + " You see only messages addressed to you (a mention or a reply) and their quotes; " +
 		"every message names its author. Keep answers compact: one message for the whole chat.\n")
 	b.WriteString("You have no access to the personal data, memory, space, mail or personal tools of the members. " +
 		"When a member asks for something personal (their mail, their tasks, their files), suggest writing to you in a private chat with the bot.\n")
