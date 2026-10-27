@@ -20,8 +20,10 @@ import (
 
 // Topics (tech spec §8, §9a).
 const (
-	// TopicInbound: a user message from any channel; key — user id, so the
-	// messages of one user are handled in order (CONV-04).
+	// TopicInbound: a user message from any channel; key — conversation id,
+	// so the messages of one conversation are handled in order (CONV-04) and
+	// the conversations of a user do not wait for each other
+	// (FTR.NAB.CHAT-0004 R6).
 	TopicInbound = "nabu.inbound"
 	// TopicOutbound: a finished answer for the messenger it came from.
 	TopicOutbound = "nabu.outbound"

@@ -44,6 +44,19 @@ type ToolStep struct {
 	Tool    string `json:"tool"`
 	Summary string `json:"summary"`
 	Status  string `json:"status"` // running | done | error
+	// Subagents are the tasks of a call of the tool subagent (FTR.NAB.CMN-0009 R8, tech §3).
+	Subagents []SubagentTask `json:"subagents,omitempty"`
+}
+
+// SubagentTask is a task of a subagent call as the answer keeps it: the
+// result only to its first 2000 characters, for the person.
+type SubagentTask struct {
+	Task        int    `json:"task"`
+	Description string `json:"description"`
+	State       string `json:"state"` // running | done | failed | timeout | aborted
+	Tools       int    `json:"tools"`
+	Error       string `json:"error,omitempty"`
+	Result      string `json:"result,omitempty"`
 }
 
 // Attachment is a file of a message.
@@ -87,6 +100,9 @@ type Message struct {
 	Retryable  bool            `json:"retryable,omitempty"`
 	ReplyTo    *uuid.UUID      `json:"replyTo"`
 	CreatedAt  time.Time       `json:"createdAt"`
+	// Queued: a user message waits for its answer behind the answer being
+	// written (FTR.NAB.CHAT-0004 R1, tech §2).
+	Queued bool `json:"queued,omitempty"`
 }
 
 // Store is the conversation repository.
@@ -198,15 +214,20 @@ func (s *Store) ArchiveIdle(ctx context.Context, after time.Duration) ([]uuid.UU
 	return out, rows.Err()
 }
 
+// waitingCond is a message waiting in the queue of its conversation, on the
+// alias m; one waiting for longer than a day is not counted (FTR.NAB.CHAT-0004 R4).
+const waitingCond = `queue = 'waiting' AND m.created_at > now() - interval '24 hours'`
+
 const msgCols = `m.id, m.conversation_id, m.role, m.text, m.channel, m.status, m.attachments, m.tool_steps, m.context, m.model,
 	m.error_class, m.error_text, m.reply_to, m.created_at, m.card, m.event, m.skill, m.voice,
-	(SELECT sc.name FROM service_clients sc WHERE sc.id = m.client_id), m.payload`
+	(SELECT sc.name FROM service_clients sc WHERE sc.id = m.client_id), m.payload,
+	COALESCE(m.` + waitingCond + `, false)`
 
 func scanMsg(row pgx.Row) (*Message, error) {
 	var m Message
 	var atts, steps, ctxb, card, ev, payload []byte
 	if err := row.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Text, &m.Channel, &m.Status, &atts, &steps, &ctxb, &m.Model,
-		&m.ErrorClass, &m.ErrorText, &m.ReplyTo, &m.CreatedAt, &card, &ev, &m.Skill, &m.Voice, &m.ClientName, &payload); err != nil {
+		&m.ErrorClass, &m.ErrorText, &m.ReplyTo, &m.CreatedAt, &card, &ev, &m.Skill, &m.Voice, &m.ClientName, &payload, &m.Queued); err != nil {
 		return nil, err
 	}
 	if len(payload) > 0 {
@@ -240,7 +261,8 @@ func (s *Store) Messages(ctx context.Context, conv uuid.UUID, page httpx.Page) (
 		cond = ` AND (m.created_at, m.id) < ($3, $4)`
 		args = append(args, page.Cursor.T, page.Cursor.ID)
 	}
-	rows, err := s.Pool.Query(ctx, `SELECT `+msgCols+` FROM messages m WHERE m.conversation_id = $1`+cond+
+	rows, err := s.Pool.Query(ctx, `SELECT `+msgCols+` FROM messages m WHERE m.conversation_id = $1
+		AND m.queue IS DISTINCT FROM 'cancelled'`+cond+
 		` ORDER BY m.created_at DESC, m.id DESC LIMIT $2`, args...)
 	if err != nil {
 		return httpx.List[Message]{}, err
@@ -283,17 +305,52 @@ type UserMessage struct {
 
 // AddUserMessage stores a user message with its skill and voice mark.
 func (s *Store) AddUserMessage(ctx context.Context, conv uuid.UUID, u UserMessage) (*Message, error) {
+	m, _, err := s.AddQueued(ctx, conv, u, 0)
+	return m, err
+}
+
+// AddQueued stores a user message behind the queue of the conversation
+// (FTR.NAB.CHAT-0004 R1, R4): queued reports an answer being written or
+// messages waiting before it. With max > 0 a full queue refuses the message
+// (queue_full); the row of the conversation is locked, so parallel messages
+// do not pass the limit together.
+func (s *Store) AddQueued(ctx context.Context, conv uuid.UUID, u UserMessage, max int) (m *Message, queued bool, err error) {
 	ab, _ := json.Marshal(u.Attachments)
 	var c any
 	if len(u.Context) > 0 {
 		c = []byte(u.Context)
 	}
-	m, err := scanMsg(s.Pool.QueryRow(ctx, `WITH m AS (INSERT INTO messages (conversation_id, role, text, channel, attachments, context, skill, voice)
-		VALUES ($1,'user',$2,$3,$4,$5,NULLIF($6,''),$7) RETURNING *) SELECT `+msgCols+` FROM m`, conv, u.Text, u.Channel, ab, c, u.Skill, u.Voice))
-	if err == nil {
-		_, _ = s.Pool.Exec(ctx, `UPDATE conversations SET last_message_at = now() WHERE id = $1`, conv)
+	err = pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
+		// the lock first: the count below then sees the messages of the transactions it waited for
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM conversations WHERE id = $1 FOR UPDATE`, conv); err != nil {
+			return err
+		}
+		var waiting int
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM messages WHERE conversation_id = $1 AND role = 'assistant'
+				AND status IN ('pending','streaming') AND created_at > now() - make_interval(secs => $2)),
+			(SELECT count(*) FROM messages m WHERE m.conversation_id = $1 AND m.`+waitingCond+`)`,
+			conv, staleTurn.Seconds()).Scan(&queued, &waiting); err != nil {
+			return err
+		}
+		queued = queued || waiting > 0
+		if max > 0 && queued && waiting >= max {
+			return apperr.Conflict("queue_full", "the queue of the conversation is full").With("max", max)
+		}
+		// a message waits until the engine begins its answer
+		var err error
+		m, err = scanMsg(tx.QueryRow(ctx, `WITH m AS (INSERT INTO messages (conversation_id, role, text, channel, attachments, context, skill, voice, queue)
+			VALUES ($1,'user',$2,$3,$4,$5,NULLIF($6,''),$7,'waiting') RETURNING *) SELECT `+msgCols+` FROM m`, conv, u.Text, u.Channel, ab, c, u.Skill, u.Voice))
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `UPDATE conversations SET last_message_at = now() WHERE id = $1`, conv)
+		return err
+	})
+	if err != nil {
+		return nil, false, err
 	}
-	return m, err
+	m.Queued = queued
+	return m, queued, nil
 }
 
 // AddAssistant creates the answer being written.
@@ -429,6 +486,7 @@ func (s *Store) History(ctx context.Context, conv uuid.UUID, n int) ([]Message, 
 			WHERE a.conversation_id = $1 AND a.role = 'assistant' AND a.status = 'done'), '-infinity'::timestamptz))
 		AND m.created_at > COALESCE((SELECT max(e.created_at) FROM messages e WHERE e.conversation_id = $1 AND e.role = 'event'
 			AND e.event->>'kind' = 'reset'), '-infinity'::timestamptz)
+		AND m.queue IS DISTINCT FROM 'cancelled' -- FTR.NAB.CHAT-0004 R3: the agent never gets a cancelled message
 		ORDER BY m.created_at DESC, m.id DESC LIMIT $2`, conv, n)
 	if err != nil {
 		return nil, err
@@ -500,14 +558,100 @@ func (s *Store) PreviousModel(ctx context.Context, conv, msg uuid.UUID) string {
 	return m
 }
 
-// Busy reports whether an answer is being written in the conversation (R1:
-// a reset waits for it). An answer left streaming for longer than stale is
-// not counted.
+// Busy reports whether an answer is being written in the conversation or a
+// message waits for one (R1: a reset waits for them; FTR.NAB.CHAT-0004 R5).
+// An answer left streaming for longer than stale is not counted.
 func (s *Store) Busy(ctx context.Context, conv uuid.UUID, stale time.Duration) bool {
 	var busy bool
 	_ = s.Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM messages WHERE conversation_id = $1 AND role = 'assistant'
-		AND status IN ('pending','streaming') AND created_at > now() - make_interval(secs => $2))`, conv, stale.Seconds()).Scan(&busy)
+		AND status IN ('pending','streaming') AND created_at > now() - make_interval(secs => $2))
+		OR EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = $1 AND m.`+waitingCond+`)`,
+		conv, stale.Seconds()).Scan(&busy)
 	return busy
+}
+
+// Start moves a waiting message to started (FTR.NAB.CHAT-0004 tech §3): the
+// engine begins its answer. The conditional update decides the race with a
+// cancellation; cancelled reports that the user cancelled the message first.
+func (s *Store) Start(ctx context.Context, id uuid.UUID) (cancelled bool) {
+	tag, err := s.Pool.Exec(ctx, `UPDATE messages SET queue = 'started' WHERE id = $1 AND queue = 'waiting'`, id)
+	if err != nil || tag.RowsAffected() > 0 {
+		return false
+	}
+	return s.Cancelled(ctx, id)
+}
+
+// Cancelled reports that the user cancelled the message in the queue.
+func (s *Store) Cancelled(ctx context.Context, id uuid.UUID) bool {
+	var c bool
+	_ = s.Pool.QueryRow(ctx, `SELECT queue IS NOT DISTINCT FROM 'cancelled' FROM messages WHERE id = $1`, id).Scan(&c)
+	return c
+}
+
+// Cancel cancels a waiting message of the user and drops its turn from the
+// queue of the pod (FTR.NAB.CHAT-0004 R3, QUE-07, QUE-19).
+func (s *Store) Cancel(ctx context.Context, uid, id uuid.UUID) (uuid.UUID, error) {
+	var conv, owner uuid.UUID
+	err := s.Pool.QueryRow(ctx, `UPDATE messages m SET queue = 'cancelled' FROM conversations c
+		WHERE m.id = $1 AND m.role = 'user' AND m.queue = 'waiting' AND c.id = m.conversation_id AND c.user_id = $2
+		RETURNING m.conversation_id, c.user_id`, id, uid).Scan(&conv, &owner)
+	if postgres.IsNoRows(err) {
+		if _, err := s.Message(ctx, uid, id); err != nil {
+			return uuid.Nil, err
+		}
+		return uuid.Nil, apperr.Conflict("message_started", "the message is not waiting for its answer")
+	}
+	if err != nil {
+		return uuid.Nil, err
+	}
+	// the turn waiting for a pod (agentpods.Manager.Drop): nobody will run it
+	_, _ = s.Pool.Exec(ctx, `DELETE FROM agent_queue WHERE owner_id = $1 AND ref = $2`, owner, "m:"+id.String())
+	return conv, nil
+}
+
+// RequestStop marks an answer being written to stop (FTR.NAB.CHAT-0004 R8);
+// the turn sees the mark within seconds. A repeated request is accepted.
+func (s *Store) RequestStop(ctx context.Context, uid, id uuid.UUID) error {
+	tag, err := s.Pool.Exec(ctx, `UPDATE messages m SET stop_requested_at = COALESCE(m.stop_requested_at, now()) FROM conversations c
+		WHERE m.id = $1 AND m.role = 'assistant' AND m.status IN ('pending','streaming') AND c.id = m.conversation_id AND c.user_id = $2`, id, uid)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		if _, err := s.Message(ctx, uid, id); err != nil {
+			return err
+		}
+		return apperr.Conflict("not_running", "the answer is not being written")
+	}
+	return nil
+}
+
+// StopRequested reports that the user asked to stop the answer.
+func (s *Store) StopRequested(ctx context.Context, id uuid.UUID) bool {
+	var stop bool
+	_ = s.Pool.QueryRow(ctx, `SELECT stop_requested_at IS NOT NULL FROM messages WHERE id = $1`, id).Scan(&stop)
+	return stop
+}
+
+// Running is the answer being written in the conversation, nil — none.
+func (s *Store) Running(ctx context.Context, conv uuid.UUID) *Message {
+	m, err := scanMsg(s.Pool.QueryRow(ctx, `SELECT `+msgCols+` FROM messages m WHERE m.conversation_id = $1 AND m.role = 'assistant'
+		AND m.status IN ('pending','streaming') AND m.created_at > now() - make_interval(secs => $2)
+		ORDER BY m.created_at DESC LIMIT 1`, conv, staleTurn.Seconds()))
+	if err != nil {
+		return nil
+	}
+	return m
+}
+
+// LastStopped reports that the latest answer of the conversation other than
+// the one being written was stopped by the user (FTR.NAB.CHAT-0004 R10: the
+// agent is told in the next prompt).
+func (s *Store) LastStopped(ctx context.Context, conv, current uuid.UUID) bool {
+	var st string
+	_ = s.Pool.QueryRow(ctx, `SELECT status FROM messages WHERE conversation_id = $1 AND role = 'assistant' AND id <> $2
+		ORDER BY created_at DESC LIMIT 1`, conv, current).Scan(&st)
+	return st == "stopped"
 }
 
 // ContextFill is the fill of the context window of a conversation (R3).

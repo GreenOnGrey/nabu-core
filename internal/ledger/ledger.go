@@ -48,6 +48,9 @@ type Entry struct {
 	// GroupAgentID: the call of a group agent; UserID is the author of the
 	// message (FTR.NAB.CMN-0002 R16).
 	GroupAgentID *uuid.UUID `json:"groupAgentId,omitempty"`
+	// Subagent: the call of a subagent of the agent, "<call>/<task> <description>"
+	// (FTR.NAB.CMN-0009 R9).
+	Subagent *string `json:"subagent,omitempty"`
 }
 
 // Ledger writes and reads usage and audit.
@@ -95,8 +98,8 @@ func (l *Ledger) Audit(ctx context.Context, e Entry, args string, secrets []stri
 		m := Mask(*e.Error, secrets, 1000)
 		e.Error = &m
 	}
-	if _, err := l.Pool.Exec(context.WithoutCancel(ctx), `INSERT INTO audit (agent_kind, agent, user_id, client_id, initiator_email, channel, server, tool, args_summary, result, error, group_agent_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, e.AgentKind, e.Agent, e.UserID, e.ClientID, e.InitiatorEmail, e.Channel, e.Server, e.Tool, a, e.Result, e.Error, e.GroupAgentID); err != nil {
+	if _, err := l.Pool.Exec(context.WithoutCancel(ctx), `INSERT INTO audit (agent_kind, agent, user_id, client_id, initiator_email, channel, server, tool, args_summary, result, error, group_agent_id, subagent)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, e.AgentKind, e.Agent, e.UserID, e.ClientID, e.InitiatorEmail, e.Channel, e.Server, e.Tool, a, e.Result, e.Error, e.GroupAgentID, e.Subagent); err != nil {
 		slog.ErrorContext(ctx, "audit write failed", "err", err, "tool", e.Tool)
 	}
 }

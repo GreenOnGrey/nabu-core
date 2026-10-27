@@ -82,6 +82,9 @@ type API struct {
 	// MaxVoiceSeconds bounds a voice recording (R20: TRANSCRIBE_MAX_SECONDS,
 	// five minutes by default).
 	MaxVoiceSeconds int
+	// QueueMax bounds the messages waiting in a conversation
+	// (FTR.NAB.CHAT-0004 R4: CHAT_QUEUE_MAX); 0 — no bound.
+	QueueMax int
 }
 
 // staleTurn: an answer streaming for longer is not a running turn (R1).
@@ -223,7 +226,9 @@ func (a *API) PostMessage(ctx context.Context, uid uuid.UUID, conv *uuid.UUID, i
 	if err != nil {
 		return nil, err
 	}
-	m, err := a.Store.AddUserMessage(ctx, c.ID, UserMessage{Text: text, Channel: channel, Attachments: atts, Context: msgCtx, Skill: in.Skill, Voice: in.Voice})
+	// FTR.NAB.CHAT-0004 R1, R4: behind a running answer the message waits in
+	// the queue of the conversation, up to QueueMax of them
+	m, _, err := a.Store.AddQueued(ctx, c.ID, UserMessage{Text: text, Channel: channel, Attachments: atts, Context: msgCtx, Skill: in.Skill, Voice: in.Voice}, a.QueueMax)
 	if err != nil {
 		return nil, err
 	}
@@ -234,9 +239,12 @@ func (a *API) PostMessage(ctx context.Context, uid uuid.UUID, conv *uuid.UUID, i
 	return m, nil
 }
 
+// enqueue puts the event on nabu.inbound keyed by the conversation: the
+// conversations of a user go in parallel, the messages of one in order
+// (FTR.NAB.CHAT-0004 R6).
 func (a *API) enqueue(ctx context.Context, in Inbound) error {
 	b, _ := json.Marshal(in)
-	if err := a.Bus.Publish(ctx, kafka.TopicInbound, in.UserID.String(), b); err != nil {
+	if err := a.Bus.Publish(ctx, kafka.TopicInbound, in.ConversationID.String(), b); err != nil {
 		slog.ErrorContext(ctx, "publish inbound", "err", err)
 		return apperr.Unavailable("agent_unavailable", "the agent is temporarily unavailable")
 	}
@@ -260,6 +268,10 @@ func (a *API) Receive(ctx context.Context, in channels.Inbound) error {
 		}
 	}
 	_, err := a.PostMessage(ctx, in.UserID, in.Conversation, pi)
+	if e, ok := apperr.As(err); ok && e.Code == "queue_full" && domain.Messenger(in.Channel) { // FTR.NAB.CHAT-0004 R4, R7
+		a.say(ctx, in.UserID, in.Channel, channels.T(a.Users.Language(ctx, in.UserID), "queue_full"))
+		return nil
+	}
 	return err
 }
 
@@ -269,8 +281,8 @@ func (a *API) Retry(ctx context.Context, p *domain.Principal, id uuid.UUID) erro
 	if err != nil {
 		return err
 	}
-	if m.Role != "assistant" || m.Status != "failed" || m.ReplyTo == nil {
-		return apperr.Conflict("not_retryable", "only a failed answer can be retried")
+	if m.Role != "assistant" || (m.Status != "failed" && m.Status != "stopped") || m.ReplyTo == nil { // FTR.NAB.CHAT-0004 R9
+		return apperr.Conflict("not_retryable", "only a failed or stopped answer can be retried")
 	}
 	user, err := a.Store.Message(ctx, p.UserID, *m.ReplyTo)
 	if err != nil {
@@ -278,6 +290,16 @@ func (a *API) Retry(ctx context.Context, p *domain.Principal, id uuid.UUID) erro
 	}
 	return a.enqueue(ctx, Inbound{UserID: p.UserID, ConversationID: m.ConversationID, MessageID: user.ID, Channel: p.Channel(),
 		ClientID: p.ClientID, Context: user.Context, RetryOf: &m.ID})
+}
+
+// CancelQueued cancels a message waiting in the queue (FTR.NAB.CHAT-0004 R3).
+func (a *API) CancelQueued(ctx context.Context, uid, id uuid.UUID) error {
+	conv, err := a.Store.Cancel(ctx, uid, id)
+	if err != nil {
+		return err
+	}
+	a.Events.Publish(ctx, events.Event{Type: events.MessageCancelled, UserID: &uid, Data: map[string]any{"id": id, "conversationId": conv}})
+	return nil
 }
 
 // ─── profile and agent (tech §3.1) ──────────────────────────────────
@@ -711,6 +733,36 @@ func (a *API) Routes(r chi.Router, site bool) {
 			status = http.StatusCreated
 		}
 		httpx.JSON(w, status, m)
+		return nil
+	}))
+	r.Delete("/messages/{id}", h(func(w http.ResponseWriter, r *http.Request) error { // FTR.NAB.CHAT-0004 R3
+		p, err := httpx.MustPrincipal(r)
+		if err != nil {
+			return err
+		}
+		id, err := httpx.ParamUUID(r, "id")
+		if err != nil {
+			return err
+		}
+		if err := a.CancelQueued(r.Context(), p.UserID, id); err != nil {
+			return err
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return nil
+	}))
+	r.Post("/messages/{id}/stop", h(func(w http.ResponseWriter, r *http.Request) error { // FTR.NAB.CHAT-0004 R8
+		p, err := httpx.MustPrincipal(r)
+		if err != nil {
+			return err
+		}
+		id, err := httpx.ParamUUID(r, "id")
+		if err != nil {
+			return err
+		}
+		if err := a.Store.RequestStop(r.Context(), p.UserID, id); err != nil {
+			return err
+		}
+		w.WriteHeader(http.StatusAccepted)
 		return nil
 	}))
 	r.Post("/messages/{id}/retry", h(func(w http.ResponseWriter, r *http.Request) error {

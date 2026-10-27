@@ -176,7 +176,7 @@ func newChatRig(t *testing.T) *chatRig {
 	}
 	r.cat = &catalog.Service{Pool: pool, Box: box, S3: r.s3, Signer: signer, InternalURL: "http://api.test"}
 	r.api = &chat.API{Store: &chat.Store{Pool: pool}, Pool: pool, Users: repo(), Models: r.ms, Bus: r.bus, Events: r.ev, S3: r.s3, MaxFile: 1 << 20,
-		MaxVoiceSeconds: 2}
+		MaxVoiceSeconds: 2, QueueMax: 10}
 	r.api.Skills = func(ctx context.Context, uid uuid.UUID) ([]chat.Skill, error) {
 		list, err := r.cat.SkillsFor(ctx, uid)
 		out := []chat.Skill{}

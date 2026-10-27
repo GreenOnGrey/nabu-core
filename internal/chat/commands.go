@@ -75,6 +75,49 @@ func (a *API) idle(ctx context.Context, conv uuid.UUID) error {
 	return nil
 }
 
+// stop stops the answer being written in the main conversation of the chat
+// (FTR.NAB.CHAT-0004 R11) and returns the key of the reply. In a group chat
+// only the author of the message being answered may stop it.
+func (a *API) stop(ctx context.Context, in channels.Inbound) string {
+	c, err := a.Store.Main(ctx, in.UserID)
+	if err != nil {
+		slog.WarnContext(ctx, "stop: the main conversation", "err", err)
+		return "cmd.stop_failed"
+	}
+	m := a.Store.Running(ctx, c.ID)
+	if m == nil {
+		return "cmd.not_running"
+	}
+	// in a group only the author of the message being answered; when the
+	// author cannot be checked the answer goes on
+	if by := groupAuthor(in.Context); by != uuid.Nil {
+		if m.ReplyTo == nil {
+			return "cmd.stop_forbidden"
+		}
+		if q, err := a.Store.Message(ctx, in.UserID, *m.ReplyTo); err != nil || groupAuthor(q.Context) != by {
+			return "cmd.stop_forbidden"
+		}
+	}
+	if err := a.Store.RequestStop(ctx, in.UserID, m.ID); err != nil {
+		return "cmd.not_running"
+	}
+	return "cmd.stopped"
+}
+
+// groupAuthor is the Nabu user who wrote a message of a group chat
+// (FTR.NAB.CMN-0007), uuid.Nil — not a group message.
+func groupAuthor(raw json.RawMessage) uuid.UUID {
+	var c struct {
+		Group *struct {
+			AuthorID uuid.UUID `json:"authorId"`
+		} `json:"group"`
+	}
+	if len(raw) == 0 || json.Unmarshal(raw, &c) != nil || c.Group == nil {
+		return uuid.Nil
+	}
+	return c.Group.AuthorID
+}
+
 // say sends a service text to the messenger of the user.
 func (a *API) say(ctx context.Context, uid uuid.UUID, ch, text string) {
 	b, _ := json.Marshal(map[string]any{"userId": uid, "channel": ch, "text": text})
@@ -84,7 +127,8 @@ func (a *API) say(ctx context.Context, uid uuid.UUID, ch, text string) {
 }
 
 // command takes the commands of a messenger (R6): /new, /compact [text],
-// /skills, /skill <name> [task]. done reports that the message was a command.
+// /skills, /skill <name> [task], /stop (FTR.NAB.CHAT-0004 R11). done reports
+// that the message was a command.
 func (a *API) command(ctx context.Context, in channels.Inbound) (bool, error) {
 	text := strings.TrimSpace(in.Text)
 	if !strings.HasPrefix(text, "/") {
@@ -121,6 +165,9 @@ func (a *API) command(ctx context.Context, in channels.Inbound) (bool, error) {
 		return true, nil
 	case "/skills":
 		a.say(ctx, in.UserID, in.Channel, a.skillList(ctx, in.UserID, lang))
+		return true, nil
+	case "/stop":
+		a.say(ctx, in.UserID, in.Channel, channels.T(lang, a.stop(ctx, in)))
 		return true, nil
 	case "/skill":
 		name, task, _ := strings.Cut(rest, " ")

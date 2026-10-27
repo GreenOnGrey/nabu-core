@@ -11,6 +11,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 )
 
 // SessionKind separates the operator's capacity (tech spec §9):
@@ -191,6 +192,9 @@ type SessionRequest struct {
 	Workspace    *Workspace       `json:"workspace,omitempty"`
 	// Label is a short description for the operator's logs (never secrets).
 	Label string `json:"label,omitempty"`
+	// Subagents lets the agent start subagents (FTR.NAB.CMN-0009 R1, R6);
+	// nil — the session has none.
+	Subagents *SubagentLimits `json:"subagents,omitempty"`
 	// probeTools gives a check session Pi's ls in the empty working
 	// directory, to see whether the model calls tools (FTR.NAB.CHAT-0001 R9).
 	// It is set only inside the operator, never from a request.
@@ -221,6 +225,58 @@ type Image struct {
 type PromptRequest struct {
 	Text   string  `json:"text"`
 	Images []Image `json:"images,omitempty"`
+	// Deadline is the end of the turn: a subagent does not live longer
+	// (FTR.NAB.CMN-0009 tech §2.1).
+	Deadline time.Time `json:"deadline,omitzero"`
+}
+
+// SubagentLimits are the limits of the subagents of a session
+// (FTR.NAB.CMN-0009 R6, tech §2.1); the operator only applies them.
+type SubagentLimits struct {
+	MaxParallel int      `json:"maxParallel"` // tasks of one call
+	MaxPerTurn  int      `json:"maxPerTurn"`  // subagents of one turn
+	Timeout     Duration `json:"timeout"`     // of one task
+	ResultChars int      `json:"resultChars"` // the result the agent gets back
+	SlotWait    Duration `json:"slotWait"`    // for a place in the pod
+}
+
+// Duration is a time.Duration written as "15m" in JSON.
+type Duration time.Duration
+
+// MarshalJSON writes the duration as a string.
+func (d Duration) MarshalJSON() ([]byte, error) { return json.Marshal(time.Duration(d).String()) }
+
+// UnmarshalJSON reads "15m".
+func (d *Duration) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	v, err := time.ParseDuration(s)
+	*d = Duration(v)
+	return err
+}
+
+// States of a subagent task (FTR.NAB.CMN-0009 R8).
+const (
+	SubagentRunning = "running"
+	SubagentDone    = "done"
+	SubagentFailed  = "failed"
+	SubagentTimeout = "timeout"
+	SubagentAborted = "aborted"
+)
+
+// SubagentState is the state of one task of a subagent call, as the stream
+// of the parent turn carries it (event subagent) and the answer keeps it.
+type SubagentState struct {
+	Call        string `json:"call"`
+	Task        int    `json:"task"`
+	Description string `json:"description"`
+	State       string `json:"state"`
+	Tools       int    `json:"tools"`
+	Error       string `json:"error,omitempty"`
+	// Result is the beginning of the result, only when done or timed out.
+	Result string `json:"result,omitempty"`
 }
 
 // PatchRequest changes the model or level of a session.
@@ -243,6 +299,9 @@ const (
 	EventUsage   = "usage"
 	EventError   = "error"
 	EventSettled = "settled"
+	// EventSubagent is the progress of a subagent of the turn; its Usage is
+	// what the subagent spent since its last event (FTR.NAB.CMN-0009 R8, R9).
+	EventSubagent = "subagent"
 )
 
 // Event is one record of the prompt stream.
@@ -263,9 +322,13 @@ type Event struct {
 	// Aborted marks a settled run stopped by abort: the stream still ends normally.
 	Aborted bool `json:"aborted,omitempty"`
 	// Auto marks a compaction the harness made itself (FTR.NAB.CHAT-0001 R2).
-	Auto          bool  `json:"auto,omitempty"`
-	ContextTokens int64 `json:"contextTokens,omitempty"`
-	ContextWindow int64 `json:"contextWindow,omitempty"`
+	Auto          bool           `json:"auto,omitempty"`
+	ContextTokens int64          `json:"contextTokens,omitempty"`
+	ContextWindow int64          `json:"contextWindow,omitempty"`
+	Subagent      *SubagentState `json:"subagent,omitempty"`
+	// Of marks a tool call or result of a subagent, "<call>/<task>": the
+	// worker audits it (FTR.NAB.CMN-0009 R9), the answer does not show it.
+	Of string `json:"of,omitempty"`
 	Usage
 }
 

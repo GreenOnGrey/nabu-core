@@ -163,6 +163,8 @@ func runOperator(ctx context.Context) error {
 		}},
 		WorkDir: envOr("AGENT_WORKDIR", "/work"), ServiceToken: os.Getenv("AGENT_SERVICE_TOKEN"),
 		MaxSessions: maxS, MaxRuns: maxR, IdleTimeout: idle,
+		// FTR.NAB.CMN-0009: where the Pi sessions start subagents; never outside the pod
+		SubagentAddr: envOr("AGENT_SUBAGENT_ADDR", "127.0.0.1:8091"),
 	})
 	if err != nil {
 		return err

@@ -10,7 +10,13 @@
  * operations with calls to the relay (NABU_WORKSPACE_URL, NABU_WORKSPACE_TOKEN),
  * which forwards them over the workspace's channel.
  *
- * Loaded only in sessions with a workspace, from the image
+ * It also gives the agent the tool subagent (FTR.NAB.CMN-0009): 1–4 child
+ * agents started by the agent operator of the pod over loopback
+ * (NABU_SUBAGENT_URL, NABU_SUBAGENT_TOKEN); a subagent itself has none
+ * (NABU_SUBAGENT_DEPTH=1). The call waits for the children and ends with the
+ * tool: nothing runs in the background.
+ *
+ * Loaded only in sessions with a workspace or with subagents, from the image
  * (/opt/nabu/pi-extensions); it cannot be installed or changed through the
  * administration.
  */
@@ -29,6 +35,7 @@ import {
 	createReadTool,
 	createWriteTool,
 	DEFAULT_MAX_BYTES,
+	defineTool,
 	type EditOperations,
 	type FindOperations,
 	formatSize,
@@ -39,6 +46,7 @@ import {
 	truncateHead,
 	type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 const URL_BASE = (process.env.NABU_WORKSPACE_URL ?? "").replace(/\/+$/, "");
 const TOKEN = process.env.NABU_WORKSPACE_TOKEN ?? "";
@@ -280,10 +288,88 @@ async function grep(localCwd: string, params: GrepToolInput, signal?: AbortSigna
 	return { content: [{ type: "text" as const, text: output }], details: Object.keys(details).length > 0 ? details : undefined };
 }
 
+const SUBAGENT_URL = process.env.NABU_SUBAGENT_URL ?? "";
+const SUBAGENT_TOKEN = process.env.NABU_SUBAGENT_TOKEN ?? "";
+const SUBAGENT_MAX = Number(process.env.NABU_SUBAGENT_MAX_PARALLEL) || 4;
+
+// FTR.NAB.CMN-0009 tech §2.4: the words skills use for it are in the description, so the model finds it
+const SUBAGENT_DESCRIPTION =
+	`Run 1–${SUBAGENT_MAX} subagents in parallel. Each subagent is a fresh agent with your tools, workspace and skills but without this conversation: ` +
+	"give it everything it needs in the prompt. You get back only each subagent's final message. Use it when a skill asks to spawn a sub-agent / use " +
+	"the Agent tool, to keep long reading out of your context, or to run independent parts in parallel. Subagents cannot start subagents.";
+
+interface SubagentResult { task: number; state: string; text: string; truncated: boolean; error?: string }
+type SubagentLine = { task: number; state: string; tools: number } | { results: SubagentResult[] } | { error: string; message: string };
+
+const SUBAGENT_STATE: Record<string, string> = { running: "running", done: "done", failed: "failed", timeout: "timed out", aborted: "stopped" };
+
+function subagentTool() {
+	return defineTool({
+		name: "subagent",
+		label: "Subagents",
+		description: SUBAGENT_DESCRIPTION,
+		parameters: Type.Object({
+			tasks: Type.Array(
+				Type.Object({
+					description: Type.String({ minLength: 1, maxLength: 80, description: "A few words shown to the user while it runs" }),
+					prompt: Type.String({ minLength: 1, maxLength: 64000, description: "The whole task: the subagent sees nothing else" }),
+					skill: Type.Optional(Type.String({ description: "A skill of yours the subagent starts with" })),
+				}),
+				{ minItems: 1, maxItems: SUBAGENT_MAX },
+			),
+		}),
+		async execute(toolCallId, params, signal, onUpdate) {
+			const res = await fetch(SUBAGENT_URL, {
+				method: "POST",
+				headers: { Authorization: `Bearer ${SUBAGENT_TOKEN}`, "Content-Type": "application/json" },
+				body: JSON.stringify({ call: toolCallId, tasks: params.tasks }),
+				signal,
+			});
+			if (!res.ok || !res.body) {
+				const e = (await res.json().catch(() => ({}))) as { error?: string; message?: string };
+				return { content: [{ type: "text", text: `${e.error ?? res.status}: ${e.message ?? res.statusText}` }], isError: true, details: undefined };
+			}
+			const progress = new Map<number, string>();
+			let results: SubagentResult[] = [];
+			let rest = "";
+			const decoder = new TextDecoder();
+			const take = (raw: string) => {
+				if (!raw.trim()) return;
+				const line = JSON.parse(raw) as SubagentLine;
+				if ("results" in line) {
+					results = line.results;
+				} else if ("task" in line) {
+					const d = params.tasks[line.task - 1]?.description ?? `task ${line.task}`;
+					progress.set(line.task, `${d}: ${SUBAGENT_STATE[line.state] ?? line.state}, tools ${line.tools}`);
+					onUpdate?.({ content: [{ type: "text", text: [...progress.values()].join("\n") }], details: undefined });
+				}
+			};
+			for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+				rest += decoder.decode(chunk, { stream: true });
+				let i: number;
+				while ((i = rest.indexOf("\n")) >= 0) {
+					take(rest.slice(0, i));
+					rest = rest.slice(i + 1);
+				}
+			}
+			take(rest);
+			const text = results
+				.map((r) => {
+					const d = params.tasks[r.task - 1]?.description ?? `task ${r.task}`;
+					const body = [r.text, r.error ? `Error: ${r.error}` : ""].filter(Boolean).join("\n");
+					return `## ${d} — ${SUBAGENT_STATE[r.state] ?? r.state}\n${body}`;
+				})
+				.join("\n\n");
+			return { content: [{ type: "text", text: text || "The subagents returned nothing." }], details: undefined };
+		},
+	});
+}
+
 export default function (pi: ExtensionAPI) {
-	if (!URL_BASE || !TOKEN) {
-		throw new Error("nabu-workspace: NABU_WORKSPACE_URL and NABU_WORKSPACE_TOKEN are required");
+	if (SUBAGENT_URL && SUBAGENT_TOKEN && process.env.NABU_SUBAGENT_DEPTH === "0") {
+		pi.registerTool(subagentTool());
 	}
+	if (!URL_BASE || !TOKEN) return; // a session with subagents and without a workspace
 	const localCwd = process.cwd();
 	const read = createReadTool(localCwd, { operations: readOps(localCwd) });
 	const write = createWriteTool(localCwd, { operations: writeOps(localCwd) });

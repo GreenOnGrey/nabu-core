@@ -42,6 +42,13 @@ var texts = map[string]map[string]string{
 		"cmd.skill_unavailable": "The skill %s is not available.",
 		"cmd.model":             "— Model: %s —",
 		"voice.failed":          "The voice message could not be recognized — send it as text.",
+		// FTR.NAB.CHAT-0004 R4, R11: the queue and the stop of an answer
+		"queue_full":         "The queue is full: I am still answering your earlier messages. Write again when I answer.",
+		"cmd.stopped":        "Stopped.",
+		"cmd.not_running":    "I am not writing anything now.",
+		"cmd.stop_forbidden": "Only the one it is addressed to can stop the answer.",
+		"answer.stopped":     "(stopped)",
+		"cmd.stop_failed":    "The answer could not be stopped, try again.",
 	},
 	"ru": {
 		"tg.send_key":           "Пришлите личный ключ Nabu, чтобы привязать этот аккаунт Telegram. Ключ выдаётся в Nabu: %s → Telegram → «Получить ключ».",
@@ -73,6 +80,12 @@ var texts = map[string]map[string]string{
 		"cmd.skill_unavailable": "Скилл %s недоступен.",
 		"cmd.model":             "— Модель: %s —",
 		"voice.failed":          "Не удалось распознать голосовое — отправьте текстом.",
+		"queue_full":            "Очередь заполнена: я ещё отвечаю на прошлые сообщения. Напишите, когда я отвечу.",
+		"cmd.stopped":           "Остановил.",
+		"cmd.not_running":       "Сейчас я ничего не пишу.",
+		"cmd.stop_forbidden":    "Остановить ответ может только тот, кому он адресован.",
+		"answer.stopped":        "(остановлено)",
+		"cmd.stop_failed":       "Не удалось остановить ответ, попробуйте ещё раз.",
 	},
 }
 

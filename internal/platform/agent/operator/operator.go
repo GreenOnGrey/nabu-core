@@ -52,6 +52,9 @@ type Config struct {
 	Generation int64
 	PublicKey  ed25519.PublicKey
 	Version    string
+	// SubagentAddr is the loopback address where the Pi sessions of the pod
+	// start their subagents (FTR.NAB.CMN-0009 tech §2.2); "" — no subagents.
+	SubagentAddr string
 }
 
 // Modes of the operator.
@@ -77,6 +80,12 @@ type entry struct {
 	conn      string
 	label     string
 	s         *pi.Session
+	// FTR.NAB.CMN-0009: the request the subagents of the session are built
+	// from, its skills, the token of its calls and the turn being run.
+	req       agent.SessionRequest
+	skillsDir string
+	subToken  string
+	turn      *turn
 
 	run  sync.Mutex // one prompt at a time
 	mu   sync.Mutex
@@ -324,6 +333,11 @@ func (o *Operator) open(w http.ResponseWriter, r *http.Request) {
 	rt := o.cfg.Runtime
 	rt.SkillsDir = skillsDir
 	rt.Stderr = &logWriter{session: id, label: req.Label}
+	subTok := ""
+	if req.Subagents != nil && o.cfg.SubagentAddr != "" {
+		subTok = randID() + randID()
+		rt.ExtraEnv = append(append([]string{}, rt.ExtraEnv...), subagentEnv(o.cfg.SubagentAddr, id, subTok, req.Subagents.MaxParallel)...)
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
 	defer cancel()
 	reason := "new"
@@ -338,7 +352,8 @@ func (o *Operator) open(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "agent_start_failed", err.Error())
 		return
 	}
-	e := &entry{id: id, token: tok, kind: req.Kind, conn: req.Model.ConnectionID, label: req.Label, s: s, last: time.Now()}
+	e := &entry{id: id, token: tok, kind: req.Kind, conn: req.Model.ConnectionID, label: req.Label, s: s, last: time.Now(),
+		req: req, skillsDir: skillsDir, subToken: subTok}
 	o.mu.Lock()
 	o.sessions[id] = e
 	metrics.AgentSessions.WithLabelValues(string(req.Kind)).Set(float64(o.counts[req.Kind]))
@@ -374,7 +389,10 @@ func (o *Operator) prompt(w http.ResponseWriter, r *http.Request) {
 	enc := json.NewEncoder(w)
 	model, _ := e.s.Model()
 	metrics.LLMRequests.WithLabelValues(e.conn, model, string(e.kind)).Inc()
+	var emitMu sync.Mutex // the events of subagents come from their own goroutines
 	emit := func(ev agent.Event) {
+		emitMu.Lock()
+		defer emitMu.Unlock()
 		switch ev.Type {
 		case agent.EventUsage:
 			metrics.LLMTokens.WithLabelValues("in").Add(float64(ev.TokensIn))
@@ -391,7 +409,17 @@ func (o *Operator) prompt(w http.ResponseWriter, r *http.Request) {
 			fl.Flush()
 		}
 	}
-	if err := e.s.Prompt(r.Context(), p, emit); err != nil {
+	tn := e.begin(r.Context(), p.Deadline, emit)
+	defer e.end()
+	// FTR.NAB.CMN-0009: the stream ends with settled or an error; the last
+	// events of running subagents go before it
+	run := func(ev agent.Event) {
+		if ev.Type == agent.EventSettled || ev.Type == agent.EventError {
+			tn.drain()
+		}
+		emit(ev)
+	}
+	if err := e.s.Prompt(r.Context(), p, run); err != nil {
 		if errors.Is(err, context.Canceled) || r.Context().Err() != nil {
 			return // the caller went away or aborted
 		}

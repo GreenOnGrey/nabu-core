@@ -204,7 +204,7 @@ func (e *Engine) taskTurn(ctx context.Context, lease *agentpods.Lease, ri *tasks
 		"[This is a run of the scheduled task «" + ri.Title + "», not a live chat: the user is not here to answer questions. " +
 		"Do the work with your tools and reply with the final result for the user only — it will be delivered to the main conversation" +
 		deliveryNote(ri.Channel) + ".]\n\nTask instruction: " + ri.Instruction
-	err = op.Prompt(ctx, resp.SessionID, agent.PromptRequest{Text: prompt}, col.handle)
+	err = op.Prompt(ctx, resp.SessionID, agent.PromptRequest{Text: prompt, Deadline: deadline(ctx)}, col.handle)
 	if col.failure != nil {
 		return "", string(col.failure.ErrorClass), col.failure.Message, false
 	}
@@ -302,7 +302,8 @@ func (e *Engine) serviceTurn(ctx context.Context, runID uuid.UUID, ag *services.
 		return "", string(agent.ErrAgentCrashed), err.Error(), total, false
 	}
 	req := agent.SessionRequest{Kind: agent.KindRun, Model: model, Label: ag.Name + " " + runID.String()[:8],
-		Secrets: agent.Secrets{LLMKey: key, MCPHeaders: map[string]map[string]string{}}, SystemAppend: ag.Instructions}
+		Secrets: agent.Secrets{LLMKey: key, MCPHeaders: map[string]map[string]string{}}, SystemAppend: ag.Instructions,
+		Subagents: e.Cfg.Subagents} // FTR.NAB.CMN-0009 tech §2.1
 	secrets := []string{key}
 	for _, s := range cat.Servers {
 		req.MCP = append(req.MCP, s)
@@ -412,7 +413,7 @@ func (e *Engine) serviceTurn(ctx context.Context, runID uuid.UUID, ag *services.
 	if initiator != nil {
 		prompt = "[Started on the initiative of " + *initiator + "]\n" + prompt
 	}
-	err = e.Op.Prompt(ctx, resp.SessionID, agent.PromptRequest{Text: prompt}, col.handle)
+	err = e.Op.Prompt(ctx, resp.SessionID, agent.PromptRequest{Text: prompt, Deadline: deadline(ctx)}, col.handle)
 	e.Models.RecordResult(ctx, model.ConnectionID, func() agent.ErrorClass {
 		if col.failure != nil {
 			return col.failure.ErrorClass

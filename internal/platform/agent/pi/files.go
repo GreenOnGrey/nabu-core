@@ -191,11 +191,12 @@ func SettingsJSON(req agent.SessionRequest, extensionDir string) map[string]any 
 		"quietStartup":           true,
 		"extensions":             []string{},
 	}
+	// the extension gives the workspace tools and the tool subagent (FTR.NAB.CMN-0009)
+	if extensionDir != "" && (req.Workspace != nil || req.Subagents != nil) {
+		s["extensions"] = []string{extensionDir}
+	}
 	if req.Workspace != nil {
 		s["defaultTools"] = CodeTools
-		if extensionDir != "" {
-			s["extensions"] = []string{extensionDir}
-		}
 	} else if req.ProbeTools() {
 		s["defaultTools"] = []string{"ls"} // the tool probe of a check: the empty working directory
 	} else {

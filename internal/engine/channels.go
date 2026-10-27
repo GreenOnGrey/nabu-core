@@ -197,6 +197,7 @@ func (e *Engine) groupRequest(ctx context.Context, u *users.User, ga *groups.Age
 		titles = append(titles, s.Description)
 	}
 	req.Skills = e.sessionSkills(ctx, cat)
+	req.Subagents = e.Cfg.Subagents // FTR.NAB.CMN-0009 tech §2.1
 	if e.Space.Enabled {
 		wsID := space.WorkspaceID(u.ID)
 		call := e.Signer.Issue(jwt.Claims{Audience: jwt.AudCall, Workspace: wsID}, tokenTTL)

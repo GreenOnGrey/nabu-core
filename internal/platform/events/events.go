@@ -20,9 +20,12 @@ import (
 
 // Event types of the user stream (tech spec §3.2, §3.2a).
 const (
-	MessageCreated      = "message.created"
-	MessageDelta        = "message.delta"
-	MessageDone         = "message.done"
+	MessageCreated = "message.created"
+	MessageDelta   = "message.delta"
+	MessageDone    = "message.done"
+	// MessageCancelled: a message left the queue of its conversation
+	// (FTR.NAB.CHAT-0004 R3).
+	MessageCancelled    = "message.cancelled"
 	ToolStep            = "tool.step"
 	ChatError           = "chat.error"
 	ConversationUpdated = "conversation.updated"

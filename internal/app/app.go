@@ -220,7 +220,7 @@ func newCore(ctx context.Context, cfg *config.Config) (*core, error) {
 	c.vk = channels.NewVKTeams()
 	c.chatAPI = &chat.API{Store: c.chat, Pool: pool, Users: c.users, Models: c.models, Bus: producer, Events: pub, S3: s3, MaxFile: cfg.UploadMaxBytes,
 		// FTR.NAB.CHAT-0001 R20: 5 minutes of opus at up to 192 kbit/s
-		MaxVoiceSeconds: cfg.TranscribeMaxSeconds}
+		MaxVoiceSeconds: cfg.TranscribeMaxSeconds, QueueMax: cfg.ChatQueueMax}
 	if cfg.WhisperURL != "" { // the site (api) and the voice messages of messengers (api, worker)
 		c.chatAPI.Whisper = whisper.New(cfg.WhisperURL)
 	}
@@ -744,7 +744,8 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 	c.mail.Pending = confirms.PendingSince
 	eng := &engine.Engine{
 		Cfg: engine.Config{InternalURL: cfg.InternalURL, RelayInternalURL: cfg.RelayInternalURL, TurnTimeout: cfg.TurnTimeout,
-			TaskRunTimeout: cfg.TaskRunTimeout, RunWorkspaceWait: cfg.RunWorkspaceWait, SessionMaxAge: 12 * time.Hour, PiVersion: cfg.PiVersion},
+			TaskRunTimeout: cfg.TaskRunTimeout, RunWorkspaceWait: cfg.RunWorkspaceWait, SessionMaxAge: 12 * time.Hour, PiVersion: cfg.PiVersion,
+			Subagents: subagentLimits(cfg)},
 		Pool: c.pool, Op: c.operator, Users: c.users, Chat: c.chat, Models: c.models, Catalog: c.catalog, Memory: c.memory, Tasks: c.tasks, Comm: c.comm,
 		Space: c.space, Sandboxes: sandboxes, Services: c.services, Ledger: c.ledger, Signer: c.signer, S3: c.s3, Events: c.events,
 		Bus: c.producer, Adapters: adapters, Registry: c.registry, Keys: c.keys, Groups: c.groups, Mail: c.mail,
@@ -983,6 +984,9 @@ func RunOperator(ctx context.Context, op *operator.Operator, listenAddr, service
 	srv := &http.Server{Addr: listenAddr, Handler: otelhttp.NewHandler(op.Handler(), "agent"), ReadHeaderTimeout: 15 * time.Second}
 	g, gctx := errgroup.WithContext(ctx)
 	serve(gctx, g, srv, serviceServer(serviceAddr, ready))
+	if addr := op.SubagentAddr(); addr != "" { // FTR.NAB.CMN-0009: loopback only, for the Pi of the pod
+		serve(gctx, g, &http.Server{Addr: addr, Handler: op.SubagentHandler(), ReadHeaderTimeout: 15 * time.Second})
+	}
 	g.Go(func() error { op.Run(gctx); return nil })
 	return g.Wait()
 }
@@ -1149,4 +1153,14 @@ func ChatSkills(ctx context.Context, cat *catalog.Service, gs *groups.Service, u
 		out = append(out, chat.Skill(s))
 	}
 	return out, err
+}
+
+// subagentLimits are the limits of the subagents of agents (FTR.NAB.CMN-0009
+// R6); nil when SUBAGENTS_ENABLED=false (R10).
+func subagentLimits(cfg *config.Config) *agent.SubagentLimits {
+	if !cfg.SubagentsEnabled {
+		return nil
+	}
+	return &agent.SubagentLimits{MaxParallel: cfg.SubagentMaxParallel, MaxPerTurn: cfg.SubagentMaxPerTurn,
+		Timeout: agent.Duration(cfg.SubagentTimeout), ResultChars: cfg.SubagentResultChars, SlotWait: agent.Duration(cfg.SubagentSlotWait)}
 }

@@ -23,7 +23,17 @@ var (
 		Name: "nabu_agent_sessions_active", Help: "Active harness sessions of the agent operator by kind.",
 	}, []string{"kind"})
 	AgentProcessStarts = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "nabu_agent_process_starts_total", Help: "Pi process starts by reason (new, restore, crash, check).",
+		Name: "nabu_agent_process_starts_total", Help: "Pi process starts by reason (new, restore, crash, check, subagent).",
+	}, []string{"reason"})
+	// FTR.NAB.CMN-0009 arch §6: subagents of the turns.
+	SubagentRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_subagent_runs_total", Help: "Subagents by session kind and result (done, failed, timeout, aborted).",
+	}, []string{"kind", "result"})
+	SubagentDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "nabu_subagent_duration_seconds", Help: "Run time of subagents.", Buckets: []float64{5, 15, 30, 60, 120, 300, 600, 900},
+	}, []string{"kind"})
+	SubagentRejected = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_subagent_rejected_total", Help: "Refused calls of subagents by reason (turn_limit, call_limit, no_slot, disabled).",
 	}, []string{"reason"})
 	LLMRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nabu_llm_requests_total", Help: "Agent runs (prompts) by connection, model and kind.",
@@ -160,7 +170,7 @@ func init() {
 
 func init() {
 	Registry.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-		HTTPRequests, HTTPDuration, KafkaLag, AgentSessions, AgentProcessStarts, LLMRequests, LLMErrors, LLMTokens, LLMCost,
+		HTTPRequests, HTTPDuration, KafkaLag, AgentSessions, AgentProcessStarts, SubagentRuns, SubagentDuration, SubagentRejected, LLMRequests, LLMErrors, LLMTokens, LLMCost,
 		Turns, WorkspaceConnections, WorkspaceCalls, Sandboxes, TaskRuns, ServiceRuns, ChannelMessages,
 		ChannelInbound, ChannelOutbound, EmailAuthRejected, IMAPConnected, VKTeamsPollLag, PendingConfirmations, Users, PurgeDeleted,
 		MemoryMaskedSecrets, MemoryDeniedTools, MemoryDigests, MemorySearch, MemoryCollect, MemoryCollectSeconds, MemoryEmbedPending)

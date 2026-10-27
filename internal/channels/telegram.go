@@ -171,8 +171,8 @@ func (t *Telegram) Setup(ctx context.Context, publicAPIURL string) error {
 // botCommands are the commands of the conversation in the menu of the bot
 // (FTR.NAB.CHAT-0001 R6, SKL-10), by language; "" is the default.
 var botCommands = map[string][][2]string{
-	"":   {{"new", "Start with a clean context"}, {"compact", "Compact the context"}, {"skills", "My skills"}, {"skill", "Call a skill: /skill <name> <task>"}},
-	"ru": {{"new", "Начать с чистого контекста"}, {"compact", "Сжать контекст"}, {"skills", "Мои скиллы"}, {"skill", "Вызвать скилл: /skill <имя> <задача>"}},
+	"":   {{"new", "Start with a clean context"}, {"compact", "Compact the context"}, {"skills", "My skills"}, {"skill", "Call a skill: /skill <name> <task>"}, {"stop", "Stop the answer"}},
+	"ru": {{"new", "Начать с чистого контекста"}, {"compact", "Сжать контекст"}, {"skills", "Мои скиллы"}, {"skill", "Вызвать скилл: /skill <имя> <задача>"}, {"stop", "Остановить ответ"}},
 }
 
 // setCommands registers the commands; a failure only costs the menu.

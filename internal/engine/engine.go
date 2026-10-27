@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -54,6 +56,9 @@ type Config struct {
 	RunWorkspaceWait time.Duration
 	SessionMaxAge    time.Duration // reopen sessions older than this (tokens)
 	PiVersion        string
+	// Subagents are the limits of the subagents of the sessions of agents
+	// (FTR.NAB.CMN-0009 R6, R10); nil — SUBAGENTS_ENABLED=false.
+	Subagents *agent.SubagentLimits
 }
 
 // Engine runs agents.
@@ -179,6 +184,7 @@ func (e *Engine) personalRequest(ctx context.Context, u *users.User, conv uuid.U
 		req.Workspace = &agent.Workspace{ID: wsID, URL: e.Cfg.RelayInternalURL + "/internal/v1/workspaces/" + wsID, Token: call,
 			Note: "The working directory is the user's personal space in Nabu: files persist between conversations and the user sees them in the Space section. Paths are relative to its root.", Root: space.SandboxRoot}
 	}
+	req.Subagents = e.Cfg.Subagents // FTR.NAB.CMN-0009 tech §2.1
 	p := Persona{User: u, Agent: ag, Memory: mem, Spaces: e.Space.Enabled, Now: time.Now(), Catalog: titles, Documents: cat.Documents}
 	req.SystemAppend = p.Instructions()
 	return &built{req: req, persona: p, secrets: secrets, model: model, mcpHash: cat.Fingerprint}, nil
@@ -367,6 +373,10 @@ func (c *collector) handle(ev agent.Event) {
 		c.first()
 		c.first = nil
 	}
+	if ev.Of != "" { // a tool of a subagent: audited, not a step of the answer
+		c.subagentTool(ev)
+		return
+	}
 	switch ev.Type {
 	case agent.EventTextDelta:
 		c.text.WriteString(ev.Delta)
@@ -417,6 +427,13 @@ func (c *collector) handle(ev agent.Event) {
 		u := c.usage
 		u.Usage = ev.Usage
 		c.e.Ledger.Usage(c.ctx, u)
+	case agent.EventSubagent: // FTR.NAB.CMN-0009 R8, R9: the task in the step of its call, its cost in the answer
+		if sa := ev.Subagent; sa != nil {
+			c.subagent(*sa)
+		}
+		if !ev.Usage.IsZero() {
+			c.handle(agent.Event{Type: agent.EventUsage, Usage: ev.Usage})
+		}
 	case agent.EventError:
 		ev := ev
 		c.failure = &ev
@@ -425,6 +442,79 @@ func (c *collector) handle(ev agent.Event) {
 	case agent.EventContext:
 		c.contextTokens, c.contextWindow = ev.ContextTokens, ev.ContextWindow
 	}
+}
+
+// subagentTool audits a tool call of a subagent like one of the agent
+// (FTR.NAB.CMN-0009 R9).
+func (c *collector) subagentTool(ev agent.Event) {
+	key := ev.Of + ":" + ev.ID
+	if ev.Type == agent.EventToolCall {
+		if c.args == nil {
+			c.args = map[string]string{}
+		}
+		c.args[key] = string(ev.Args)
+		return
+	}
+	server, tool := ledger.SplitTool(ev.Name)
+	mark := ev.Of + " " + c.taskDescription(ev.Of) // R9: the call and the task the user saw
+	mark = strings.TrimSpace(mark)
+	a := c.audit
+	a.Tool, a.Result, a.Subagent = tool, "ok", &mark
+	if ev.IsError {
+		t := ev.Summary
+		a.Result, a.Error = "error", &t
+	}
+	if server != "" {
+		a.Server = &server
+	}
+	c.e.Ledger.Audit(c.ctx, a, c.args[key], c.secrets)
+	delete(c.args, key)
+}
+
+// taskDescription is the description of the task "<call>/<task>" in the
+// step of its call, "" — not known yet.
+func (c *collector) taskDescription(of string) string {
+	call, n, _ := strings.Cut(of, "/")
+	for _, st := range c.steps {
+		if st.ID != call {
+			continue
+		}
+		for _, t := range st.Subagents {
+			if strconv.Itoa(t.Task) == n {
+				return t.Description
+			}
+		}
+	}
+	return ""
+}
+
+// subagent puts the state of a task into the step of its call.
+func (c *collector) subagent(sa agent.SubagentState) {
+	for i := range c.steps {
+		if c.steps[i].ID != sa.Call {
+			continue
+		}
+		t := chat.SubagentTask{Task: sa.Task, Description: sa.Description, State: sa.State, Tools: sa.Tools, Error: sa.Error, Result: sa.Result}
+		list := c.steps[i].Subagents
+		j := slices.IndexFunc(list, func(x chat.SubagentTask) bool { return x.Task == sa.Task })
+		if j < 0 {
+			list = append(list, t)
+			slices.SortFunc(list, func(a, b chat.SubagentTask) int { return a.Task - b.Task })
+		} else {
+			list[j] = t
+		}
+		c.steps[i].Subagents = list
+		if c.stream {
+			c.e.publish(c.ctx, events.ToolStep, c.uid, map[string]any{"messageId": c.msgID, "conversationId": c.conv, "step": c.steps[i]})
+		}
+		return
+	}
+}
+
+// deadline is the end of the turn the operator keeps subagents within.
+func deadline(ctx context.Context) time.Time {
+	d, _ := ctx.Deadline()
+	return d
 }
 
 func firstLine(s string) string {
@@ -458,6 +548,7 @@ func (e *Engine) HandleInbound(ctx context.Context, key, value []byte) error {
 		return err
 	}
 	if u == nil {
+		e.Chat.Start(ctx, in.MessageID) // FTR.NAB.CHAT-0004 tech §3: nobody answers, it does not wait
 		return nil
 	}
 	if in.Command != "" { // FTR.NAB.CHAT-0001 R1, R2
@@ -473,6 +564,10 @@ func (e *Engine) HandleInbound(ctx context.Context, key, value []byte) error {
 		e.Pods.Drop(ctx, u.ID, turn.Ref) // nobody will run it: the later turns of the owner go on
 		return nil
 	}
+	if in.RetryOf == nil && e.Chat.Cancelled(ctx, userMsg.ID) { // FTR.NAB.CHAT-0004 R3: no pod for a cancelled message
+		e.Pods.Drop(ctx, u.ID, turn.Ref)
+		return nil
+	}
 	// At-least-once delivery: an answered message is not answered again. An
 	// answer left unfinished by a turn that lost its pod does not count: the
 	// turn waits in the queue to continue it.
@@ -481,6 +576,7 @@ func (e *Engine) HandleInbound(ctx context.Context, key, value []byte) error {
 		_ = e.Pool.QueryRow(ctx, `SELECT count(*) FROM messages m WHERE m.reply_to = $1 AND m.role = 'assistant'
 			AND NOT EXISTS (SELECT 1 FROM agent_queue q WHERE q.resume = m.id)`, userMsg.ID).Scan(&n)
 		if n > 0 {
+			e.Chat.Start(ctx, userMsg.ID)
 			e.Pods.Drop(ctx, u.ID, turn.Ref)
 			return nil
 		}
@@ -491,12 +587,24 @@ func (e *Engine) HandleInbound(ctx context.Context, key, value []byte) error {
 	if u.Status != "blocked" && u.Status != "archived" {
 		lease, err = e.acquire(ctx, u.ID, turn)
 		if errors.Is(err, agentpods.ErrQueued) {
+			// FTR.NAB.CHAT-0004 R3: the message waits for a place in the pod — it is
+			// in the queue and may be cancelled, as the listing shows it
+			if in.RetryOf == nil && userMsg.Queued {
+				e.publish(ctx, events.MessageCreated, u.ID, userMsg)
+			}
 			return nil
 		}
 		if err != nil {
 			return err
 		}
 		defer lease.Release(ctx)
+	}
+	// FTR.NAB.CHAT-0004 R2, R3: the message leaves the queue when its turn has
+	// a pod; until then the user may cancel it. A retry and the continuation
+	// of an answer after a lost pod were started before.
+	if in.RetryOf == nil && lease.Resume == uuid.Nil && e.Chat.Start(ctx, userMsg.ID) {
+		e.Pods.Drop(ctx, u.ID, turn.Ref)
+		return nil
 	}
 	// R17: the time to the first piece of the answer counts from the message,
 	// for a retry — from the retry.
@@ -549,6 +657,9 @@ func (e *Engine) HandleInbound(ctx context.Context, key, value []byte) error {
 		}
 	}
 	text, images := e.promptOf(ctx, u, userMsg, in)
+	if e.Chat.LastStopped(ctx, in.ConversationID, asst.ID) { // FTR.NAB.CHAT-0004 R10
+		text = "[The user stopped your previous answer.]\n" + text
+	}
 	var author *uuid.UUID
 	if mctx.Group != nil && mctx.Group.AuthorID != uuid.Nil {
 		author = &mctx.Group.AuthorID
@@ -566,28 +677,26 @@ func (e *Engine) HandleInbound(ctx context.Context, key, value []byte) error {
 		}
 		slog.WarnContext(ctx, "requeue a turn", "conversation", in.ConversationID, "err", err)
 	}
-	status := "done"
-	if res.errClass != "" {
-		status = "failed"
+	status := res.status()
+	if status == "stopped" { // FTR.NAB.CHAT-0004 R9: what was written stays, without an error
+		res.errClass, res.errText = "", ""
 	}
 	final, err := e.Chat.Finish(ctx, asst.ID, res.text, status, res.steps, res.errClass, res.errText)
 	if err != nil {
 		return err
 	}
-	final.Retryable = res.errClass != ""
-	if res.errClass != "" {
-		metrics.Turns.WithLabelValues(channelLabel(in.Channel), "failed").Inc()
+	final.Retryable = status != "done"
+	metrics.Turns.WithLabelValues(channelLabel(in.Channel), turnLabel[status]).Inc()
+	if status == "failed" {
 		e.publish(ctx, events.ChatError, u.ID, map[string]any{"messageId": asst.ID, "conversationId": in.ConversationID,
 			"errorClass": res.errClass, "retryable": retryable(res.errClass), "text": res.errText})
-	} else {
-		metrics.Turns.WithLabelValues(channelLabel(in.Channel), "ok").Inc()
 	}
 	e.publish(ctx, events.MessageDone, u.ID, final)
 	switch {
 	case e.Chat.Source(ctx, in.ConversationID) == "email":
 		// R8: a letter in the thread when the bot was the only recipient,
 		// otherwise the topic with an unread mark; a failure stays in the topic.
-		if e.Mail != nil && res.errClass == "" {
+		if e.Mail != nil && status == "done" {
 			if err := e.Mail.Reply(context.WithoutCancel(ctx), u.ID, in.ConversationID, res.text, e.outFiles(u.ID, final.Attachments), started); err != nil {
 				slog.WarnContext(ctx, "mail reply", "conversation", in.ConversationID, "err", err)
 			}
@@ -595,11 +704,14 @@ func (e *Engine) HandleInbound(ctx context.Context, key, value []byte) error {
 	case domain.Messenger(in.Channel):
 		// R14: what the agent wrote before its tools went already; the rest follows
 		out := seg.rest()
-		if res.errClass != "" {
+		switch status {
+		case "stopped": // FTR.NAB.CHAT-0004 tech §3
+			out = strings.TrimSpace(out + "\n\n" + channels.T(u.Language, "answer.stopped"))
+		case "failed":
 			out = errorText(u.Language, res.errClass)
 		}
 		e.deliver(ctx, u.ID, in.Channel, out)
-		if res.errClass == "" {
+		if status != "failed" {
 			e.deliverFiles(ctx, u.ID, in.Channel, final.Attachments) // FTR.NAB.CHAT-0001 R33: the files go after the text
 		}
 	}
@@ -698,6 +810,22 @@ type turnResult struct {
 	// podLost: the pod of the owner went away before the answer began; the
 	// caller may put the turn back into the queue.
 	podLost bool
+	// stopped: the user stopped the answer (FTR.NAB.CHAT-0004 R8).
+	stopped bool
+}
+
+// turnLabel is the result label of nabu_turns_total by the status of the answer.
+var turnLabel = map[string]string{"done": "ok", "failed": "failed", "stopped": "stopped"}
+
+// status is the status of the answer: done, failed, or stopped by the user.
+func (r turnResult) status() string {
+	switch {
+	case r.stopped:
+		return "stopped"
+	case r.errClass != "":
+		return "failed"
+	}
+	return "done"
 }
 
 // podLost reports a failure of the pod itself, not of the turn: the operator
@@ -777,6 +905,8 @@ func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked
 		col.onEvent = seg.event
 	}
 	op := lease.Operator()
+	stop := e.watchStop(ctx, op, msgID)
+	defer stop.end()
 	images, text = imagesFor(b.model, images, text, e.Space.Enabled)
 	name := b.model.ModelID
 	if d := modelDef(b.model); d != nil && d.Name != "" {
@@ -824,7 +954,11 @@ func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked
 		}
 		// FTR.NAB.CHAT-0002 R3: the notices since the last answer come first
 		prompt = e.turnNotices(ctx, conv, msgID, u.Timezone) + prompt
-		err = op.Prompt(ctx, sess.OpSession, agent.PromptRequest{Text: prompt, Images: images}, col.handle)
+		if stop.stopped.Load() {
+			break // stopped before the answer began
+		}
+		stop.session(sess.OpSession)
+		err = op.Prompt(stop.ctx, sess.OpSession, agent.PromptRequest{Text: prompt, Images: images, Deadline: deadline(ctx)}, col.handle)
 		if errors.Is(err, agent.ErrSessionGone) || errors.Is(err, agent.ErrStreamBroken) {
 			_, _ = e.Pool.Exec(ctx, `UPDATE harness_sessions SET closed_at = now() WHERE id = $1`, sess.ID)
 			if col.text.Len() == 0 && len(col.steps) == 0 {
@@ -843,7 +977,8 @@ func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked
 		}
 		e.recordContext(ctx, u.ID, conv, sess.ID, col.contextTokens, col.contextWindow)
 	}
-	if err == nil && sess != nil {
+	// FTR.NAB.CHAT-0004 tech §3: a stopped turn keeps its part too, also one cancelled after the grace
+	if (err == nil || stop.stopped.Load()) && sess != nil {
 		e.saveSnapshot(context.WithoutCancel(ctx), op, conv, sess.OpSession)
 	}
 	e.Models.RecordResult(ctx, b.model.ConnectionID, func() agent.ErrorClass {
@@ -852,7 +987,10 @@ func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked
 		}
 		return ""
 	}())
-	res := turnResult{text: col.text.String(), steps: col.steps}
+	res := turnResult{text: col.text.String(), steps: col.steps, stopped: stop.stopped.Load()}
+	if res.stopped {
+		return res
+	}
 	res.podLost = col.failure == nil && col.text.Len() == 0 && len(col.steps) == 0 && e.podLost(lease, err)
 	switch {
 	case col.failure != nil:
@@ -861,6 +999,58 @@ func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked
 		res.errClass, res.errText = operatorClass(err), operatorText(err)
 	}
 	return res
+}
+
+// stopWatch follows the stop of an answer by the user (FTR.NAB.CHAT-0004
+// R8, tech §3): every 2 s it reads the mark of the answer and aborts the
+// session of the turn; a prompt the operator does not end within 5 s after
+// the abort is cancelled.
+type stopWatch struct {
+	ctx     context.Context
+	stopped atomic.Bool
+	sess    atomic.Pointer[string]
+	end     context.CancelFunc
+}
+
+const (
+	stopPoll  = 2 * time.Second
+	stopGrace = 5 * time.Second
+)
+
+func (w *stopWatch) session(id string) { w.sess.Store(&id) }
+
+func (e *Engine) watchStop(ctx context.Context, op Operator, answer uuid.UUID) *stopWatch {
+	w := &stopWatch{}
+	var cancel context.CancelFunc
+	w.ctx, cancel = context.WithCancel(ctx)
+	done := make(chan struct{})
+	w.end = func() { cancel(); <-done }
+	go func() {
+		defer close(done)
+		t := time.NewTicker(stopPoll)
+		defer t.Stop()
+		for {
+			select {
+			case <-w.ctx.Done():
+				return
+			case <-t.C:
+			}
+			if !e.Chat.StopRequested(w.ctx, answer) {
+				continue
+			}
+			w.stopped.Store(true)
+			if s := w.sess.Load(); s != nil {
+				_ = op.Abort(context.WithoutCancel(ctx), *s)
+			}
+			select {
+			case <-w.ctx.Done():
+			case <-time.After(stopGrace):
+				cancel()
+			}
+			return
+		}
+	}()
+	return w
 }
 
 func operatorClass(err error) string {
@@ -1122,6 +1312,13 @@ func (e *Engine) history(ctx context.Context, conv uuid.UUID, tz string) []agent
 	hist, _ := e.Chat.History(ctx, conv, 30)
 	var out []agent.HistoryMessage
 	for _, m := range hist {
+		if m.Queued { // FTR.NAB.CHAT-0004 R3: a message of the queue is not said yet
+			continue
+		}
+		if m.Status == "stopped" && strings.TrimSpace(m.Text) != "" { // FTR.NAB.CHAT-0004 R10: the part written before the stop
+			out = append(out, agent.HistoryMessage{Role: m.Role, Text: m.Text + "\n[The user stopped this answer.]"})
+			continue
+		}
 		if m.Status != "done" || strings.TrimSpace(m.Text) == "" {
 			continue
 		}

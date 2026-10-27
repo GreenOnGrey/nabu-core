@@ -154,8 +154,17 @@ type Config struct {
 	// of GigaChat's certificates (R13) and the schedule of the refresh of the
 	// models of connections (R10).
 	TranscribeMaxSeconds int
-	GigaChatCAFile       string
-	ModelsRefreshCron    string
+	// ChatQueueMax bounds the messages waiting in a conversation (FTR.NAB.CHAT-0004 R4).
+	ChatQueueMax int
+	// FTR.NAB.CMN-0009 R6, R10: the subagents of agents and their limits.
+	SubagentsEnabled    bool
+	SubagentMaxParallel int
+	SubagentMaxPerTurn  int
+	SubagentTimeout     time.Duration
+	SubagentResultChars int
+	SubagentSlotWait    time.Duration
+	GigaChatCAFile      string
+	ModelsRefreshCron   string
 
 	// BootstrapLLM: an OpenAI-compatible connection created on the first
 	// start when there is none (the stand gets its DeepSeek key this way).
@@ -365,7 +374,10 @@ func Load() (*Config, error) {
 
 		RunWorkspaceWait: p.dur("RUN_WORKSPACE_WAIT", "120s"), UploadMaxBytes: p.bytes("UPLOAD_MAX_BYTES", "50MB"),
 		WhisperURL: os.Getenv("WHISPER_URL"), PiVersion: env("PI_VERSION", "dev"),
-		TranscribeMaxSeconds: p.int("TRANSCRIBE_MAX_SECONDS", 300), GigaChatCAFile: os.Getenv("GIGACHAT_CA_FILE"),
+		TranscribeMaxSeconds: p.int("TRANSCRIBE_MAX_SECONDS", 300), ChatQueueMax: p.int("CHAT_QUEUE_MAX", 10),
+		SubagentsEnabled: p.bool("SUBAGENTS_ENABLED", true), SubagentMaxParallel: p.int("SUBAGENT_MAX_PARALLEL", 4),
+		SubagentMaxPerTurn: p.int("SUBAGENT_MAX_PER_TURN", 8), SubagentTimeout: p.dur("SUBAGENT_TIMEOUT", "15m"),
+		SubagentResultChars: p.int("SUBAGENT_RESULT_CHARS", 16000), SubagentSlotWait: p.dur("SUBAGENT_SLOT_WAIT", "1m"), GigaChatCAFile: os.Getenv("GIGACHAT_CA_FILE"),
 		ModelsRefreshCron: env("MODELS_REFRESH_CRON", "17 4 * * *"),
 
 		BootstrapLLMKey: os.Getenv("BOOTSTRAP_LLM_API_KEY"), BootstrapLLMURL: env("BOOTSTRAP_LLM_BASE_URL", "https://api.deepseek.com"),
