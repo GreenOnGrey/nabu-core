@@ -12,3 +12,25 @@ vulnerabilities:
       undici in Pi talks only to the models and the MCP servers of the catalog;
       a failed stream ends one turn of the agent, not the api of Nabu.
     expired_at: 2026-11-25
+  # undici 8.10.2: three more findings fixed in 8.12.2, pinned by Pi 1.4.0 like
+  # CVE-2026-109869 above; by the expiry — a Pi with the fixed undici.
+  - id: CVE-2026-109383
+    paths: ["usr/local/lib/node_modules/@earendil-works/**"]
+    statement: >-
+      Certificate validation bypass when an Agent drops its TLS options: Pi
+      gives undici no TLS options of its own (core/http-dispatcher.js passes
+      only autoSelectFamilyAttemptTimeout to connect), so its connections to
+      the models and the MCP servers of the catalog keep the default verification of Node.
+    expired_at: 2026-11-25
+  - id: CVE-2026-109829
+    paths: ["usr/local/lib/node_modules/@earendil-works/**"]
+    statement: >-
+      Cache poisoning through cross-origin redirects needs the cache
+      interceptor of undici; Pi does not use it.
+    expired_at: 2026-11-25
+  - id: CVE-2026-87018
+    paths: ["usr/local/lib/node_modules/@earendil-works/**"]
+    statement: >-
+      Denial of service through TLS renegotiation needs a hostile server among
+      the models and the MCP servers of the catalog; it ends one run of the agent, not the api of Nabu.
+    expired_at: 2026-11-25
