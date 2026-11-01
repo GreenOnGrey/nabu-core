@@ -105,10 +105,11 @@ COPY --from=node:24-trixie-slim /usr/local/lib/node_modules/npm /usr/local/lib/n
 COPY --from=uv /uv /usr/local/bin/uv
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
  && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
- && npm install -g --no-audit --no-fund pnpm@10.18.0 typescript@5.9.3 eslint@9.37.0 prettier@3.6.2 \
+ && npm install -g --no-audit --no-fund npm@11.21.1 \
+ && npm install -g --no-audit --no-fund pnpm@10.34.7 typescript@5.9.3 eslint@9.39.5 prettier@3.9.10 \
  && npm cache clean --force && rm -rf /root/.npm \
- && GOBIN=/usr/local/bin GOPATH=/tmp/gopath GOCACHE=/tmp/gocache /usr/local/go/bin/go install golang.org/x/tools/gopls@v0.20.0 \
- && GOBIN=/usr/local/bin GOPATH=/tmp/gopath GOCACHE=/tmp/gocache /usr/local/go/bin/go install mvdan.cc/gofumpt@v0.9.1 \
+ && GOBIN=/usr/local/bin GOPATH=/tmp/gopath GOCACHE=/tmp/gocache /usr/local/go/bin/go install golang.org/x/tools/gopls@v0.24.0 \
+ && GOBIN=/usr/local/bin GOPATH=/tmp/gopath GOCACHE=/tmp/gocache /usr/local/go/bin/go install mvdan.cc/gofumpt@v0.12.0 \
  && GOBIN=/usr/local/bin GOPATH=/tmp/gopath GOCACHE=/tmp/gocache /usr/local/go/bin/go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 \
  && rm -rf /tmp/gopath /tmp/gocache
 COPY sandbox/code /tmp/sandbox

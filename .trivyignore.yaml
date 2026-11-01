@@ -34,3 +34,25 @@ vulnerabilities:
       Denial of service through TLS renegotiation needs a hostile server among
       the models and the MCP servers of the catalog; it ends one run of the agent, not the api of Nabu.
     expired_at: 2026-11-25
+  # undici 6.29.0 → 6.29.1 inside npm of the profile code (FTR.HMR.CMN-0007
+  # R25): node-gyp of npm 11.21.1 and 12.2.1, the latest npm, bundles 6.29.0;
+  # by the expiry — an npm with the fixed undici.
+  - id: CVE-2026-109383
+    paths: ["usr/local/lib/node_modules/npm/**"]
+    statement: >-
+      node-gyp of npm downloads Node headers for native addons through the
+      egress gateway of the sandbox and passes no TLS options of its own, so
+      the default verification of Node applies; nothing of Nabu runs npm.
+    expired_at: 2026-11-30
+  - id: CVE-2026-109869
+    paths: ["usr/local/lib/node_modules/npm/**"]
+    statement: >-
+      A failed stream ends one npm command of the agent in its own sandbox,
+      not a service of Nabu.
+    expired_at: 2026-11-30
+  - id: CVE-2026-87018
+    paths: ["usr/local/lib/node_modules/npm/**"]
+    statement: >-
+      TLS renegotiation needs a hostile server among the addresses of the
+      proxies of the sandbox; it ends one npm command of the agent.
+    expired_at: 2026-11-30
