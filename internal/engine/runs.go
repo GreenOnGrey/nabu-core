@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"time"
 
@@ -322,38 +323,35 @@ func (e *Engine) serviceTurn(ctx context.Context, runID uuid.UUID, ag *services.
 	}
 	req.Skills = e.sessionSkills(ctx, cat)
 	switch ag.Workspace {
-	case services.WorkspaceExternal:
-		wsID := services.WorkspaceID(runID)
-		// RLY-07: the external workspace must connect within RUN_WORKSPACE_WAIT.
-		deadline := time.Now().Add(e.Cfg.RunWorkspaceWait)
-		for !e.Connected(ctx, wsID) {
-			if time.Now().After(deadline) {
-				return "", "workspace_not_connected", "the workspace did not connect to the relay in time", total, false
-			}
-			select {
-			case <-ctx.Done():
-				return "", string(agent.ErrUnavailable), "cancelled", total, false
-			case <-time.After(time.Second):
-			}
-		}
-		call := e.Signer.Issue(jwt.Claims{Audience: jwt.AudCall, Workspace: wsID}, tokenTTL)
-		secrets = append(secrets, call)
-		req.Workspace = &agent.Workspace{ID: wsID, URL: e.Cfg.RelayInternalURL + "/internal/v1/workspaces/" + wsID, Token: call,
-			Note: "The working directory is the workspace of " + clientName + " for this run (for example a repository checkout). Paths are relative to its root."}
 	case services.WorkspaceNabu:
 		if e.Sandboxes == nil || e.Sandboxes.K8s == nil {
 			return "", "workspace_not_connected", "temporary sandboxes are not enabled in this deployment", total, false
 		}
 		wsID := services.WorkspaceID(runID)
-		if err := e.Sandboxes.StartEphemeral(ctx, wsID, runID.String(), ag.WorkspaceProfile); err != nil {
+		// FTR.HMR.CMN-0007 R5, R17: the working copy of the caller and the
+		// proxies of the agent.
+		files := e.runHasFiles(ctx, runID)
+		rs, err := e.Sandboxes.StartEphemeral(ctx, wsID, runID.String(), ag.WorkspaceProfile,
+			space.Ephemeral{Files: files, Proxies: ag.Proxies, TokenTTL: time.Duration(ag.Limits.TimeoutSec)*time.Second + 10*time.Minute})
+		if err != nil {
 			return "", "workspace_not_connected", err.Error(), total, false
 		}
 		defer e.Sandboxes.StopEphemeral(context.WithoutCancel(ctx), wsID)
+		if files {
+			// Runs before StopEphemeral: the changes are taken from the live sandbox.
+			defer e.collectChanges(context.WithoutCancel(ctx), runID, wsID)
+		}
 		call := e.Signer.Issue(jwt.Claims{Audience: jwt.AudCall, Workspace: wsID}, tokenTTL)
 		secrets = append(secrets, call)
+		note := "The working directory is a temporary sandbox of this run; its files are deleted after the run. " +
+			"It has a fixed set of tools: see /nabu/sandbox-profile.json; system packages cannot be installed."
+		if files {
+			note = "The working directory is a copy of the repository of " + clientName + " for this run. " +
+				"Change the files in place: " + clientName + " takes the changes after the run and commits them; do not create branches or commits. " +
+				"Tools: see /nabu/sandbox-profile.json; system packages cannot be installed."
+		}
 		req.Workspace = &agent.Workspace{ID: wsID, URL: e.Cfg.RelayInternalURL + "/internal/v1/workspaces/" + wsID, Token: call,
-			Note: "The working directory is a temporary sandbox of this run; its files are deleted after the run. " +
-				"It has a fixed set of tools: see /nabu/sandbox-profile.json; packages cannot be installed.", Root: space.SandboxRoot}
+			Note: note + " " + space.ProxyNote(rs), Root: space.SandboxRoot}
 	}
 	resp, err := e.open(ctx, e.Op, req)
 	if err != nil {
@@ -456,4 +454,50 @@ func (e *Engine) dropFiles(ctx context.Context, uid uuid.UUID, files []chat.Atta
 			_ = e.S3.Delete(ctx, key)
 		}
 	}
+}
+
+// runHasFiles reports a working copy of the run (FTR.HMR.CMN-0007 tech §2.2).
+func (e *Engine) runHasFiles(ctx context.Context, runID uuid.UUID) bool {
+	var key *string
+	_ = e.Pool.QueryRow(ctx, `SELECT files_key FROM runs WHERE id = $1`, runID).Scan(&key)
+	return key != nil
+}
+
+// collectChanges asks the sandbox of the run for the changes of its working
+// copy (tech §2.6); a failure is an event of the run, not its error.
+func (e *Engine) collectChanges(ctx context.Context, runID uuid.UUID, wsID string) {
+	ctx, cancel := context.WithTimeout(ctx, e.Cfg.RunChangesTimeout)
+	defer cancel()
+	fail := func(err error) {
+		slog.WarnContext(ctx, "changes of a run", "run", runID, "err", err)
+		e.Services.AppendEvent(ctx, runID, "changes_failed", map[string]string{"message": err.Error()})
+	}
+	if !e.Connected(ctx, wsID) {
+		fail(errors.New("the sandbox is not connected"))
+		return
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.Cfg.RelayInternalURL+"/internal/v1/workspaces/"+wsID+"/v1/workspace/changes",
+		strings.NewReader("{}"))
+	if err != nil {
+		fail(err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+e.Signer.Issue(jwt.Claims{Audience: jwt.AudCall, Workspace: wsID}, e.Cfg.RunChangesTimeout))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fail(err)
+		return
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Files   int    `json:"files"`
+		Message string `json:"message"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if resp.StatusCode >= 300 {
+		fail(fmt.Errorf("%s: %s", resp.Status, out.Message))
+		return
+	}
+	e.Services.SetChangesCount(ctx, runID, out.Files)
 }

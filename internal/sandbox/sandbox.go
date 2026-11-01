@@ -48,6 +48,9 @@ type Config struct {
 	// temporary sandbox; with them the sandbox reports missing packages.
 	Profile  string
 	RunToken string
+	// FTR.HMR.CMN-0007 tech §2.5: the run and whether it has a working copy.
+	RunID string
+	Files bool
 }
 
 type entry struct {
@@ -459,6 +462,14 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	ws := &workspace.Workspace{Root: cfg.Root, Token: cfg.WorkspaceToken, Env: workspace.SandboxEnv(cfg.Root),
 		OnMissing: s.reportMissing}
+	if cfg.Ephemeral && cfg.Files {
+		m, err := s.fetchFiles(ctx)
+		if err != nil {
+			slog.Error("working copy", "err", err)
+			os.Exit(3) // the engine ends the run with workspace_not_connected
+		}
+		ws.Changes = func(ctx context.Context) (any, error) { return s.uploadChanges(ctx, m) }
+	}
 	if !cfg.Ephemeral {
 		ws.Heartbeat = s.heartbeat
 	}

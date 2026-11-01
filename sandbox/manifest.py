@@ -33,9 +33,23 @@ TOOLS = [
     ("pdf", "pdftotext", ["pdftotext", "-v"], "documents"),
     ("pdf", "pdftoppm", ["pdftoppm", "-v"], "documents"),
     ("pdf", "qpdf", ["qpdf", "--version"], "documents"),
+    # FTR.HMR.CMN-0007 R25
+    ("go", "go", ["go", "version"], "code"),
+    ("go", "gopls", ["gopls", "version"], "code"),
+    ("go", "gofumpt", ["gofumpt", "--version"], "code"),
+    ("go", "golangci-lint", ["golangci-lint", "version", "--short"], "code"),
+    ("javascript", "npm", ["npm", "--version"], "code"),
+    ("javascript", "pnpm", ["pnpm", "--version"], "code"),
+    ("javascript", "tsc", ["tsc", "--version"], "code"),
+    ("javascript", "eslint", ["eslint", "--version"], "code"),
+    ("javascript", "prettier", ["prettier", "--version"], "code"),
+    ("python-tools", "uv", ["uv", "--version"], "code"),
+    ("python-tools", "ruff", ["ruff", "--version"], "code"),
+    ("python-tools", "pytest", ["pytest", "--version"], "code"),
+    ("python-tools", "mypy", ["mypy", "--version"], "code"),
 ]
 
-PROFILES = {"base": {"base"}, "documents": {"base", "documents"}}
+PROFILES = {"base": {"base"}, "documents": {"base", "documents"}, "code": {"base", "code"}}
 
 
 def version_of(cmd):

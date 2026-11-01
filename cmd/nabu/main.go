@@ -35,6 +35,7 @@ modes:
   worker    agent turns, scheduled tasks, service agent runs, sandboxes, delivery to messengers
   agent     the agent operator: Pi sessions behind the internal API (:8090)
   relay     channels of workspaces and the agent's tool calls (:8085)
+  egress    the gateway sandboxes go outside through (:3128)
   sandbox   a personal space of one user (started by the worker)
   sandbox-init   puts this binary and the profile into /nabu (the init container of a sandbox)
   sandbox-probe  checks a custom sandbox image and reports its contents (a probe pod)
@@ -70,7 +71,7 @@ func main() {
 	case "sandbox-probe":
 		exit(sandbox.Probe(ctx, strings.TrimRight(os.Getenv("NABU_API_INTERNAL_URL"), "/"), os.Getenv("NABU_PROBE_TOKEN")))
 		return
-	case "api", "worker", "relay", "cleaner", "migrate":
+	case "api", "worker", "relay", "egress", "cleaner", "migrate":
 	default:
 		fmt.Fprintln(os.Stderr, usage)
 		os.Exit(2)
@@ -98,6 +99,8 @@ func main() {
 		err = app.RunWorker(ctx, cfg)
 	case "relay":
 		err = app.RunRelay(ctx, cfg)
+	case "egress":
+		err = app.RunEgress(ctx, cfg)
 	case "cleaner":
 		err = app.RunCleaner(ctx, cfg)
 	case "migrate":
@@ -182,7 +185,8 @@ func runSandbox(ctx context.Context) error {
 		RelayURL: os.Getenv("NABU_RELAY_URL"), APIURL: strings.TrimRight(os.Getenv("NABU_API_INTERNAL_URL"), "/"),
 		Exclude: strings.Split(os.Getenv("NABU_SANDBOX_EXCLUDE"), ","), Ephemeral: os.Getenv("NABU_SANDBOX_EPHEMERAL") == "1",
 		WorkspaceID: os.Getenv("NABU_SANDBOX_WORKSPACE"), Profile: os.Getenv("NABU_SANDBOX_PROFILE"),
-		RunToken: os.Getenv("NABU_SANDBOX_RUN_TOKEN")}
+		RunToken: os.Getenv("NABU_SANDBOX_RUN_TOKEN"), RunID: os.Getenv("NABU_SANDBOX_RUN"),
+		Files: os.Getenv("NABU_SANDBOX_FILES") == "1"}
 	sandbox.PrepareProfile()
 	if cfg.WorkspaceToken == "" || cfg.RelayURL == "" || (!cfg.Ephemeral && (cfg.UserID == "" || cfg.SandboxToken == "" || cfg.APIURL == "")) {
 		return fmt.Errorf("sandbox: NABU_SANDBOX_USER, NABU_SANDBOX_TOKEN, NABU_WORKSPACE_TOKEN, NABU_RELAY_URL and NABU_API_INTERNAL_URL are required")

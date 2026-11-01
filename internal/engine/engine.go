@@ -53,9 +53,11 @@ type Config struct {
 	RelayInternalURL string // the agent's calls to workspaces
 	TurnTimeout      time.Duration
 	TaskRunTimeout   time.Duration
-	RunWorkspaceWait time.Duration
-	SessionMaxAge    time.Duration // reopen sessions older than this (tokens)
-	PiVersion        string
+	// RunChangesTimeout bounds the collection of the changes of a working
+	// copy (FTR.HMR.CMN-0007 tech §2.6).
+	RunChangesTimeout time.Duration
+	SessionMaxAge     time.Duration // reopen sessions older than this (tokens)
+	PiVersion         string
 	// Subagents are the limits of the subagents of the sessions of agents
 	// (FTR.NAB.CMN-0009 R6, R10); nil — SUBAGENTS_ENABLED=false.
 	Subagents *agent.SubagentLimits
@@ -182,7 +184,7 @@ func (e *Engine) personalRequest(ctx context.Context, u *users.User, conv uuid.U
 		call := e.Signer.Issue(jwt.Claims{Audience: jwt.AudCall, Workspace: wsID}, tokenTTL)
 		secrets = append(secrets, call)
 		req.Workspace = &agent.Workspace{ID: wsID, URL: e.Cfg.RelayInternalURL + "/internal/v1/workspaces/" + wsID, Token: call,
-			Note: "The working directory is the user's personal space in Nabu: files persist between conversations and the user sees them in the Space section. Paths are relative to its root.", Root: space.SandboxRoot}
+			Note: "The working directory is the user's personal space in Nabu: files persist between conversations and the user sees them in the Space section. Paths are relative to its root." + e.Sandboxes.ProxyNote(ctx, u.ID), Root: space.SandboxRoot}
 	}
 	req.Subagents = e.Cfg.Subagents // FTR.NAB.CMN-0009 tech §2.1
 	p := Persona{User: u, Agent: ag, Memory: mem, Spaces: e.Space.Enabled, Now: time.Now(), Catalog: titles, Documents: cat.Documents}

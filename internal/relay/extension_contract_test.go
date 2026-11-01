@@ -41,8 +41,8 @@ func TestExtensionThroughRelay(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	client := &Client{URL: "ws" + strings.TrimPrefix(hs.URL, "http") + "/v1/workspaces/connect",
-		Token:       signer.Issue(jwt.Claims{Audience: jwt.AudWorkspace, Workspace: "run-k", Kind: "external"}, time.Hour),
-		WorkspaceID: "run-k", Kind: "external", Handler: ws.Handler(), HandlerToken: "local"}
+		Token:       signer.Issue(jwt.Claims{Audience: jwt.AudWorkspace, Workspace: "run-k", Kind: "sandbox"}, time.Hour),
+		WorkspaceID: "run-k", Kind: "sandbox", Handler: ws.Handler(), HandlerToken: "local"}
 	go func() { _ = client.Run(ctx) }()
 
 	steps := []fakellm.ToolCall{
@@ -170,8 +170,8 @@ func TestExtensionLoadsDeferredTool(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	client := &Client{URL: "ws" + strings.TrimPrefix(hs.URL, "http") + "/v1/workspaces/connect",
-		Token:       signer.Issue(jwt.Claims{Audience: jwt.AudWorkspace, Workspace: "run-d", Kind: "external"}, time.Hour),
-		WorkspaceID: "run-d", Kind: "external", Handler: ws.Handler(), HandlerToken: "local"}
+		Token:       signer.Issue(jwt.Claims{Audience: jwt.AudWorkspace, Workspace: "run-d", Kind: "sandbox"}, time.Hour),
+		WorkspaceID: "run-d", Kind: "sandbox", Handler: ws.Handler(), HandlerToken: "local"}
 	go func() { _ = client.Run(ctx) }()
 
 	calls := []fakellm.ToolCall{

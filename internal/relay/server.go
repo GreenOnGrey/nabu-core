@@ -144,9 +144,12 @@ func (s *Server) connect(w http.ResponseWriter, r *http.Request) {
 		_ = ws.Close(websocket.StatusPolicyViolation, "hello does not match the token")
 		return
 	}
+	// Workspaces are sandboxes of Nabu only: the workspace of a caller is
+	// gone (FTR.HMR.CMN-0007 R12).
 	kind := claims.Kind
-	if kind == "" {
-		kind = hello.Kind
+	if kind != "sandbox" {
+		_ = ws.Close(websocket.StatusPolicyViolation, "only sandboxes connect")
+		return
 	}
 	c := &conn{id: claims.Workspace, kind: kind, ws: ws, out: make(chan Frame, 64), done: make(chan struct{}), pending: map[string]chan Frame{}}
 	s.mu.Lock()

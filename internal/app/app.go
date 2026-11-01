@@ -42,6 +42,7 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/config"
 	"github.com/GreenOnGrey/nabu-core/internal/confirm"
 	"github.com/GreenOnGrey/nabu-core/internal/domain"
+	"github.com/GreenOnGrey/nabu-core/internal/egress"
 	"github.com/GreenOnGrey/nabu-core/internal/engine"
 	"github.com/GreenOnGrey/nabu-core/internal/groups"
 	"github.com/GreenOnGrey/nabu-core/internal/importer"
@@ -64,6 +65,7 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/platform/storage"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/whisper"
 	"github.com/GreenOnGrey/nabu-core/internal/preview"
+	"github.com/GreenOnGrey/nabu-core/internal/proxies"
 	"github.com/GreenOnGrey/nabu-core/internal/relay"
 	"github.com/GreenOnGrey/nabu-core/internal/sandboxprofile"
 	"github.com/GreenOnGrey/nabu-core/internal/services"
@@ -94,6 +96,8 @@ type core struct {
 	pkgs     *pkgsignals.Service
 	chat     *chat.Store
 	services *services.Service
+	// FTR.HMR.CMN-0007: proxies of sandboxes.
+	proxies  *proxies.Service
 	ledger   *ledger.Ledger
 	clients  *clients.Service
 	producer *kafka.Producer
@@ -198,10 +202,21 @@ func newCore(ctx context.Context, cfg *config.Config) (*core, error) {
 	c.catalog.Results = c.snapshots // FTR.NAB.CHAT-0003 R10
 	c.chat = &chat.Store{Pool: pool}
 	c.services = &services.Service{Pool: pool, Models: c.models, Signer: signer, Bus: producer, Events: pub,
-		RelayPublicURL: cfg.RelayPublicWSURL, PublicAPIURL: cfg.PublicAPIURL, WorkspaceTTL: 12 * time.Hour,
-		Harnesses: []services.Harness{{Name: "pi", Version: cfg.PiVersion, Status: "ok"}}, ProfileReady: c.profiles.Ready}
+		PublicAPIURL: cfg.PublicAPIURL,
+		Harnesses:    []services.Harness{{Name: "pi", Version: cfg.PiVersion, Status: "ok"}}, ProfileReady: c.profiles.Ready}
 	c.ledger = &ledger.Ledger{Pool: pool}
 	c.clients = &clients.Service{Pool: pool, Signer: signer}
+	// FTR.HMR.CMN-0007: proxies, working copies of runs.
+	adminAudit := func(ctx context.Context, actor, tool string, args any) {
+		b, _ := json.Marshal(args)
+		c.ledger.Audit(ctx, ledger.Entry{AgentKind: "personal", Agent: "nabu", UserID: proxies.ActorUUID(actor), Channel: "admin", Tool: tool, Result: "ok"}, string(b), nil)
+	}
+	c.proxies = &proxies.Service{Pool: pool, Box: box, Audit: adminAudit}
+	c.services.ProxiesExist = c.proxies.Exists
+	c.services.Files = &services.Files{Store: s3, Cfg: services.FilesConfig{MaxFiles: cfg.RunFilesMaxFiles, MaxBytes: cfg.RunFilesMaxBytes,
+		UploadTTL: cfg.RunFilesUploadTTL, Keep: cfg.RunFilesKeep}}
+	c.profiles.ProxiesExist = c.proxies.Exists
+	c.profiles.Audit = adminAudit
 
 	pepper := cfg.KeyPepper
 	if len(pepper) == 0 {
@@ -466,43 +481,31 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 	if err := c.catalog.StarterCatalog(ctx); err != nil {
 		slog.Error("starter catalog", "err", err)
 	}
+	// FTR.HMR.CMN-0007: the built-in proxy, its checks and the files of runs.
+	if err := c.proxies.EnsureBuiltin(ctx); err != nil {
+		slog.Error("built-in proxies", "err", err)
+	}
+	go every(ctx, time.Minute, func() { c.proxies.CheckAll(ctx, c.proxyChecker()) })
+	go every(ctx, 10*time.Minute, func() { c.services.SweepFiles(ctx) })
 	// FTR.NAB.CHAT-0003 tech §6: previews of office files
 	previews := &preview.Service{Pool: c.pool, S3: c.s3, Cfg: preview.Config{ConvertURL: cfg.PreviewConvertURL, ConvertUser: cfg.PreviewConvertUser,
 		ConvertPassword: cfg.PreviewConvertPassword, LegacyURL: cfg.PreviewLegacyURL, DocgenURL: cfg.PreviewDocgenURL, DocgenKey: cfg.PreviewDocgenKey,
 		MaxBytes: cfg.PreviewMaxBytes, Parallel: cfg.PreviewParallel}}
-	go func() {
-		t := time.NewTicker(time.Hour)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				if n, err := previews.Sweep(ctx); err != nil {
-					slog.Warn("sweep previews", "err", err)
-				} else if n > 0 {
-					slog.Info("cleaned", "what", "previews", "objects", n)
-				}
-			}
+	go every(ctx, time.Hour, func() {
+		if n, err := previews.Sweep(ctx); err != nil {
+			slog.Warn("sweep previews", "err", err)
+		} else if n > 0 {
+			slog.Info("cleaned", "what", "previews", "objects", n)
 		}
-	}()
+	})
 	// FTR.NAB.CMN-0006 tech §3.6: copies of files for MCP servers live an hour
-	go func() {
-		t := time.NewTicker(10 * time.Minute)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				if n, err := c.snapshots.Sweep(ctx); err != nil {
-					slog.Warn("sweep copies of space files", "err", err)
-				} else if n > 0 {
-					slog.Info("cleaned", "what", "copies of space files", "objects", n)
-				}
-			}
+	go every(ctx, 10*time.Minute, func() {
+		if n, err := c.snapshots.Sweep(ctx); err != nil {
+			slog.Warn("sweep copies of space files", "err", err)
+		} else if n > 0 {
+			slog.Info("cleaned", "what", "copies of space files", "objects", n)
 		}
-	}()
+	})
 
 	chatAPI := c.chatAPI
 	allowedModel := func(ctx context.Context, owner uuid.UUID, m groups.ModelChoice) bool {
@@ -626,6 +629,7 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 		c.catalog.AdminRoutes(r, cfg.SecretsKey)
 		c.services.AdminRoutes(r)
 		c.profiles.AdminRoutes(r)
+		c.proxies.AdminRoutes(r, c.proxyChecker)
 		c.pkgs.AdminRoutes(r)
 		c.clients.AdminRoutes(r)
 		c.ledger.AdminRoutes(r)
@@ -650,6 +654,7 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 	r.Route("/client/v1", func(r chi.Router) {
 		r.Use(auth.ClientAuth(c.signer, c.clients.Load))
 		c.services.ClientRoutes(r)
+		c.services.FilesRoutes(r)
 		imp.Route(r)
 		c.accounts.ClientRoutes(r)
 		r.Route("/me", func(r chi.Router) {
@@ -707,6 +712,7 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 	})
 	c.space.InternalRoutes(internal)
 	c.profiles.InternalRoutes(internal, c.signer)
+	c.services.InternalRoutes(internal, c.signer)
 	c.pkgs.InternalRoutes(internal)
 
 	api := &http.Server{Addr: cfg.HTTPAddr, Handler: otelhttp.NewHandler(r, "http"), ReadHeaderTimeout: 15 * time.Second}
@@ -733,7 +739,7 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 		sandboxes = &space.Sandboxes{Pool: c.pool, K8s: k8s.NewInCluster(), Space: c.space, Events: c.events, Cfg: space.SandboxConfig{
 			Namespace: cfg.SandboxNamespace, Image: cfg.SandboxImage, CPU: cfg.SandboxCPU, Memory: cfg.SandboxMemory, Quota: cfg.SpaceQuota,
 			IdleTimeout: cfg.SandboxIdleTimeout, RelayURL: cfg.RelaySandboxWSURL, APIURL: cfg.InternalURL, Exclude: cfg.SandboxExclude, TokenTTL: 7 * 24 * time.Hour,
-			InitImage: cfg.SandboxInitImage, PullSecrets: cfg.SandboxPullSecrets}, Profiles: c.profiles}
+			InitImage: cfg.SandboxInitImage, PullSecrets: cfg.SandboxPullSecrets, EgressURL: cfg.EgressURL}, Profiles: c.profiles, Proxies: c.proxies}
 	}
 	hub := events.NewHub()
 	go hub.Listen(ctx, c.pool)
@@ -744,7 +750,7 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 	c.mail.Pending = confirms.PendingSince
 	eng := &engine.Engine{
 		Cfg: engine.Config{InternalURL: cfg.InternalURL, RelayInternalURL: cfg.RelayInternalURL, TurnTimeout: cfg.TurnTimeout,
-			TaskRunTimeout: cfg.TaskRunTimeout, RunWorkspaceWait: cfg.RunWorkspaceWait, SessionMaxAge: 12 * time.Hour, PiVersion: cfg.PiVersion,
+			TaskRunTimeout: cfg.TaskRunTimeout, RunChangesTimeout: cfg.RunChangesTimeout, SessionMaxAge: 12 * time.Hour, PiVersion: cfg.PiVersion,
 			Subagents: subagentLimits(cfg)},
 		Pool: c.pool, Op: c.operator, Users: c.users, Chat: c.chat, Models: c.models, Catalog: c.catalog, Memory: c.memory, Tasks: c.tasks, Comm: c.comm,
 		Space: c.space, Sandboxes: sandboxes, Services: c.services, Ledger: c.ledger, Signer: c.signer, S3: c.s3, Events: c.events,
@@ -970,6 +976,23 @@ func RunRelay(ctx context.Context, cfg *config.Config) error {
 	return g.Wait()
 }
 
+// RunEgress serves the egress gateway of sandboxes (FTR.HMR.CMN-0007 tech
+// §3.5). It reads only the addresses of proxies; no HTTP server timeouts on
+// the listener: a tunnel lives as long as it has traffic.
+func RunEgress(ctx context.Context, cfg *config.Config) error {
+	pool, err := postgres.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	px := &proxies.Service{Pool: pool}
+	gw := &egress.Gateway{Signer: jwt.NewSigner(cfg.PublicAPIURL, cfg.SecretsKey), Allow: px.Allow}
+	g, gctx := errgroup.WithContext(ctx)
+	serve(gctx, g, &http.Server{Addr: cfg.EgressListen, Handler: gw, ReadHeaderTimeout: 15 * time.Second},
+		serviceServer(cfg.ServiceAddr, func(ctx context.Context) error { return pool.Ping(ctx) }))
+	return g.Wait()
+}
+
 // RunOperator serves the agent operator: the internal API and health.
 func RunOperator(ctx context.Context, op *operator.Operator, listenAddr, serviceAddr string, piCommand []string) error {
 	ready := func(context.Context) error {
@@ -1163,4 +1186,27 @@ func subagentLimits(cfg *config.Config) *agent.SubagentLimits {
 	}
 	return &agent.SubagentLimits{MaxParallel: cfg.SubagentMaxParallel, MaxPerTurn: cfg.SubagentMaxPerTurn,
 		Timeout: agent.Duration(cfg.SubagentTimeout), ResultChars: cfg.SubagentResultChars, SlotWait: agent.Duration(cfg.SubagentSlotWait)}
+}
+
+// proxyChecker checks proxies through the egress gateway; nil when the
+// gateway is off on the stand (FTR.HMR.CMN-0007 R16).
+func (c *core) proxyChecker() proxies.Checker {
+	if c.cfg.EgressURL == "" {
+		return nil
+	}
+	return egress.Check(c.cfg.EgressURL, c.signer)
+}
+
+// every runs fn every d until ctx ends.
+func every(ctx context.Context, d time.Duration, fn func()) {
+	t := time.NewTicker(d)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			fn()
+		}
+	}
 }

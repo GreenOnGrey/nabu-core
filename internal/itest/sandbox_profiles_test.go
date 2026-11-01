@@ -58,7 +58,7 @@ func TestSandboxProfiles(t *testing.T) {
 	if err := ps.Create(ctx, "admin", "tools", "registry.local/nabu/tools:2", ""); code(err) != "sandbox_profile_name_taken" {
 		t.Fatalf("name taken: %v", err)
 	}
-	if err := ps.Assign(ctx, "admin", map[string]string{"personal": "tools"}); code(err) != "sandbox_profile_not_ready" {
+	if err := ps.Assign(ctx, "admin", map[string]sandboxprofile.Assignment{"personal": {Profile: "tools"}}); code(err) != "sandbox_profile_not_ready" {
 		t.Fatalf("ASG-03: %v", err)
 	}
 	// The probe passed (the worker's finish).
@@ -66,7 +66,7 @@ func TestSandboxProfiles(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE sandbox_profiles SET state = 'ready', image_digest = 'sha256:abc', inventory = $1 WHERE name = 'tools'`, inv); err != nil {
 		t.Fatal(err)
 	}
-	if err := ps.Assign(ctx, "admin", map[string]string{"personal": "tools"}); err != nil {
+	if err := ps.Assign(ctx, "admin", map[string]sandboxprofile.Assignment{"personal": {Profile: "tools"}}); err != nil {
 		t.Fatal(err)
 	}
 	p, _ = ps.Resolve(ctx, sandboxprofile.Target{Kind: sandboxprofile.TargetPersonal, UserID: uid})

@@ -78,14 +78,18 @@ type Report struct {
 // personal agent and needs no service agent).
 var Scenarios = []string{"issue_analysis", "gate_generation", "conformance_check", "codegen", "review_update", "rollback_revert"}
 
-// codeScenarios work on a checkout in Hammurapi's runner (R26).
+// codeScenarios work on the working copy Hammurapi passes to the sandbox of
+// the run (FTR.HMR.CMN-0007 R14, R25): the profile code with the proxy of
+// package registries. Only Hammurapi before FTR.HMR.CMN-0007 sends the import,
+// so the list is part of that frozen protocol; the live list is in
+// hammurapi-core (agent.Scenario.HasCode, GET /admin/api/v1/nabu scenarioRows).
 var codeScenarios = map[string]bool{"codegen": true, "review_update": true, "rollback_revert": true}
 
 var descriptions = map[string]string{
 	"issue_analysis":    "Hammurapi: analysis of an issue (Discovery)",
 	"gate_generation":   "Hammurapi: generation of the tech and qa gates",
 	"conformance_check": "Hammurapi: check of code against the specification",
-	"codegen":           "Hammurapi: code generation in the runner",
+	"codegen":           "Hammurapi: code generation in the sandbox of Nabu",
 	"review_update":     "Hammurapi: answers to review comments",
 	"rollback_revert":   "Hammurapi: conflicts and reverts",
 }
@@ -228,14 +232,14 @@ func (im *Importer) Run(ctx context.Context, client string, b Body) (*Report, er
 				continue
 			}
 		}
-		ws := services.WorkspaceNone
+		ws, profile, proxies := services.WorkspaceNone, "", []string(nil)
 		if codeScenarios[sc] {
-			ws = services.WorkspaceExternal
+			ws, profile, proxies = services.WorkspaceNabu, im.codeProfile(ctx), im.codeProxies(ctx)
 		}
 		sort.Strings(skillsOf[sc])
 		cfg := services.Config{Name: AgentName(sc), Description: descriptions[sc], Harness: "pi", Model: ch,
 			Instructions: fmt.Sprintf("You are the service agent of Hammurapi for the %s scenario. The input describes the task; use the hammurapi MCP tools of the run to read the context and to submit the results.", sc),
-			Skills:       skillsOf[sc], MCP: mcpOf[sc], AcceptCallerMC: true, Workspace: ws,
+			Skills:       skillsOf[sc], MCP: mcpOf[sc], AcceptCallerMC: true, Workspace: ws, WorkspaceProfile: profile, Proxies: proxies,
 			Limits: services.Limits{TimeoutSec: 7200}, Clients: []string{client}}
 		_, err := im.Services.Get(ctx, cfg.Name)
 		create := err != nil
@@ -291,4 +295,23 @@ func (im *Importer) Route(r chi.Router) {
 		httpx.JSON(w, 200, rep)
 		return nil
 	}))
+}
+
+// codeProfile is the profile code when the stand has it ready, else the default.
+func (im *Importer) codeProfile(ctx context.Context) string {
+	if im.Services.ProfileReady == nil {
+		return ""
+	}
+	if ok, err := im.Services.ProfileReady(ctx, "code"); err == nil && ok {
+		return "code"
+	}
+	return ""
+}
+
+// codeProxies is the proxy of package registries when it exists.
+func (im *Importer) codeProxies(ctx context.Context) []string {
+	if im.Services.ProxiesExist == nil || im.Services.ProxiesExist(ctx, []string{"packages"}, "proxies") != nil {
+		return nil
+	}
+	return []string{"packages"}
 }

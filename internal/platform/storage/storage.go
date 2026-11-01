@@ -164,3 +164,28 @@ func ReadAll(ctx context.Context, s Storage, key string) ([]byte, error) {
 	defer rc.Close()
 	return io.ReadAll(rc)
 }
+
+// Copier copies an object inside the store; S3 implements it.
+type Copier interface {
+	CopyObject(ctx context.Context, src, dst string) error
+}
+
+// CopyObject implements Copier (a server-side copy).
+func (s *S3) CopyObject(ctx context.Context, src, dst string) error {
+	_, err := s.c.CopyObject(ctx, minio.CopyDestOptions{Bucket: s.bucket, Object: dst}, minio.CopySrcOptions{Bucket: s.bucket, Object: src})
+	return err
+}
+
+// Copy copies src to dst: on the server when the store can, else by
+// reading and writing the object.
+func Copy(ctx context.Context, s Storage, src, dst, contentType string) error {
+	if c, ok := s.(Copier); ok {
+		return c.CopyObject(ctx, src, dst)
+	}
+	rc, err := s.Get(ctx, src)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	return s.Put(ctx, dst, rc, -1, contentType)
+}

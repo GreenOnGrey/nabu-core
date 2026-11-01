@@ -40,6 +40,9 @@ type Workspace struct {
 	// a command runs (tech §5.4). Both run outside the request and may be nil.
 	OnMissing func([]Missing)
 	Heartbeat func()
+	// Changes collects and uploads the changes of the working copy of a run
+	// (FTR.HMR.CMN-0007 tech §2.5); nil — the operation is not served.
+	Changes func(ctx context.Context) (any, error)
 
 	run    sync.Mutex // one bash at a time; the others wait
 	mu     sync.Mutex
@@ -123,6 +126,17 @@ func (w *Workspace) Handler() http.Handler {
 		"/v1/grep":       w.grep,
 		"/v1/exec":       w.exec,
 		"/v1/abort":      w.abort,
+		"/v1/workspace/changes": func(rw http.ResponseWriter, r *http.Request) error {
+			if w.Changes == nil {
+				return fs.ErrNotExist
+			}
+			out, err := w.Changes(r.Context())
+			if err != nil {
+				return err
+			}
+			rw.Header().Set("Content-Type", "application/json")
+			return json.NewEncoder(rw).Encode(out)
+		},
 	} {
 		fn := fn
 		mux.HandleFunc("POST "+route, func(rw http.ResponseWriter, r *http.Request) {

@@ -156,6 +156,10 @@ type Target struct {
 type Service struct {
 	Pool *pgxpool.Pool
 	Cfg  Config
+	// ProxiesExist checks proxies of an assignment (FTR.HMR.CMN-0007); nil — any.
+	ProxiesExist func(ctx context.Context, names []string, field string) error
+	// Audit writes a change of the assignments; nil — none.
+	Audit func(ctx context.Context, actor, tool string, args any)
 }
 
 // KindOf tells personal from group spaces: a group agent's data belong to its

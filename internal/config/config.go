@@ -24,12 +24,20 @@ type Config struct {
 	ServiceAddr  string // health and metrics (:9100)
 	RelayAddr    string // relay mode (:8085)
 
-	PublicWebURL       string
-	PublicAPIURL       string
-	InternalURL        string // http://api-internal.<ns>.svc:8081 — agent sessions reach the built-in MCP here
-	RelayInternalURL   string // http://relay.<ns>.svc:8085 — the agent's calls to workspaces
-	RelayPublicWSURL   string // wss://nabu-api.<domain>/v1/workspaces/connect — external workspaces
-	RelaySandboxWSURL  string // ws://relay.<ns>.svc:8085/v1/workspaces/connect — sandboxes inside the cluster
+	PublicWebURL      string
+	PublicAPIURL      string
+	InternalURL       string // http://api-internal.<ns>.svc:8081 — agent sessions reach the built-in MCP here
+	RelayInternalURL  string // http://relay.<ns>.svc:8085 — the agent's calls to workspaces
+	RelaySandboxWSURL string // ws://relay.<ns>.svc:8085/v1/workspaces/connect — sandboxes inside the cluster
+
+	// FTR.HMR.CMN-0007 tech §10: working copies of runs and the egress gateway.
+	RunFilesMaxFiles   int
+	RunFilesMaxBytes   int64
+	RunFilesUploadTTL  time.Duration
+	RunFilesKeep       time.Duration
+	RunChangesTimeout  time.Duration
+	EgressURL          string // http://nabu-egress.<ns>.svc:3128 — sandboxes with proxies; "" — off
+	EgressListen       string // egress mode (:3128)
 	CORSAllowedOrigins []string
 	CookieDomain       string
 
@@ -146,10 +154,9 @@ type Config struct {
 	DefaultTimezone   string
 	DefaultLanguage   string
 
-	RunWorkspaceWait time.Duration
-	UploadMaxBytes   int64
-	WhisperURL       string
-	PiVersion        string
+	UploadMaxBytes int64
+	WhisperURL     string
+	PiVersion      string
 	// FTR.NAB.CHAT-0001: the longest voice recording (R20), the extra root
 	// of GigaChat's certificates (R13) and the schedule of the refresh of the
 	// models of connections (R10).
@@ -372,7 +379,10 @@ func Load() (*Config, error) {
 		TaskMaxFailures:    p.int("TASK_MAX_FAILURES", 3), TaskCatchupWindow: p.dur("TASK_CATCHUP_WINDOW", "1h"),
 		DefaultTimezone: env("DEFAULT_TIMEZONE", "Europe/Moscow"), DefaultLanguage: env("DEFAULT_LANGUAGE", "en"),
 
-		RunWorkspaceWait: p.dur("RUN_WORKSPACE_WAIT", "120s"), UploadMaxBytes: p.bytes("UPLOAD_MAX_BYTES", "50MB"),
+		RunFilesMaxFiles: p.int("RUN_FILES_MAX_FILES", 5000), RunFilesMaxBytes: p.bytes("RUN_FILES_MAX_BYTES", "200MB"),
+		RunFilesUploadTTL: p.dur("RUN_FILES_UPLOAD_TTL", "1h"), RunFilesKeep: p.dur("RUN_FILES_KEEP", "24h"),
+		RunChangesTimeout: p.dur("RUN_CHANGES_TIMEOUT", "2m"), EgressURL: strings.TrimRight(os.Getenv("EGRESS_URL"), "/"),
+		EgressListen: env("EGRESS_LISTEN", ":3128"), UploadMaxBytes: p.bytes("UPLOAD_MAX_BYTES", "50MB"),
 		WhisperURL: os.Getenv("WHISPER_URL"), PiVersion: env("PI_VERSION", "dev"),
 		TranscribeMaxSeconds: p.int("TRANSCRIBE_MAX_SECONDS", 300), ChatQueueMax: p.int("CHAT_QUEUE_MAX", 10),
 		SubagentsEnabled: p.bool("SUBAGENTS_ENABLED", true), SubagentMaxParallel: p.int("SUBAGENT_MAX_PARALLEL", 4),
@@ -396,7 +406,6 @@ func Load() (*Config, error) {
 	}
 	c.RelayInternalURL = strings.TrimRight(env("RELAY_INTERNAL_URL", "http://localhost"+c.RelayAddr), "/")
 	c.RelaySandboxWSURL = env("RELAY_SANDBOX_WS_URL", strings.Replace(c.RelayInternalURL, "http", "ws", 1)+"/v1/workspaces/connect")
-	c.RelayPublicWSURL = env("RELAY_PUBLIC_WS_URL", strings.Replace(c.PublicAPIURL, "http", "ws", 1)+"/v1/workspaces/connect")
 	if k := os.Getenv("SECRETS_KEY"); k != "" {
 		key, err := DecodeKey(k)
 		if err != nil {
@@ -422,7 +431,7 @@ func (c *Config) Validate(mode string) error {
 	if len(c.SecretsKey) == 0 {
 		errs = append(errs, errors.New("SECRETS_KEY is required"))
 	}
-	if mode == "relay" {
+	if mode == "relay" || mode == "egress" {
 		return errors.Join(errs...)
 	}
 	if len(c.KafkaBrokers) == 0 && mode != "cleaner" {

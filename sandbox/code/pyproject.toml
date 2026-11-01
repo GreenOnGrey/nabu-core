@@ -1,0 +1,15 @@
+# Python tools of the code sandbox profile (FTR.HMR.CMN-0007 R25) on top of
+# base. The image installs them from uv.lock with hashes into /opt/py; `make
+# sandbox-lock` updates the lock.
+[project]
+name = "nabu-sandbox-code"
+version = "0"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "mypy",
+    "pytest",
+    "ruff",
+]
+
+[tool.uv]
+package = false

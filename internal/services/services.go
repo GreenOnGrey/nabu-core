@@ -26,13 +26,15 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/platform/jwt"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/kafka"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/postgres"
+	"github.com/GreenOnGrey/nabu-core/internal/runfiles"
 )
 
-// Workspace modes of a service agent (R15).
+// Workspace modes of a service agent (R15). The workspace of the caller is
+// gone: code runs in the sandbox of Nabu with the working copy of the caller
+// (FTR.HMR.CMN-0007 R12).
 const (
-	WorkspaceNone     = "none"
-	WorkspaceNabu     = "nabu"
-	WorkspaceExternal = "external"
+	WorkspaceNone = "none"
+	WorkspaceNabu = "nabu"
 )
 
 // Limits bound a run (SVC-06).
@@ -54,9 +56,12 @@ type Config struct {
 	Workspace      string        `json:"workspace"`
 	// WorkspaceProfile is the sandbox profile of a workspace in Nabu; "" —
 	// the default of the stand (FTR.NAB.CMN-0008 R6).
-	WorkspaceProfile string   `json:"workspaceProfile,omitempty"`
-	Limits           Limits   `json:"limits"`
-	Clients          []string `json:"clients"`
+	WorkspaceProfile string `json:"workspaceProfile,omitempty"`
+	// Proxies of the sandbox of a run (FTR.HMR.CMN-0007 R17); only with the
+	// workspace of Nabu.
+	Proxies []string `json:"proxies,omitempty"`
+	Limits  Limits   `json:"limits"`
+	Clients []string `json:"clients"`
 }
 
 // Agent is a stored service agent with run statistics.
@@ -84,6 +89,11 @@ type Run struct {
 	Usage          json.RawMessage `json:"usage"`
 	StartedAt      time.Time       `json:"startedAt"`
 	FinishedAt     *time.Time      `json:"finishedAt"`
+	// FTR.HMR.CMN-0007 R20, tech §2.3: the proxies of the sandbox, the
+	// working copy and its changes.
+	Proxies []string        `json:"proxies"`
+	Files   *runfiles.Stats `json:"files"`
+	Changes *RunChanges     `json:"changes"`
 }
 
 // CallerMCP is an MCP server the caller passes for one run (R15, SVC-08).
@@ -100,24 +110,27 @@ type RunInput struct {
 	CallerMCP      []CallerMCP     `json:"callerMcp"`
 	Initiator      string          `json:"initiator"`
 	IdempotencyKey string          `json:"idempotencyKey"`
+	// Files is the upload with the working copy (FTR.HMR.CMN-0007 tech §2.2).
+	Files string `json:"files,omitempty"`
 }
 
 // Service manages service agents and runs.
 type Service struct {
-	Pool   *pgxpool.Pool
-	Models *models.Service
-	Signer *jwt.Signer
-	Bus    kafka.Publisher
-	Events events.Publisher
-	// RelayPublicURL is where external workspaces connect.
-	RelayPublicURL string
-	PublicAPIURL   string
+	Pool         *pgxpool.Pool
+	Models       *models.Service
+	Signer       *jwt.Signer
+	Bus          kafka.Publisher
+	Events       events.Publisher
+	PublicAPIURL string
 	// Harnesses are the installed harnesses (R20: pi).
 	Harnesses []Harness
-	// WorkspaceTTL is the lifetime of a workspace token.
-	WorkspaceTTL time.Duration
 	// ProfileReady checks a workspaceProfile (FTR.NAB.CMN-0008); nil — any.
 	ProfileReady func(ctx context.Context, name string) (bool, error)
+	// Files stores working copies of runs (FTR.HMR.CMN-0007).
+	Files *Files
+	// ProxiesExist checks the proxies of an agent (FTR.HMR.CMN-0007 tech
+	// §3.3); nil — any.
+	ProxiesExist func(ctx context.Context, names []string, field string) error
 }
 
 // Harness is an installed harness (tech §4: GET /harnesses).
@@ -150,12 +163,17 @@ func (s *Service) validate(ctx context.Context, c *Config) error {
 	switch c.Workspace {
 	case "":
 		c.Workspace = WorkspaceNone
-	case WorkspaceNone, WorkspaceNabu, WorkspaceExternal:
+	case WorkspaceNone, WorkspaceNabu:
 	default:
-		return apperr.Unprocessable("invalid_workspace", "workspace is none, nabu or external").With("field", "workspace")
+		return apperr.Unprocessable("invalid_workspace", "workspace is none or nabu").With("field", "workspace")
 	}
 	if c.Workspace != WorkspaceNabu {
-		c.WorkspaceProfile = ""
+		c.WorkspaceProfile, c.Proxies = "", nil
+	}
+	if len(c.Proxies) > 0 && s.ProxiesExist != nil {
+		if err := s.ProxiesExist(ctx, c.Proxies, "proxies"); err != nil {
+			return err
+		}
 	}
 	if c.WorkspaceProfile != "" && s.ProfileReady != nil {
 		ok, err := s.ProfileReady(ctx, c.WorkspaceProfile)
@@ -291,13 +309,33 @@ func (s *Service) Delete(ctx context.Context, name string) error {
 // ─── runs ───────────────────────────────────────────────────────────
 
 const runSelect = `SELECT r.id, r.agent, r.client_id, c.name, r.initiator_email, r.status, r.summary, r.error_class, r.error_text,
-	r.usage, r.started_at, r.finished_at FROM runs r JOIN service_clients c ON c.id = r.client_id`
+	r.usage, r.started_at, r.finished_at, r.proxies, r.files_count, r.files_bytes, r.changes_count
+	FROM runs r JOIN service_clients c ON c.id = r.client_id`
 
 func scanRun(row pgx.Row) (*Run, error) {
 	var r Run
+	var files, changes *int
+	var bytes *int64
 	err := row.Scan(&r.ID, &r.Agent, &r.ClientID, &r.ClientName, &r.InitiatorEmail, &r.Status, &r.Summary, &r.ErrorClass, &r.ErrorText,
-		&r.Usage, &r.StartedAt, &r.FinishedAt)
+		&r.Usage, &r.StartedAt, &r.FinishedAt, &r.Proxies, &files, &bytes, &changes)
+	if files != nil {
+		r.Files = &runfiles.Stats{Files: *files}
+		if bytes != nil {
+			r.Files.Bytes = *bytes
+		}
+	}
+	if changes != nil {
+		r.Changes = &RunChanges{Files: *changes}
+	}
+	if r.Proxies == nil {
+		r.Proxies = []string{}
+	}
 	return &r, err
+}
+
+// RunChanges counts the changes of a run (FTR.HMR.CMN-0007 tech §2.3).
+type RunChanges struct {
+	Files int `json:"files"`
 }
 
 // GetRun loads a run.
@@ -335,13 +373,10 @@ func (s *Service) Runs(ctx context.Context, name string, page httpx.Page) (httpx
 
 // Started is the answer of POST /client/v1/agents/{name}/runs.
 type Started struct {
-	RunID          uuid.UUID `json:"runId"`
-	WorkspaceToken string    `json:"workspaceToken,omitempty"`
-	WorkspaceID    string    `json:"workspaceId,omitempty"`
-	RelayURL       string    `json:"relayUrl,omitempty"`
-	EventsURL      string    `json:"eventsUrl"`
-	EventsToken    string    `json:"eventsToken"`
-	Existing       bool      `json:"-"`
+	RunID       uuid.UUID `json:"runId"`
+	EventsURL   string    `json:"eventsUrl"`
+	EventsToken string    `json:"eventsToken"`
+	Existing    bool      `json:"-"`
 }
 
 // RunMessage is the payload of nabu.runs.
@@ -349,7 +384,7 @@ type RunMessage struct {
 	RunID uuid.UUID `json:"runId"`
 }
 
-// WorkspaceID is the relay id of a run's external workspace.
+// WorkspaceID is the relay id of the sandbox of a run.
 func WorkspaceID(run uuid.UUID) string { return "run-" + run.String() }
 
 // Start creates a run for a client (SVC-02…04): the agent must be allowed to
@@ -380,6 +415,9 @@ func (s *Service) Start(ctx context.Context, cl *httpx.Client, name string, in R
 			return nil, apperr.Unprocessable("invalid_caller_mcp", "callerMcp needs a name and an http(s) url")
 		}
 	}
+	if in.Files != "" && (ag.Workspace != WorkspaceNabu || s.Files == nil) {
+		return nil, apperr.Unprocessable("no_workspace", "the agent has no workspace for files").With("field", "files")
+	}
 	body, _ := json.Marshal(in)
 	var key *string
 	if in.IdempotencyKey != "" {
@@ -392,22 +430,33 @@ func (s *Service) Start(ctx context.Context, cl *httpx.Client, name string, in R
 	}
 	var id uuid.UUID
 	existing := false
-	err = s.Pool.QueryRow(ctx, `INSERT INTO runs (agent, client_id, initiator_email, idempotency_key, status, input)
-		VALUES ($1,$2,$3,$4,'queued',$5) ON CONFLICT (client_id, idempotency_key) DO NOTHING RETURNING id`,
-		name, cl.ID, initiator, key, body).Scan(&id)
-	if postgres.IsNoRows(err) && key != nil {
-		existing = true
-		err = s.Pool.QueryRow(ctx, `SELECT id FROM runs WHERE client_id = $1 AND idempotency_key = $2`, cl.ID, *key).Scan(&id)
+	proxies := ag.Proxies
+	if proxies == nil {
+		proxies = []string{}
 	}
+	err = postgres.InTx(ctx, s.Pool, func(tx pgx.Tx) error {
+		err := tx.QueryRow(ctx, `INSERT INTO runs (agent, client_id, initiator_email, idempotency_key, status, input, proxies)
+			VALUES ($1,$2,$3,$4,'queued',$5,$6) ON CONFLICT (client_id, idempotency_key) DO NOTHING RETURNING id`,
+			name, cl.ID, initiator, key, body, proxies).Scan(&id)
+		if postgres.IsNoRows(err) && key != nil {
+			existing = true
+			return tx.QueryRow(ctx, `SELECT id FROM runs WHERE client_id = $1 AND idempotency_key = $2`, cl.ID, *key).Scan(&id)
+		}
+		if err != nil || in.Files == "" {
+			return err
+		}
+		return s.attachFiles(ctx, tx, cl.ID, id, in.Files)
+	})
 	if err != nil {
 		return nil, err
 	}
 	st := &Started{RunID: id, Existing: existing, EventsURL: s.PublicAPIURL + "/client/v1/runs/" + id.String() + "/events",
 		EventsToken: s.Signer.Issue(jwt.Claims{Audience: jwt.AudRunEvents, Run: id.String()}, 24*time.Hour)}
-	if ag.Workspace == WorkspaceExternal {
-		st.WorkspaceID = WorkspaceID(id)
-		st.RelayURL = s.RelayPublicURL
-		st.WorkspaceToken = s.Signer.Issue(jwt.Claims{Audience: jwt.AudWorkspace, Workspace: st.WorkspaceID, Kind: "external", Run: id.String()}, s.WorkspaceTTL)
+	switch {
+	case in.Files != "" && existing:
+		s.dropUpload(ctx, cl.ID, in.Files)
+	case in.Files != "":
+		s.moveFiles(ctx, id)
 	}
 	if !existing {
 		b, _ := json.Marshal(RunMessage{RunID: id})
@@ -554,7 +603,13 @@ func (s *Service) ClientRoutes(r chi.Router) {
 			if err != nil || !a.Enabled {
 				continue
 			}
-			out = append(out, map[string]any{"name": a.Name, "description": a.Description, "workspace": a.Workspace})
+			proxies := a.Proxies
+			if proxies == nil {
+				proxies = []string{}
+			}
+			// FTR.HMR.CMN-0007 tech §3.3: Hammurapi warns about a code agent without a sandbox.
+			out = append(out, map[string]any{"name": a.Name, "description": a.Description, "workspace": a.Workspace,
+				"workspaceProfile": a.WorkspaceProfile, "proxies": proxies})
 		}
 		httpx.JSON(w, 200, map[string]any{"items": out})
 		return nil

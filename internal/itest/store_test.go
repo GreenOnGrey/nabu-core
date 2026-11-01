@@ -369,9 +369,9 @@ func TestClientsAndRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 	b := &bus{}
-	ss := &services.Service{Pool: pool, Models: ms, Signer: signer, Bus: b, Harnesses: []services.Harness{{Name: "pi"}}, WorkspaceTTL: time.Hour}
+	ss := &services.Service{Pool: pool, Models: ms, Signer: signer, Bus: b, Harnesses: []services.Harness{{Name: "pi"}}}
 	if _, err := ss.Save(ctx, nil, "", services.Config{Name: "hammurapi-codegen", Model: models.Choice{ConnectionID: conn.ID, Model: "gpt-x"},
-		Workspace: "external", Clients: []string{"hammurapi"}}, true); err != nil {
+		Workspace: "nabu", Clients: []string{"hammurapi"}}, true); err != nil {
 		t.Fatal(err)
 	}
 	hc, _ := cs.Load(ctx, cl.ID)
@@ -382,8 +382,13 @@ func TestClientsAndRuns(t *testing.T) {
 		t.Fatal("not allowed agent started")
 	}
 	st, err := ss.Start(ctx, hc, "hammurapi-codegen", services.RunInput{Input: "do it", IdempotencyKey: "task:1:1"})
-	if err != nil || st.WorkspaceToken == "" {
+	if err != nil || st.EventsToken == "" {
 		t.Fatal(st, err)
+	}
+	// FTR.HMR.CMN-0007 EX-03: the workspace of the caller is gone
+	if _, err := ss.Save(ctx, nil, "", services.Config{Name: "old-runner", Model: models.Choice{ConnectionID: conn.ID, Model: "gpt-x"},
+		Workspace: "external"}, true); err == nil {
+		t.Fatal("external workspace saved")
 	}
 	st2, err := ss.Start(ctx, hc, "hammurapi-codegen", services.RunInput{Input: "do it", IdempotencyKey: "task:1:1"})
 	if err != nil || st2.RunID != st.RunID || len(b.msgs) != 1 {

@@ -29,18 +29,21 @@ robfig/cron, goldmark (answers → channel formats), go-imap v2 and go-message (
 `/.well-known/jwks.json`.
 
 ```text
-cmd/nabu/             entry point; modes: api | worker | agent | relay | sandbox | migrate | cleaner
+cmd/nabu/             entry point; modes: api | worker | agent | relay | egress | sandbox | migrate | cleaner
 pkg/pirpc/            client of Pi's RPC mode — no imports from internal/
 pi-extensions/        nabu-workspace: Pi tools routed through relay to the workspace server
 migrations/           goose migrations, embedded
-internal/app/         wiring per mode (RunAPI, RunWorker, RunRelay, RunOperator, …)
+internal/app/         wiring per mode (RunAPI, RunWorker, RunRelay, RunEgress, RunOperator, …)
 internal/config/      every environment variable
 internal/engine/      turns of personal agents, runs of service agents, persona, snapshots
 internal/agentpods/   a pod per owner for conversations and tasks (FTR.NAB.CMN-0004): leases for the engine, the manager
                       loop (capacity, warm reserve, queue of turns), the Agents section of the administration
 internal/relay/       the WebSocket channel of workspaces (server and client; frames in proto.go)
-internal/workspace/   the workspace server (fs/*, grep, exec) served in sandboxes and runners
-internal/space, sandbox/   personal spaces: sandbox pods, S3 sync
+internal/workspace/   the workspace server (fs/*, grep, exec) served in sandboxes
+internal/space, sandbox/   personal spaces: sandbox pods, S3 sync; temporary sandboxes of runs with a working copy
+internal/runfiles/    working copies of runs (FTR.HMR.CMN-0007): archive checks, unpacking, the archive of changes
+internal/proxies/     proxies of sandboxes: kinds, checks, the template of package registries, assignment
+internal/egress/      the egress gateway (HTTP CONNECT): sandboxes reach only the addresses of their proxies
 internal/catalog/     catalog, MCP proxy with credentials, skills
 internal/channels/    registry and availability of channels, Telegram (keys, rich messages), VK Teams; email/ — the mail channel
 internal/render/      the agent's Markdown → Telegram rich blocks, messenger HTML, letters
@@ -56,8 +59,8 @@ internal/itest/       integration tests (build tag integration)
 deploy/versions.env   DEPLOY_WORKFLOW_REF, CHART_VERSION, PI_VERSION — changed only by PR
 ```
 
-`relay/proto.go` and `relay/client.go` are copied into `hammurapi-core/internal/platform/relay`
-(the runner of Hammurapi is a client). Change the protocol in both places.
+Only sandboxes of Nabu connect to `relay` (FTR.HMR.CMN-0007 R12): there are no external workspaces
+and no copies of the protocol in other repositories.
 
 ## Commands
 

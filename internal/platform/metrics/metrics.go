@@ -278,3 +278,30 @@ var (
 func init() {
 	Registry.MustRegister(PreviewRequests, PreviewSeconds)
 }
+
+// FTR.HMR.CMN-0007 tech §3.5: the egress gateway of sandboxes and the proxies.
+var (
+	EgressConnections = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_egress_connections_total", Help: "Tunnels of the egress gateway by proxy and result (ok, denied, dial_error, auth, limit).",
+	}, []string{"proxy", "result"})
+	EgressBytes = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_egress_bytes_total", Help: "Bytes through the egress gateway by proxy and direction (up, down).",
+	}, []string{"proxy", "direction"})
+	EgressActive = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "nabu_egress_active", Help: "Open tunnels of the egress gateway by proxy.",
+	}, []string{"proxy"})
+	ProxyUp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "nabu_proxy_up", Help: "1 when the last check of the proxy passed.",
+	}, []string{"proxy"})
+	RunFilesBytes = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "nabu_run_files_bytes", Help: "Working copies of runs (in) and their changes (out) in bytes.",
+		Buckets: prometheus.ExponentialBuckets(1<<16, 4, 9),
+	}, []string{"direction"})
+	RunChangesFiles = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name: "nabu_run_changes_files", Help: "Changed files of a run with a working copy.", Buckets: []float64{0, 1, 3, 10, 30, 100, 300, 1000},
+	})
+)
+
+func init() {
+	Registry.MustRegister(EgressConnections, EgressBytes, EgressActive, ProxyUp, RunFilesBytes, RunChangesFiles)
+}

@@ -65,8 +65,8 @@ func connectWorkspace(t *testing.T, signer *jwt.Signer, wsURL, id string) (strin
 	ws := &workspace.Workspace{Root: root, Token: "local", Env: workspace.CommandEnv(root)}
 	ctx, cancel := context.WithCancel(context.Background())
 	connected := make(chan struct{}, 1)
-	c := &Client{URL: wsURL, Token: signer.Issue(jwt.Claims{Audience: jwt.AudWorkspace, Workspace: id, Kind: "external"}, time.Hour),
-		WorkspaceID: id, Kind: "external", Handler: ws.Handler(), HandlerToken: "local",
+	c := &Client{URL: wsURL, Token: signer.Issue(jwt.Claims{Audience: jwt.AudWorkspace, Workspace: id, Kind: "sandbox"}, time.Hour),
+		WorkspaceID: id, Kind: "sandbox", Handler: ws.Handler(), HandlerToken: "local",
 		OnConnected: func() { connected <- struct{}{} }}
 	go func() { _ = c.Run(ctx) }()
 	select {

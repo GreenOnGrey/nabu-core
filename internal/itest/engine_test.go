@@ -139,9 +139,9 @@ func TestEngineWithPi(t *testing.T) {
 	isrv := httptest.NewServer(ir)
 	defer isrv.Close()
 
-	svcSvc := &services.Service{Pool: pool, Models: ms, Signer: signer, Bus: b, Events: hub, Harnesses: []services.Harness{{Name: "pi"}}, WorkspaceTTL: time.Hour}
+	svcSvc := &services.Service{Pool: pool, Models: ms, Signer: signer, Bus: b, Events: hub, Harnesses: []services.Harness{{Name: "pi"}}}
 	eng := &engine.Engine{
-		Cfg:  engine.Config{InternalURL: isrv.URL, TurnTimeout: 2 * time.Minute, TaskRunTimeout: 2 * time.Minute, RunWorkspaceWait: time.Second, SessionMaxAge: time.Hour},
+		Cfg:  engine.Config{InternalURL: isrv.URL, TurnTimeout: 2 * time.Minute, TaskRunTimeout: 2 * time.Minute, SessionMaxAge: time.Hour},
 		Pool: pool, Op: &agent.Client{BaseURL: osrv.URL, Token: "svc"}, Users: repo(), Chat: store, Models: ms,
 		Catalog: &catalog.Service{Pool: pool, Box: box, Signer: signer, InternalURL: isrv.URL, S3: s3},
 		Memory:  memSvc, Tasks: taskSvc, Space: spaceSvc, Services: svcSvc, Ledger: &ledger.Ledger{Pool: pool},

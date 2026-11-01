@@ -1,8 +1,8 @@
 # Nabu core image: one binary with modes api | worker | agent | relay |
 # sandbox | migrate | cleaner (FTR.NAB.CMN-0001 arch §3), with Pi for the
-# agent operator and git for skill sources. The targets sandbox-base and
-# sandbox-documents are the images of the built-in sandbox profiles
-# (FTR.NAB.CMN-0008).
+# agent operator and git for skill sources. The targets sandbox-base,
+# sandbox-documents and sandbox-code are the images of the built-in sandbox
+# profiles (FTR.NAB.CMN-0008, FTR.HMR.CMN-0007 R25).
 
 # The Debian of sandboxes (FTR.NAB.CMN-0008 R4): a dated image and a fixed day
 # of the apt archive on snapshot.debian.org. The nabu-core build (the manifests
@@ -92,12 +92,46 @@ RUN MPLCONFIGDIR=/opt/nabu/mpl-cache python3 -c "import matplotlib.font_manager 
 LABEL org.opencontainers.image.title="nabu-sandbox-documents"
 USER 1000:1000
 
+# The code profile (FTR.HMR.CMN-0007 R25): Go, Python and JavaScript for
+# service agents that change repositories. Dependencies of a project come
+# through the proxy of package registries the agent is given (R18): npm, go
+# and uv are here, apt is not. Caches go into /work (HOME), not into the
+# small /tmp; the changes of a run skip them.
+FROM sandbox-base AS sandbox-code
+ARG VERSION=dev
+USER root
+COPY --from=golang:1.27-trixie /usr/local/go /usr/local/go
+COPY --from=node:24-trixie-slim /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+COPY --from=uv /uv /usr/local/bin/uv
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+ && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+ && npm install -g --no-audit --no-fund pnpm@10.18.0 typescript@5.9.3 eslint@9.37.0 prettier@3.6.2 \
+ && npm cache clean --force && rm -rf /root/.npm \
+ && GOBIN=/usr/local/bin GOPATH=/tmp/gopath GOCACHE=/tmp/gocache /usr/local/go/bin/go install golang.org/x/tools/gopls@v0.20.0 \
+ && GOBIN=/usr/local/bin GOPATH=/tmp/gopath GOCACHE=/tmp/gocache /usr/local/go/bin/go install mvdan.cc/gofumpt@v0.9.1 \
+ && GOBIN=/usr/local/bin GOPATH=/tmp/gopath GOCACHE=/tmp/gocache /usr/local/go/bin/go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 \
+ && rm -rf /tmp/gopath /tmp/gocache
+COPY sandbox/code /tmp/sandbox
+RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv-build \
+    cd /tmp/sandbox && uv-build export --frozen --no-emit-project --format requirements-txt >/tmp/requirements.txt \
+ && uv-build pip install --python /opt/py/bin/python --require-hashes --no-deps --no-cache -r /tmp/requirements.txt \
+ && rm -rf /tmp/sandbox /tmp/requirements.txt \
+ && test ! -e /opt/py/bin/pip
+ENV PATH=/opt/py/bin:/usr/local/go/bin:/work/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    GOPATH=/work/go GOCACHE=/work/.cache/go-build GOTOOLCHAIN=local \
+    UV_CACHE_DIR=/work/.cache/uv npm_config_cache=/work/.npm \
+    XDG_CACHE_HOME=/work/.cache XDG_CONFIG_HOME=/work/.cache/config XDG_DATA_HOME=/work/.cache/share XDG_STATE_HOME=/work/.cache/state
+LABEL org.opencontainers.image.title="nabu-sandbox-code"
+USER 1000:1000
+
 # Manifests of the built-in profiles for the api (space_info, the status of
 # requested packages) without starting a sandbox.
 FROM sandbox-base AS manifest-base
 RUN python3 /opt/nabu/manifest.py base >/tmp/base.json
 FROM sandbox-documents AS manifest-documents
 RUN python3 /opt/nabu/manifest.py documents >/tmp/documents.json
+FROM sandbox-code AS manifest-code
+RUN python3 /opt/nabu/manifest.py code >/tmp/code.json
 
 # Release image (the default target): Nabu and the Pi agent. The Pi version
 # comes from deploy/versions.env (PI_VERSION) and changes only by PR. The
@@ -122,6 +156,7 @@ COPY pi-extensions/ /opt/nabu/pi-extensions/
 COPY --from=build /out/nabu /usr/local/bin/nabu
 COPY --from=manifest-base /tmp/base.json /opt/nabu/profiles/base.json
 COPY --from=manifest-documents /tmp/documents.json /opt/nabu/profiles/documents.json
+COPY --from=manifest-code /tmp/code.json /opt/nabu/profiles/code.json
 LABEL org.opencontainers.image.title="nabu-core" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.source="https://github.com/GreenOnGrey/nabu-core" \

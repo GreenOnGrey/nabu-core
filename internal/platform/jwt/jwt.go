@@ -30,6 +30,7 @@ const (
 	AudMCP       = "nabu:mcp"       // the built-in MCP of a session
 	AudAgent     = "nabu:agent"     // the worker calling the agent pod of one owner
 	AudLLMBridge = "nabu:llm"       // an agent calling the model bridge of one connection (FTR.NAB.CHAT-0001 tech §2.4)
+	AudEgress    = "nabu:egress"    // a sandbox going out through the egress gateway (FTR.HMR.CMN-0007 tech §3.4)
 )
 
 // Claims are the claims Nabu uses.
@@ -52,6 +53,8 @@ type Claims struct {
 	Run          string `json:"run,omitempty"`
 	Task         string `json:"task,omitempty"`
 	Email        string `json:"email,omitempty"`
+	// Proxies are the proxies of an egress token (FTR.HMR.CMN-0007 tech §3.4).
+	Proxies []string `json:"prx,omitempty"`
 	// Generation is the start of the agent pod an agent token is for.
 	Generation int64 `json:"gen,omitempty"`
 }

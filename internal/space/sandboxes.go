@@ -9,10 +9,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/GreenOnGrey/nabu-core/internal/egress"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/events"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/jwt"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/k8s"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/metrics"
+	"github.com/GreenOnGrey/nabu-core/internal/proxies"
 	"github.com/GreenOnGrey/nabu-core/internal/sandboxprofile"
 )
 
@@ -36,6 +38,9 @@ type SandboxConfig struct {
 	// and the imagePullSecrets of sandboxes (built-in and custom registries).
 	InitImage   string
 	PullSecrets []string
+	// EgressURL is the gateway sandboxes with proxies go out through
+	// (FTR.HMR.CMN-0007); "" — off.
+	EgressURL string
 }
 
 // Sandboxes starts personal sandboxes on demand and puts them to sleep after
@@ -49,6 +54,8 @@ type Sandboxes struct {
 	// Profiles chooses the image of a sandbox (FTR.NAB.CMN-0008 R6); nil —
 	// the single image of Cfg.Image.
 	Profiles *sandboxprofile.Service
+	// Proxies resolves the proxies of sandboxes (FTR.HMR.CMN-0007); nil — none.
+	Proxies *proxies.Service
 }
 
 // profile is the profile a sandbox of the target starts from.
@@ -84,6 +91,10 @@ func (m *Sandboxes) Ensure(ctx context.Context, uid uuid.UUID) error {
 	if err != nil {
 		return err
 	}
+	ps, err := m.personalProxies(ctx, uid)
+	if err != nil {
+		return err
+	}
 	tag, err := m.Pool.Exec(ctx, `UPDATE spaces SET state = 'starting', pod = $2, profile = $3, state_changed_at = now(), last_activity_at = now()
 		WHERE user_id = $1 AND state IN ('sleeping','stopping')`, uid, PodName(uid), prof.Name)
 	if err != nil {
@@ -104,7 +115,9 @@ func (m *Sandboxes) Ensure(ctx context.Context, uid uuid.UUID) error {
 			time.Sleep(time.Second)
 		}
 	}
-	err = m.K8s.CreatePod(ctx, m.Cfg.Namespace, m.manifest(uid, prof))
+	man := m.manifest(uid, prof)
+	ps.apply(man)
+	err = m.K8s.CreatePod(ctx, m.Cfg.Namespace, man)
 	if err != nil && !k8s.Conflict(err) {
 		_, _ = m.Pool.Exec(ctx, `UPDATE spaces SET state = 'sleeping', pod = NULL, state_changed_at = now() WHERE user_id = $1`, uid)
 		m.publish(ctx, uid)
@@ -112,6 +125,43 @@ func (m *Sandboxes) Ensure(ctx context.Context, uid uuid.UUID) error {
 	}
 	slog.InfoContext(ctx, "sandbox starting", "user_id", uid)
 	return nil
+}
+
+// personalProxies are the proxies of the personal or group sandbox of a
+// user (FTR.HMR.CMN-0007 R24).
+func (m *Sandboxes) personalProxies(ctx context.Context, uid uuid.UUID) (proxySetup, error) {
+	if m.Profiles == nil || m.Proxies == nil {
+		return proxySetup{}, nil
+	}
+	kind, err := m.Profiles.KindOf(ctx, uid)
+	if err != nil {
+		return proxySetup{}, err
+	}
+	names, err := m.Profiles.AssignedProxies(ctx, kind)
+	if err != nil {
+		return proxySetup{}, err
+	}
+	rs, err := m.resolveProxies(ctx, names)
+	if err != nil {
+		return proxySetup{}, err
+	}
+	return m.setup(rs, func(names []string) string {
+		return egress.WorkspaceToken(m.Space.Signer, WorkspaceID(uid), names, m.Cfg.TokenTTL)
+	}), nil
+}
+
+// ProxyNote describes the proxies of the personal or group sandbox of a user
+// for the agent (R20); "" without sandboxes or when they cannot be read.
+func (m *Sandboxes) ProxyNote(ctx context.Context, uid uuid.UUID) string {
+	if m == nil {
+		return ""
+	}
+	ps, err := m.personalProxies(ctx, uid)
+	if err != nil {
+		slog.WarnContext(ctx, "sandbox proxies for the note", "user", uid, "err", err)
+		return ""
+	}
+	return " " + ProxyNote(ps.resolved)
 }
 
 func (m *Sandboxes) publish(ctx context.Context, uid uuid.UUID) {
@@ -317,10 +367,17 @@ func (m *Sandboxes) restartOnNewImage(ctx context.Context) {
 			continue
 		}
 		pod, err := m.K8s.GetPod(ctx, m.Cfg.Namespace, PodName(uid))
-		if err != nil || pod == nil || pod.Metadata.Annotations["nabu.io/image"] == p.Image {
+		if err != nil || pod == nil {
 			continue
 		}
-		if pod.Metadata.Annotations["nabu.io/image"] == "" && p.Legacy && pod.Image() == p.Image {
+		sameImage := pod.Metadata.Annotations["nabu.io/image"] == p.Image ||
+			(pod.Metadata.Annotations["nabu.io/image"] == "" && p.Legacy && pod.Image() == p.Image)
+		// FTR.HMR.CMN-0007 R24: other proxies restart the sandbox like another image.
+		ps, err := m.personalProxies(ctx, uid)
+		if err != nil {
+			continue
+		}
+		if sameImage && pod.Metadata.Annotations[AnnotationProxies] == ps.hash {
 			continue
 		}
 		_, _ = m.Pool.Exec(ctx, `UPDATE spaces SET state = 'stopping', state_changed_at = now() WHERE user_id = $1 AND state = 'running'`, uid)
@@ -365,11 +422,24 @@ func (m *Sandboxes) Run(ctx context.Context) {
 // (workspace "nabu", arch §4.3): no files are restored or kept. profile is
 // the agent's workspaceProfile, "" — the default of the stand
 // (FTR.NAB.CMN-0008 R6).
-func (m *Sandboxes) StartEphemeral(ctx context.Context, workspaceID, runID, profile string) error {
+// Ephemeral are the options of a run's temporary sandbox (FTR.HMR.CMN-0007):
+// whether it unpacks the working copy of the run, the proxies of the agent
+// and how long the egress token lives.
+type Ephemeral struct {
+	Files    bool
+	Proxies  []string
+	TokenTTL time.Duration
+}
+
+func (m *Sandboxes) StartEphemeral(ctx context.Context, workspaceID, runID, profile string, opts Ephemeral) ([]proxies.Resolved, error) {
 	name := ephemeralPod(workspaceID)
 	prof, err := m.profile(ctx, sandboxprofile.Target{Kind: sandboxprofile.TargetService, Profile: profile})
 	if err != nil {
-		return err
+		return nil, err
+	}
+	rs, err := m.resolveProxies(ctx, opts.Proxies)
+	if err != nil {
+		return nil, err
 	}
 	man := m.manifest(uuid.Nil, prof)
 	runToken := ""
@@ -390,7 +460,11 @@ func (m *Sandboxes) StartEphemeral(ctx context.Context, workspaceID, runID, prof
 		{"name": "NABU_API_INTERNAL_URL", "value": m.Cfg.APIURL},
 		{"name": "NABU_SANDBOX_RUN_TOKEN", "value": runToken},
 		{"name": "NABU_SANDBOX_PROFILE", "value": prof.Name},
+		{"name": "NABU_SANDBOX_RUN", "value": runID},
 		{"name": "HOME", "value": "/work"},
+	}
+	if opts.Files {
+		c["env"] = append(c["env"].([]map[string]any), map[string]any{"name": "NABU_SANDBOX_FILES", "value": "1"})
 	}
 	if inits, ok := spec["initContainers"].([]map[string]any); ok {
 		inits[0]["env"] = []map[string]any{
@@ -399,11 +473,12 @@ func (m *Sandboxes) StartEphemeral(ctx context.Context, workspaceID, runID, prof
 			{"name": "NABU_API_INTERNAL_URL", "value": m.Cfg.APIURL},
 		}
 	}
+	m.setup(rs, func(names []string) string { return egress.RunToken(m.Space.Signer, runID, names, opts.TokenTTL) }).apply(man)
 	if err := m.K8s.CreatePod(ctx, m.Cfg.Namespace, man); err != nil && !k8s.Conflict(err) {
-		return err
+		return nil, err
 	}
 	go m.watchEphemeral(context.WithoutCancel(ctx), name, workspaceID, prof)
-	return nil
+	return rs, nil
 }
 
 // watchEphemeral records how a temporary sandbox started (FTR.NAB.CMN-0008
