@@ -338,14 +338,14 @@ type idleConn struct {
 }
 
 func (c idleConn) Read(b []byte) (int, error) {
-	_ = c.Conn.SetDeadline(time.Now().Add(IdleTimeout))
+	_ = c.SetDeadline(time.Now().Add(IdleTimeout))
 	n, err := c.Conn.Read(b)
 	c.n.Add(int64(n))
 	return n, err
 }
 
 func (c idleConn) Write(b []byte) (int, error) {
-	_ = c.Conn.SetDeadline(time.Now().Add(IdleTimeout))
+	_ = c.SetDeadline(time.Now().Add(IdleTimeout))
 	return c.Conn.Write(b)
 }
 
@@ -370,7 +370,7 @@ func tunnel(w http.ResponseWriter, upstream net.Conn) (int64, int64, error) {
 	go func() {
 		// Bytes the client sent along with CONNECT are already buffered.
 		if n := buf.Reader.Buffered(); n > 0 {
-			b, _ := buf.Reader.Peek(n)
+			b, _ := buf.Peek(n)
 			up.Add(int64(n))
 			_, _ = uu.Write(b)
 		}

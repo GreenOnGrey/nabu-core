@@ -38,15 +38,14 @@ import (
 // accessRig is a connection of models, a platform MCP server and the access
 // service of a test.
 type accessRig struct {
-	t      *testing.T
-	acc    *access.Service
-	ms     *models.Service
-	cat    *catalog.Service
-	conn   *models.Connection
-	item   *catalog.Item
-	proxy  *httptest.Server
-	actor  access.Actor
-	cancel func()
+	t     *testing.T
+	acc   *access.Service
+	ms    *models.Service
+	cat   *catalog.Service
+	conn  *models.Connection
+	item  *catalog.Item
+	proxy *httptest.Server
+	actor access.Actor
 }
 
 func newAccessRig(t *testing.T) *accessRig {
