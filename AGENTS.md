@@ -78,9 +78,17 @@ NABU_PI_CMD=pi NABU_QUALITY_LLM_URL=… NABU_QUALITY_LLM_MODEL=… go test -tags
 golangci-lint run ./... && golangci-lint run --build-tags integration ./internal/itest/
 ```
 
-CI (`.github/workflows/ci.yml`) runs lint, unit and integration tests, the Pi contract tests against
-`PI_VERSION` (`pi-contract` job), `deploy/sync-ref.sh --check` and actionlint. Run the same before
-handing work over.
+## Checks before a commit
+
+A change is ready when every job of `.github/workflows/ci.yml` passes locally at the versions the workflow pins, plus the
+matching lines below. Read the workflow for the exact commands. Install a missing tool outside the repository
+at the pinned version. Name any job you could not run in your report, with the reason.
+
+- Go code: `gofmt -l .` is empty; `golangci-lint` at the version of `ci.yml`, also with `--build-tags integration ./internal/itest/`.
+- `Dockerfile`, `sandbox/**`, `go.mod`, `PI_VERSION`: build the changed targets and scan each with `trivy image --timeout 40m --severity CRITICAL,HIGH --ignore-unfixed --ignorefile .trivyignore.yaml <image>`.
+  Then `bash sandbox/test.sh <base> <documents> <code>`. `ci.yml` scans the profile `code`; base, documents and the `release` image are scanned first at the release (`release.yml`).
+- `.github/**`, `deploy/versions.env`: `actionlint`, `deploy/sync-ref.sh --check`. `DEPLOY_WORKFLOW_REF` and `CHART_VERSION` name tags that are already published.
+- Client API, public routes or new variables: check the consumers too: tests of `hammurapi-core`, `nabu-web`, the charts and `tests/manifests.sh` of `hammurapi-infra`, the post-deploy checks of `nabu/.github/workflows/deploy-component.yml`.
 
 ## Rules
 

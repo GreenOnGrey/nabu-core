@@ -50,19 +50,33 @@ jobs:
           go test -count=1 ./pkg/pirpc/ ./internal/platform/agent/... ./internal/relay/ ./internal/workspace/
           go test -tags integration -count=1 -run TestEngineWithPi ./internal/itest/
 
-  # FTR.NAB.CMN-0008: the images of the built-in sandbox profiles build and
-  # pass their checks (qa PRF-01…07).
+  # FTR.NAB.CMN-0008, FTR.HMR.CMN-0007: the images of the built-in sandbox
+  # profiles build and pass their checks (qa PRF-01…07, PF-01, PF-02). The tools
+  # of the profile code are pinned in the Dockerfile and age fast: Trivy finds
+  # them here, not at the release.
   sandbox-images:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - name: Сборка профилей base и documents
+      - name: Сборка профилей base, documents и code
         run: |
           docker buildx build --load --target sandbox-base --build-arg VERSION=ci -t nabu-sandbox-base:ci .
           docker buildx build --load --target sandbox-documents --build-arg VERSION=ci -t nabu-sandbox-documents:ci .
+          docker buildx build --load --target sandbox-code --build-arg VERSION=ci -t nabu-sandbox-code:ci .
       - name: Проверки профилей
-        run: bash sandbox/test.sh nabu-sandbox-base:ci nabu-sandbox-documents:ci
+        run: bash sandbox/test.sh nabu-sandbox-base:ci nabu-sandbox-documents:ci nabu-sandbox-code:ci
+      - name: CRITICAL и HIGH с исправлением в профиле code
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: nabu-sandbox-code:ci
+          version: v0.74.0
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          timeout: 15m
+          trivyignores: .trivyignore.yaml
 
   workflows:
     runs-on: ubuntu-24.04
