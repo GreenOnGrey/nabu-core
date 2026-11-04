@@ -164,14 +164,19 @@ type Config struct {
 	// ChatQueueMax bounds the messages waiting in a conversation (FTR.NAB.CHAT-0004 R4).
 	ChatQueueMax int
 	// FTR.NAB.CMN-0009 R6, R10: the subagents of agents and their limits.
-	SubagentsEnabled    bool
-	SubagentMaxParallel int
-	SubagentMaxPerTurn  int
-	SubagentTimeout     time.Duration
-	SubagentResultChars int
-	SubagentSlotWait    time.Duration
-	GigaChatCAFile      string
-	ModelsRefreshCron   string
+	// FTR.NAB.CMN-0010: the stall detector.
+	StallDetectorEnabled bool
+	StallRepeatLimit     int
+	StallErrorLimit      int
+	StallWrapupTimeout   time.Duration
+	SubagentsEnabled     bool
+	SubagentMaxParallel  int
+	SubagentMaxPerTurn   int
+	SubagentTimeout      time.Duration
+	SubagentResultChars  int
+	SubagentSlotWait     time.Duration
+	GigaChatCAFile       string
+	ModelsRefreshCron    string
 
 	// BootstrapLLM: an OpenAI-compatible connection created on the first
 	// start when there is none (the stand gets its DeepSeek key this way).
@@ -385,6 +390,8 @@ func Load() (*Config, error) {
 		EgressListen: env("EGRESS_LISTEN", ":3128"), UploadMaxBytes: p.bytes("UPLOAD_MAX_BYTES", "50MB"),
 		WhisperURL: os.Getenv("WHISPER_URL"), PiVersion: env("PI_VERSION", "dev"),
 		TranscribeMaxSeconds: p.int("TRANSCRIBE_MAX_SECONDS", 300), ChatQueueMax: p.int("CHAT_QUEUE_MAX", 10),
+		StallDetectorEnabled: p.bool("STALL_DETECTOR_ENABLED", true), StallRepeatLimit: p.int("STALL_REPEAT_LIMIT", 5),
+		StallErrorLimit: p.int("STALL_ERROR_LIMIT", 5), StallWrapupTimeout: p.dur("STALL_WRAPUP_TIMEOUT", "2m"),
 		SubagentsEnabled: p.bool("SUBAGENTS_ENABLED", true), SubagentMaxParallel: p.int("SUBAGENT_MAX_PARALLEL", 4),
 		SubagentMaxPerTurn: p.int("SUBAGENT_MAX_PER_TURN", 8), SubagentTimeout: p.dur("SUBAGENT_TIMEOUT", "15m"),
 		SubagentResultChars: p.int("SUBAGENT_RESULT_CHARS", 16000), SubagentSlotWait: p.dur("SUBAGENT_SLOT_WAIT", "1m"), GigaChatCAFile: os.Getenv("GIGACHAT_CA_FILE"),

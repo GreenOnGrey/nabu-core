@@ -47,6 +47,11 @@ type changesReport struct {
 	Skipped []runfiles.Skipped `json:"skipped"`
 }
 
+// hasChanges tells whether the working copy changed (FTR.HMR.CMN-0008 R7).
+func (s *Sandbox) hasChanges(m runfiles.Manifest) (bool, error) {
+	return runfiles.HasChanges(s.cfg.Root, m)
+}
+
 func (s *Sandbox) uploadChanges(ctx context.Context, m runfiles.Manifest) (any, error) {
 	pr, pw := io.Pipe()
 	done := make(chan *runfiles.Changes, 1)

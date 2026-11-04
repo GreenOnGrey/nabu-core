@@ -469,6 +469,7 @@ func Run(ctx context.Context, cfg Config) error {
 			os.Exit(3) // the engine ends the run with workspace_not_connected
 		}
 		ws.Changes = func(ctx context.Context) (any, error) { return s.uploadChanges(ctx, m) }
+		ws.Changed = func() (bool, error) { return s.hasChanges(m) }
 	}
 	if !cfg.Ephemeral {
 		ws.Heartbeat = s.heartbeat

@@ -43,6 +43,8 @@ type Workspace struct {
 	// Changes collects and uploads the changes of the working copy of a run
 	// (FTR.HMR.CMN-0007 tech §2.5); nil — the operation is not served.
 	Changes func(ctx context.Context) (any, error)
+	// Changed tells whether the working copy changed (FTR.HMR.CMN-0008 R7).
+	Changed func() (bool, error)
 
 	run    sync.Mutex // one bash at a time; the others wait
 	mu     sync.Mutex
@@ -126,6 +128,17 @@ func (w *Workspace) Handler() http.Handler {
 		"/v1/grep":       w.grep,
 		"/v1/exec":       w.exec,
 		"/v1/abort":      w.abort,
+		"/v1/workspace/changed": func(rw http.ResponseWriter, r *http.Request) error {
+			if w.Changed == nil {
+				return fs.ErrNotExist
+			}
+			changed, err := w.Changed()
+			if err != nil {
+				return err
+			}
+			rw.Header().Set("Content-Type", "application/json")
+			return json.NewEncoder(rw).Encode(map[string]bool{"changed": changed})
+		},
 		"/v1/workspace/changes": func(rw http.ResponseWriter, r *http.Request) error {
 			if w.Changes == nil {
 				return fs.ErrNotExist

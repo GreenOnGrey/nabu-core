@@ -8,11 +8,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -94,6 +96,10 @@ type Run struct {
 	Proxies []string        `json:"proxies"`
 	Files   *runfiles.Stats `json:"files"`
 	Changes *RunChanges     `json:"changes"`
+	// FTR.HMR.CMN-0008 R10: the readiness check; FTR.NAB.CMN-0010 R6: why the
+	// run was stopped.
+	Check      *CheckResult `json:"check"`
+	StopReason *string      `json:"stopReason"`
 }
 
 // CallerMCP is an MCP server the caller passes for one run (R15, SVC-08).
@@ -112,6 +118,8 @@ type RunInput struct {
 	IdempotencyKey string          `json:"idempotencyKey"`
 	// Files is the upload with the working copy (FTR.HMR.CMN-0007 tech §2.2).
 	Files string `json:"files,omitempty"`
+	// Check is the readiness check of the run (FTR.HMR.CMN-0008 R5).
+	Check *RunCheck `json:"check,omitempty"`
 }
 
 // Service manages service agents and runs.
@@ -309,15 +317,22 @@ func (s *Service) Delete(ctx context.Context, name string) error {
 // ─── runs ───────────────────────────────────────────────────────────
 
 const runSelect = `SELECT r.id, r.agent, r.client_id, c.name, r.initiator_email, r.status, r.summary, r.error_class, r.error_text,
-	r.usage, r.started_at, r.finished_at, r.proxies, r.files_count, r.files_bytes, r.changes_count
+	r.usage, r.started_at, r.finished_at, r.proxies, r.files_count, r.files_bytes, r.changes_count, r.check_result, r.stop_reason
 	FROM runs r JOIN service_clients c ON c.id = r.client_id`
 
 func scanRun(row pgx.Row) (*Run, error) {
 	var r Run
 	var files, changes *int
 	var bytes *int64
+	var check []byte
 	err := row.Scan(&r.ID, &r.Agent, &r.ClientID, &r.ClientName, &r.InitiatorEmail, &r.Status, &r.Summary, &r.ErrorClass, &r.ErrorText,
-		&r.Usage, &r.StartedAt, &r.FinishedAt, &r.Proxies, &files, &bytes, &changes)
+		&r.Usage, &r.StartedAt, &r.FinishedAt, &r.Proxies, &files, &bytes, &changes, &check, &r.StopReason)
+	if len(check) > 0 {
+		r.Check = &CheckResult{}
+		if uerr := json.Unmarshal(check, r.Check); uerr != nil {
+			r.Check = nil
+		}
+	}
 	if files != nil {
 		r.Files = &runfiles.Stats{Files: *files}
 		if bytes != nil {
@@ -417,6 +432,9 @@ func (s *Service) Start(ctx context.Context, cl *httpx.Client, name string, in R
 	}
 	if in.Files != "" && (ag.Workspace != WorkspaceNabu || s.Files == nil) {
 		return nil, apperr.Unprocessable("no_workspace", "the agent has no workspace for files").With("field", "files")
+	}
+	if err := validateCheck(in.Check, ag.Workspace); err != nil {
+		return nil, err
 	}
 	body, _ := json.Marshal(in)
 	var key *string
@@ -747,4 +765,92 @@ func (s *Service) EventsRoute(r chi.Router, hub *events.Hub, clientOf func(r *ht
 			}
 		}
 	})
+}
+
+// Stop reasons of a run (FTR.NAB.CMN-0010 R6).
+const StopStalled = "stalled"
+
+// States of the readiness check and the reasons of unavailable and not_run
+// (FTR.HMR.CMN-0008 R10, tech §2.1).
+const (
+	CheckPassed      = "passed"
+	CheckFailed      = "failed"
+	CheckUnavailable = "unavailable"
+	CheckNotRun      = "not_run"
+
+	CheckReasonNotRunnable = "command_not_runnable"
+	CheckReasonTimeout     = "timeout"
+	CheckReasonSandbox     = "sandbox_error"
+	CheckReasonLimit       = "limit"
+	CheckReasonNoChanges   = "no_changes"
+	CheckReasonTurnFailed  = "turn_failed"
+)
+
+// Bounds of the check of a run (FTR.HMR.CMN-0008 tech §2.1).
+const (
+	checkMaxCommand     = 2000
+	checkDefaultTimeout = 600
+	checkMinTimeout     = 10
+	checkMaxTimeout     = 1800
+	checkMaxRepairs     = 5
+)
+
+// RunCheck is the check block of a run.
+type RunCheck struct {
+	Command    string `json:"command"`
+	TimeoutSec int    `json:"timeoutSec,omitempty"`
+	MaxRepairs int    `json:"maxRepairs,omitempty"`
+}
+
+// Timeout is the time of one run of the command, in seconds.
+func (c RunCheck) Timeout() int {
+	if c.TimeoutSec == 0 {
+		return checkDefaultTimeout
+	}
+	return c.TimeoutSec
+}
+
+// CheckResult is the result of the check of a run.
+type CheckResult struct {
+	Status      string `json:"status"`
+	Reason      string `json:"reason,omitempty"`
+	Command     string `json:"command"`
+	Attempts    int    `json:"attempts"`
+	MaxAttempts int    `json:"maxAttempts"`
+	ExitCode    *int   `json:"exitCode,omitempty"`
+	OutputTail  string `json:"outputTail,omitempty"`
+	DurationMs  int64  `json:"durationMs"`
+}
+
+// validateCheck refuses a check block a run cannot perform (R13, tech §2.1).
+func validateCheck(c *RunCheck, workspace string) error {
+	if c == nil {
+		return nil
+	}
+	if workspace != WorkspaceNabu {
+		return apperr.Unprocessable("check_requires_workspace", "the agent has no sandbox of Nabu for a check").With("field", "check")
+	}
+	bad := func(field, msg string) error {
+		return apperr.Unprocessable("invalid_check", msg).With("field", "check."+field)
+	}
+	switch {
+	case strings.TrimSpace(c.Command) == "" || utf8.RuneCountInString(c.Command) > checkMaxCommand:
+		return bad("command", fmt.Sprintf("the command is 1–%d characters", checkMaxCommand))
+	case c.TimeoutSec != 0 && (c.TimeoutSec < checkMinTimeout || c.TimeoutSec > checkMaxTimeout):
+		return bad("timeoutSec", fmt.Sprintf("the timeout is %d–%d seconds", checkMinTimeout, checkMaxTimeout))
+	case c.MaxRepairs < 0 || c.MaxRepairs > checkMaxRepairs:
+		return bad("maxRepairs", fmt.Sprintf("repair rounds are 0–%d", checkMaxRepairs))
+	}
+	return nil
+}
+
+// SetRunOutcome stores the check and the stop reason of a run before it ends.
+func (s *Service) SetRunOutcome(ctx context.Context, id uuid.UUID, check *CheckResult, stopReason string) {
+	var b []byte
+	if check != nil {
+		b, _ = json.Marshal(check)
+	}
+	if _, err := s.Pool.Exec(context.WithoutCancel(ctx), `UPDATE runs SET check_result = $2, stop_reason = NULLIF($3,'') WHERE id = $1`, id, b, stopReason); err != nil {
+		slog.WarnContext(ctx, "the outcome of a run", "run", id, "err", err)
+	}
 }
