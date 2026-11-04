@@ -508,6 +508,7 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 	})
 
 	chatAPI := c.chatAPI
+	chatAPI.PreviewOffice = previews.Cfg.Enabled()
 	allowedModel := func(ctx context.Context, owner uuid.UUID, m groups.ModelChoice) bool {
 		avail, err := c.models.AvailableFor(ctx, owner)
 		if err != nil {
@@ -660,6 +661,7 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 		r.Route("/me", func(r chi.Router) {
 			r.Use(auth.Delegation(c.users, c.registry.Open))
 			chatAPI.Routes(r, false)
+			previews.Routes(r) // FTR.HMR.CMN-0007 R26
 			r.Get("/events", events.SSEHandler(hub))
 		})
 	})

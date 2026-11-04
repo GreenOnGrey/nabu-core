@@ -1053,4 +1053,12 @@ func TestChatAgentFiles(t *testing.T) {
 	if code, _ := get("/other"); code != http.StatusNotFound {
 		t.Fatalf("SEC-05: another user gets %d", code)
 	}
+
+	// FTR.HMR.CMN-0007 FL-05: a client learns from the agent whether office files have a preview
+	r.api.PreviewOffice = true
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/own/agent", nil))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"previewOffice":true`) {
+		t.Fatalf("FL-05: %d %s", w.Code, w.Body)
+	}
 }

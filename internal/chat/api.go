@@ -85,6 +85,9 @@ type API struct {
 	// QueueMax bounds the messages waiting in a conversation
 	// (FTR.NAB.CHAT-0004 R4: CHAT_QUEUE_MAX); 0 — no bound.
 	QueueMax int
+	// PreviewOffice: documents and spreadsheets open in the preview; a client
+	// learns it from GET /agent (FTR.HMR.CMN-0007 R26).
+	PreviewOffice bool
 }
 
 // staleTurn: an answer streaming for longer is not a running turn (R1).
@@ -327,6 +330,7 @@ type AgentView struct {
 	DefaultModel    *models.AvailableModel  `json:"defaultModel"`
 	Chosen          bool                    `json:"chosen"` // the user chose the model; false — the default
 	AvailableModels []models.AvailableModel `json:"availableModels"`
+	PreviewOffice   bool                    `json:"previewOffice"`
 	Context         ContextFill             `json:"context"`
 }
 
@@ -339,7 +343,7 @@ func (a *API) agentView(ctx context.Context, uid uuid.UUID) (*AgentView, error) 
 	if err != nil {
 		return nil, err
 	}
-	v := &AgentView{Name: ag.Name, Tone: ag.Tone, AvailableModels: avail}
+	v := &AgentView{Name: ag.Name, Tone: ag.Tone, AvailableModels: avail, PreviewOffice: a.PreviewOffice}
 	for i, m := range avail {
 		if ag.ConnectionID != nil && ag.Model != nil && m.ConnectionID == *ag.ConnectionID && m.Model == *ag.Model {
 			v.Model, v.Chosen = &avail[i], true

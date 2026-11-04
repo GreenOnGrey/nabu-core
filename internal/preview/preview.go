@@ -96,7 +96,7 @@ type source struct {
 	attachment     uuid.UUID // the row to store the hash of an old attachment
 }
 
-// Routes mounts GET /preview (under /api/v1, like the content of attachments).
+// Routes mounts GET /preview (under /api/v1 and /client/v1/me, like the content of attachments).
 func (s *Service) Routes(r chi.Router) {
 	r.Get("/preview", httpx.Handler(s.serve))
 }
