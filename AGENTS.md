@@ -12,7 +12,7 @@ Nabu is three repositories checked out side by side, next to Hammurapi:
 | `nabu-web` | React SPA |
 | `nabu` | Docs and the reusable deploy workflow `deploy-component.yml` |
 | `hammurapi-specs` | Source of truth: `specs/NAB/CMN/FTR.NAB.CMN-0001`, `FTR.NAB.CMN-0002` (channels and accounts), `FTR.NAB.CMN-0003` (memory of communications) and `FTR.HMR.CMN-0006` for Hammurapi |
-| `hammurapi-infra` | The stand: charts `nabu-core`/`nabu-web` and `bin/nabu-deploy` next to those of Hammurapi |
+| `installer` | The stand: charts `nabu-core`/`nabu-web` and `bin/nabu-deploy` next to those of Hammurapi |
 
 - Every change implements a feature specification from `hammurapi-specs/specs/NAB/<GROUP>/FTR.NAB.<GROUP>-NNNN/`.
   Read all five areas (product, design, arch, tech, qa) before coding. Test IDs (`MEM-02`, `RLY-04`,
@@ -88,7 +88,7 @@ at the pinned version. Name any job you could not run in your report, with the r
 - `Dockerfile`, `sandbox/**`, `go.mod`, `PI_VERSION`: build the changed targets and scan each with `trivy image --timeout 40m --severity CRITICAL,HIGH --ignore-unfixed --ignorefile .trivyignore.yaml <image>`.
   Then `bash sandbox/test.sh <base> <documents> <code>`. `ci.yml` scans the profile `code`; base, documents and the `release` image are scanned first at the release (`release.yml`).
 - `.github/**`, `deploy/versions.env`: `actionlint`, `deploy/sync-ref.sh --check`. `DEPLOY_WORKFLOW_REF` and `CHART_VERSION` name tags that are already published.
-- Client API, public routes or new variables: check the consumers too: tests of `hammurapi-core`, `nabu-web`, the charts and `tests/manifests.sh` of `hammurapi-infra`, the post-deploy checks of `nabu/.github/workflows/deploy-component.yml`.
+- Client API, public routes or new variables: check the consumers too: tests of `hammurapi-core`, `nabu-web`, the charts and `tests/manifests.sh` of `installer`, the post-deploy checks of `nabu/.github/workflows/deploy-component.yml`.
 - Always, after the checks pass: run the `code-review` skill on the diff to be committed. Fix each finding, or name it in your report with the reason it stays. Ask the user when you doubt a finding.
 
 ## Rules
@@ -105,7 +105,7 @@ at the pinned version. Name any job you could not run in your report, with the r
 - Every error returned to clients has a stable code (`apperr`); a new code needs a translation in
   `nabu-web/locales/*.json` (`errors.<code>`).
 - A new environment variable goes to `internal/config/config.go`, `nabu/docs/configuration.md` and,
-  if the stand needs it, the chart `hammurapi-infra/charts/nabu-core` and `hammurapi-infra/bin/nabu-deploy`.
+  if the stand needs it, the chart `installer/charts/nabu-core` and `installer/bin/nabu-deploy`.
 - The web source never names a client product (`nabu-web` tests it): a product channel is data — the
   name of its service client — not a literal in the interface.
 - A channel adapter knows nothing of conversations; messages of every channel pass the availability
@@ -122,6 +122,6 @@ at the pinned version. Name any job you could not run in your report, with the r
 
 A tag `vX.Y.Z` runs `release.yml`: image `ghcr.io/greenongrey/nabu-core` (with Pi), SBOM, cosign
 signature, Trivy, then the reusable `deploy-component.yml` of the `nabu` repo pinned by
-`DEPLOY_WORKFLOW_REF`; `CHART_VERSION` is the `hammurapi-infra` release whose charts are installed
-(as in hammurapi-core). When a change needs a new chart: tag `hammurapi-infra`; a new deploy
+`DEPLOY_WORKFLOW_REF`; `CHART_VERSION` is the `installer` release whose charts are installed
+(as in hammurapi-core). When a change needs a new chart: tag `installer`; a new deploy
 workflow: tag `nabu`; then bump `deploy/versions.env` here (`deploy/sync-ref.sh`) → tag core.
