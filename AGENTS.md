@@ -89,6 +89,7 @@ at the pinned version. Name any job you could not run in your report, with the r
   Then `bash sandbox/test.sh <base> <documents> <code>`. `ci.yml` scans the profile `code`; base, documents and the `release` image are scanned first at the release (`release.yml`).
 - `.github/**`, `deploy/versions.env`: `actionlint`, `deploy/sync-ref.sh --check`. `DEPLOY_WORKFLOW_REF` and `CHART_VERSION` name tags that are already published.
 - Client API, public routes or new variables: check the consumers too: tests of `hammurapi-core`, `nabu-web`, the charts and `tests/manifests.sh` of `hammurapi-infra`, the post-deploy checks of `nabu/.github/workflows/deploy-component.yml`.
+- Always, after the checks pass: run the `code-review` skill on the diff to be committed. Fix each finding, or name it in your report with the reason it stays. Ask the user when you doubt a finding.
 
 ## Rules
 
