@@ -21,6 +21,9 @@ func TestCORS(t *testing.T) {
 		if w.Header().Get("Access-Control-Allow-Credentials") != "true" || w.Code != http.StatusOK {
 			t.Fatalf("credentials or status: %v %d", w.Header(), w.Code)
 		}
+		if w.Header().Get("Access-Control-Expose-Headers") != "X-Preview-Pages" { // the pages of a preview, FTR.HMR.CMN-0007 R26
+			t.Fatalf("expose: %v", w.Header())
+		}
 	})
 
 	t.Run("preflight answered without auth", func(t *testing.T) {
