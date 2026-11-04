@@ -88,6 +88,13 @@ func TestEngineWithPi(t *testing.T) {
 		prompts = append(prompts, r.LastUser())
 		mu.Unlock()
 		last := r.LastUser()
+		// FTR.NAB.CMN-0010 STL-10: a model that repeats one call until it is told to stop.
+		if strings.Contains(last, "Stop: you have repeated") {
+			return &fakellm.Reply{Text: "Nothing is done: the search keeps finding nothing."}
+		}
+		if strings.Contains(last, "keep searching") {
+			return &fakellm.Reply{ToolCalls: []fakellm.ToolCall{{Name: toolNamed(r, "memory_search"), Args: map[string]any{"query": "no-such-words"}}}}
+		}
 		if strings.Contains(last, "remember") && r.ToolResults() == 0 {
 			if n := toolNamed(r, "memory_save"); n != "" {
 				return &fakellm.Reply{ToolCalls: []fakellm.ToolCall{{Name: n, Args: map[string]any{"text": "Prefers green tea"}}}}
@@ -141,7 +148,8 @@ func TestEngineWithPi(t *testing.T) {
 
 	svcSvc := &services.Service{Pool: pool, Models: ms, Signer: signer, Bus: b, Events: hub, Harnesses: []services.Harness{{Name: "pi"}}}
 	eng := &engine.Engine{
-		Cfg:  engine.Config{InternalURL: isrv.URL, TurnTimeout: 2 * time.Minute, TaskRunTimeout: 2 * time.Minute, SessionMaxAge: time.Hour},
+		Cfg: engine.Config{InternalURL: isrv.URL, TurnTimeout: 2 * time.Minute, TaskRunTimeout: 2 * time.Minute, SessionMaxAge: time.Hour,
+			StallDetector: true, StallRepeatLimit: 5, StallErrorLimit: 5, StallWrapupTimeout: 30 * time.Second},
 		Pool: pool, Op: &agent.Client{BaseURL: osrv.URL, Token: "svc"}, Users: repo(), Chat: store, Models: ms,
 		Catalog: &catalog.Service{Pool: pool, Box: box, Signer: signer, InternalURL: isrv.URL, S3: s3},
 		Memory:  memSvc, Tasks: taskSvc, Space: spaceSvc, Services: svcSvc, Ledger: &ledger.Ledger{Pool: pool},
@@ -250,6 +258,16 @@ func TestEngineWithPi(t *testing.T) {
 	h, _ := store.History(ctx, main.ID, 1)
 	if st != "succeeded" || h[0].Channel != "task:"+tk.ID.String() || !strings.Contains(h[0].Text, "say tea") {
 		t.Fatalf("task run %s, last message %+v", st, h[0])
+	}
+
+	// FTR.NAB.CMN-0010 STL-10, STL-13, STL-14: the detector stops the turn, the
+	// answer is not an error, has the wrap-up and the note, and the talk goes on.
+	stalled := turn("keep searching for it")
+	if stalled.Status != "done" || !strings.Contains(stalled.Text, "Nothing is done") || !strings.HasSuffix(stalled.Text, channels.T("en", "answer.stalled")) || len(stalled.ToolSteps) != 5 {
+		t.Fatalf("STL-13: %+v", stalled)
+	}
+	if next := turn("hello after the stop"); next.Status != "done" {
+		t.Fatalf("STL-14: %+v", next)
 	}
 
 	// 4. SVC-02, SVC-07: a client runs a service agent; the events and the result go to the client.

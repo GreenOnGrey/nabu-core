@@ -4,6 +4,9 @@
 # sandbox-documents and sandbox-code are the images of the built-in sandbox
 # profiles (FTR.NAB.CMN-0008, FTR.HMR.CMN-0007 R25).
 
+# Every stage that uses apt retries its downloads (80retries): one failure of a
+# mirror must not fail a release.
+
 # The Debian of sandboxes (FTR.NAB.CMN-0008 R4): a dated image and a fixed day
 # of the apt archive on snapshot.debian.org. The nabu-core build (the manifests
 # of profiles) and the build of the published sandbox images get the same
@@ -31,7 +34,8 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}"
 FROM ghcr.io/astral-sh/uv:0.9.5 AS uv
 
 FROM debian:trixie-slim AS sandbox-assets
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
+RUN echo 'Acquire::Retries "5";' >/etc/apt/apt.conf.d/80retries \
+ && apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
  && rm -rf /var/lib/apt/lists/*
 COPY sandbox/install-assets.sh sandbox/documents/assets.lock /tmp/
 RUN mkdir -p /out/opt/nabu && sh /tmp/install-assets.sh /tmp/assets.lock /out
@@ -47,6 +51,7 @@ RUN sed -i -e "s|^URIs: http://deb.debian.org/debian-security$|URIs: http://snap
       /etc/apt/sources.list.d/debian.sources \
  && grep -q "snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}" /etc/apt/sources.list.d/debian.sources \
  && echo 'Acquire::Check-Valid-Until "false";' >/etc/apt/apt.conf.d/99snapshot \
+ && echo 'Acquire::Retries "5";' >/etc/apt/apt.conf.d/80retries \
  && apt-get update && apt-get -y upgrade && apt-get install -y --no-install-recommends \
       bash ca-certificates tzdata git libstdc++6 \
       zip unzip xz-utils bzip2 jq ripgrep file tree patch less bc sqlite3 \
@@ -145,6 +150,7 @@ ARG VERSION=dev
 ARG PI_VERSION
 ARG PI_PACKAGE=@earendil-works/pi-coding-agent
 RUN test -n "$PI_VERSION" \
+ && echo 'Acquire::Retries "5";' >/etc/apt/apt.conf.d/80retries \
  && apt-get update && apt-get -y upgrade && apt-get install -y --no-install-recommends ca-certificates git \
  && npm install -g --no-audit --no-fund "${PI_PACKAGE}@${PI_VERSION}" \
  && npm cache clean --force && rm -rf /var/lib/apt/lists/* /root/.npm \

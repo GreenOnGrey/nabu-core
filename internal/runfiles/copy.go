@@ -147,6 +147,24 @@ var homePaths = map[string]bool{"go/pkg": true, "go/bin": true, "nabu": true}
 // Collect compares root with the manifest and writes the archive of changes
 // to w: changes.json first, then the added and modified files.
 func Collect(root string, m Manifest, w io.Writer) (*Changes, error) {
+	out, files, err := diff(root, m)
+	if err != nil {
+		return nil, err
+	}
+	return out, write(root, out, files, w)
+}
+
+// HasChanges tells whether Collect would find changes (FTR.HMR.CMN-0008 R7).
+func HasChanges(root string, m Manifest) (bool, error) {
+	out, _, err := diff(root, m)
+	if err != nil {
+		return false, err
+	}
+	return len(out.Changes) > 0, nil
+}
+
+// diff compares root with the manifest.
+func diff(root string, m Manifest) (*Changes, []string, error) {
 	out := &Changes{Changes: []Change{}, Skipped: []Skipped{}}
 	for _, e := range m {
 		out.Base.Files++
@@ -207,7 +225,7 @@ func Collect(root string, m Manifest, w io.Writer) (*Changes, error) {
 		return nil
 	}
 	if err := walk("", false); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	for p := range m {
 		if !seen[p] {
@@ -215,7 +233,7 @@ func Collect(root string, m Manifest, w io.Writer) (*Changes, error) {
 		}
 	}
 	sort.Slice(out.Changes, func(i, j int) bool { return out.Changes[i].Path < out.Changes[j].Path })
-	return out, write(root, out, files, w)
+	return out, files, nil
 }
 
 func compare(root, rel string, info fs.FileInfo, m Manifest) (*Change, *Skipped, error) {

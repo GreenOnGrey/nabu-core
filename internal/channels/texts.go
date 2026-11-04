@@ -48,6 +48,7 @@ var texts = map[string]map[string]string{
 		"cmd.not_running":    "I am not writing anything now.",
 		"cmd.stop_forbidden": "Only the one it is addressed to can stop the answer.",
 		"answer.stopped":     "(stopped)",
+		"answer.stalled":     "The agent was stopped: it kept repeating the same action with no result.",
 		"cmd.stop_failed":    "The answer could not be stopped, try again.",
 	},
 	"ru": {
@@ -85,6 +86,7 @@ var texts = map[string]map[string]string{
 		"cmd.not_running":       "Сейчас я ничего не пишу.",
 		"cmd.stop_forbidden":    "Остановить ответ может только тот, кому он адресован.",
 		"answer.stopped":        "(остановлено)",
+		"answer.stalled":        "Агент остановлен: он повторял одно и то же действие без результата.",
 		"cmd.stop_failed":       "Не удалось остановить ответ, попробуйте ещё раз.",
 	},
 }

@@ -35,6 +35,10 @@ var (
 	SubagentRejected = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nabu_subagent_rejected_total", Help: "Refused calls of subagents by reason (turn_limit, call_limit, no_slot, disabled).",
 	}, []string{"reason"})
+	// FTR.NAB.CMN-0010 R9.
+	AgentStalls = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_agent_stalls_total", Help: "Turns stopped by the stall detector by session kind and reason (repeated_call, tool_errors).",
+	}, []string{"kind", "reason"})
 	LLMRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nabu_llm_requests_total", Help: "Agent runs (prompts) by connection, model and kind.",
 	}, []string{"connection", "model", "kind"})
@@ -170,7 +174,7 @@ func init() {
 
 func init() {
 	Registry.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-		HTTPRequests, HTTPDuration, KafkaLag, AgentSessions, AgentProcessStarts, SubagentRuns, SubagentDuration, SubagentRejected, LLMRequests, LLMErrors, LLMTokens, LLMCost,
+		HTTPRequests, HTTPDuration, KafkaLag, AgentSessions, AgentProcessStarts, SubagentRuns, SubagentDuration, SubagentRejected, AgentStalls, LLMRequests, LLMErrors, LLMTokens, LLMCost,
 		Turns, WorkspaceConnections, WorkspaceCalls, Sandboxes, TaskRuns, ServiceRuns, ChannelMessages,
 		ChannelInbound, ChannelOutbound, EmailAuthRejected, IMAPConnected, VKTeamsPollLag, PendingConfirmations, Users, PurgeDeleted,
 		MemoryMaskedSecrets, MemoryDeniedTools, MemoryDigests, MemorySearch, MemoryCollect, MemoryCollectSeconds, MemoryEmbedPending)

@@ -178,3 +178,11 @@ func TestNotConnected(t *testing.T) {
 		t.Fatalf("%d %s", r.StatusCode, body)
 	}
 }
+
+// FTR.HMR.CMN-0007 tech §2.3: the engine collects the changes of a run through
+// the relay, so the operation has to be allowed on both ends.
+func TestOpsAllowChanges(t *testing.T) {
+	if !Ops["workspace/changes"] {
+		t.Fatal("workspace/changes is not an operation of the relay")
+	}
+}
