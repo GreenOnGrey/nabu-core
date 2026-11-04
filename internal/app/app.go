@@ -753,7 +753,9 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 	eng := &engine.Engine{
 		Cfg: engine.Config{InternalURL: cfg.InternalURL, RelayInternalURL: cfg.RelayInternalURL, TurnTimeout: cfg.TurnTimeout,
 			TaskRunTimeout: cfg.TaskRunTimeout, RunChangesTimeout: cfg.RunChangesTimeout, SessionMaxAge: 12 * time.Hour, PiVersion: cfg.PiVersion,
-			Subagents: subagentLimits(cfg)},
+			Subagents:     subagentLimits(cfg),
+			StallDetector: cfg.StallDetectorEnabled, StallRepeatLimit: cfg.StallRepeatLimit, StallErrorLimit: cfg.StallErrorLimit,
+			StallWrapupTimeout: cfg.StallWrapupTimeout},
 		Pool: c.pool, Op: c.operator, Users: c.users, Chat: c.chat, Models: c.models, Catalog: c.catalog, Memory: c.memory, Tasks: c.tasks, Comm: c.comm,
 		Space: c.space, Sandboxes: sandboxes, Services: c.services, Ledger: c.ledger, Signer: c.signer, S3: c.s3, Events: c.events,
 		Bus: c.producer, Adapters: adapters, Registry: c.registry, Keys: c.keys, Groups: c.groups, Mail: c.mail,

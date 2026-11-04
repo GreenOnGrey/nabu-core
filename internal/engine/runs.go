@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -201,11 +202,17 @@ func (e *Engine) taskTurn(ctx context.Context, lease *agentpods.Lease, ri *tasks
 		audit: ledger.Entry{AgentKind: "personal", Agent: b.persona.Agent.Name, UserID: &user.ID, Channel: "task:" + ri.TaskID.String()}}
 	connID, _ := uuid.Parse(b.model.ConnectionID)
 	col.usage = ledger.UsageRow{UserID: &user.ID, Model: b.model.ModelID, ConnectionID: &connID}
+	e.watchStall(col, "task")
+	col.abort = func() { _ = op.Abort(context.WithoutCancel(ctx), resp.SessionID) }
 	prompt := channelRules(ri.Channel, time.Now(), user.Timezone) + "\n" +
 		"[This is a run of the scheduled task «" + ri.Title + "», not a live chat: the user is not here to answer questions. " +
 		"Do the work with your tools and reply with the final result for the user only — it will be delivered to the main conversation" +
 		deliveryNote(ri.Channel) + ".]\n\nTask instruction: " + ri.Instruction
 	err = op.Prompt(ctx, resp.SessionID, agent.PromptRequest{Text: prompt, Deadline: deadline(ctx)}, col.handle)
+	if col.stalled != "" && err == nil && col.failure == nil { // FTR.NAB.CMN-0010 R4, R5
+		e.finishStalled(ctx, op, resp.SessionID, col)
+		stallNote(col, user.Language)
+	}
 	if col.failure != nil {
 		return "", string(col.failure.ErrorClass), col.failure.Message, false
 	}
@@ -322,15 +329,17 @@ func (e *Engine) serviceTurn(ctx context.Context, runID uuid.UUID, ag *services.
 		req.Secrets.MCPHeaders[c.Name] = c.Headers
 	}
 	req.Skills = e.sessionSkills(ctx, cat)
+	wsID, hasCopy := "", false // FTR.HMR.CMN-0008 R6, R7: the check runs in the sandbox of the run
 	switch ag.Workspace {
 	case services.WorkspaceNabu:
 		if e.Sandboxes == nil || e.Sandboxes.K8s == nil {
 			return "", "workspace_not_connected", "temporary sandboxes are not enabled in this deployment", total, false
 		}
-		wsID := services.WorkspaceID(runID)
+		wsID = services.WorkspaceID(runID)
 		// FTR.HMR.CMN-0007 R5, R17: the working copy of the caller and the
 		// proxies of the agent.
 		files := e.runHasFiles(ctx, runID)
+		hasCopy = files
 		rs, err := e.Sandboxes.StartEphemeral(ctx, wsID, runID.String(), ag.WorkspaceProfile,
 			space.Ephemeral{Files: files, Proxies: ag.Proxies, TokenTTL: time.Duration(ag.Limits.TimeoutSec)*time.Second + 10*time.Minute})
 		if err != nil {
@@ -363,6 +372,8 @@ func (e *Engine) serviceTurn(ctx context.Context, runID uuid.UUID, ag *services.
 		audit: ledger.Entry{AgentKind: "service", Agent: ag.Name, ClientID: &cid, InitiatorEmail: initiator, Channel: "client:" + clientName}}
 	connID, _ := uuid.Parse(model.ConnectionID)
 	col.usage = ledger.UsageRow{RunID: &runID, ClientID: &cid, Agent: ag.Name, Model: model.ModelID, ConnectionID: &connID}
+	e.watchStall(col, "service")
+	col.abort = func() { _ = e.Op.Abort(context.WithoutCancel(ctx), resp.SessionID) }
 	limitHit := false
 	col.onEvent = func(ev agent.Event) {
 		switch ev.Type {
@@ -383,7 +394,10 @@ func (e *Engine) serviceTurn(ctx context.Context, runID uuid.UUID, ag *services.
 			}
 		}
 	}
-	// A cancellation by the client aborts the run.
+	// A cancellation by the client aborts the run and its check.
+	checkCtx, cancelCheck := context.WithCancel(ctx)
+	defer cancelCheck()
+	var clientCancelled atomic.Bool
 	stop := make(chan struct{})
 	defer close(stop)
 	go func() {
@@ -397,7 +411,8 @@ func (e *Engine) serviceTurn(ctx context.Context, runID uuid.UUID, ag *services.
 				var st string
 				_ = e.Pool.QueryRow(ctx, `SELECT status FROM runs WHERE id = $1`, runID).Scan(&st)
 				if st == "cancelled" {
-					cancelled = true
+					clientCancelled.Store(true)
+					cancelCheck()
 					_ = e.Op.Abort(context.WithoutCancel(ctx), resp.SessionID)
 					return
 				}
@@ -418,8 +433,23 @@ func (e *Engine) serviceTurn(ctx context.Context, runID uuid.UUID, ag *services.
 		}
 		return ""
 	}())
+	// FTR.HMR.CMN-0008 R6, R9, R20; FTR.NAB.CMN-0010 R4, R6: after a first turn
+	// that ended well the work is not lost, whatever happens later.
+	if finishedTurn := err == nil && col.failure == nil && !limitHit && !clientCancelled.Load() && ctx.Err() == nil; finishedTurn && (col.stalled != "" || in.Check != nil) {
+		e.afterServiceTurn(checkCtx, runID, wsID, hasCopy, resp.SessionID, in.Check, col, model.ConnectionID, secrets, &limitHit)
+		summary, total = strings.TrimSpace(col.text.String()), col.total
+		if clientCancelled.Load() {
+			return summary, "", "", total, true
+		}
+		return summary, "", "", total, false
+	}
+	if in.Check != nil {
+		e.Services.SetRunOutcome(ctx, runID, &services.CheckResult{Status: services.CheckNotRun, Reason: services.CheckReasonTurnFailed,
+			Command: in.Check.Command, MaxAttempts: in.Check.MaxRepairs + 1}, "")
+	}
 	summary = strings.TrimSpace(col.text.String())
 	total = col.total
+	cancelled = clientCancelled.Load()
 	switch {
 	case cancelled:
 		return summary, "", "", total, true
@@ -434,6 +464,61 @@ func (e *Engine) serviceTurn(ctx context.Context, runID uuid.UUID, ag *services.
 		return summary, operatorClass(err), operatorText(err), total, false
 	}
 	return summary, "", "", total, false
+}
+
+// afterServiceTurn finishes a run whose first turn ended well: the wrap-up of
+// a stalled turn and the readiness check with its repair rounds.
+func (e *Engine) afterServiceTurn(ctx context.Context, runID uuid.UUID, wsID string, hasCopy bool, sessionID string, spec *services.RunCheck,
+	col *collector, connectionID string, secrets []string, limitHit *bool) {
+	stopReason := ""
+	wrapup := func() {
+		stopReason = services.StopStalled
+		e.Services.AppendEvent(ctx, runID, "stalled", map[string]string{"reason": col.stalled, "tool": col.stalledTool})
+		e.finishStalled(ctx, e.Op, sessionID, col)
+	}
+	maxRepairs := 0
+	if col.stalled != "" {
+		wrapup()
+	} else if spec != nil {
+		maxRepairs = spec.MaxRepairs
+	}
+	var result *services.CheckResult
+	if spec != nil && ctx.Err() == nil {
+		r := checkRunner{
+			exec: func(ctx context.Context, command string, t int) (checkExec, error) {
+				return e.sandboxExec(ctx, wsID, command, t)
+			},
+			event: func(typ string, data any) { e.Services.AppendEvent(ctx, runID, typ, data) },
+			mask:  maskSecrets(secrets),
+			repair: func(ctx context.Context, prompt string) repairOutcome {
+				if col.stall != nil {
+					col.stall.reset()
+				}
+				err := e.Op.Prompt(ctx, sessionID, agent.PromptRequest{Text: prompt, Deadline: deadline(ctx)}, col.handle)
+				var class agent.ErrorClass
+				if col.failure != nil {
+					class = col.failure.ErrorClass
+				}
+				e.Models.RecordResult(ctx, connectionID, class)
+				switch {
+				case col.stalled != "" && err == nil && col.failure == nil && !*limitHit && ctx.Err() == nil:
+					wrapup()
+					return repairLastCheck
+				case err != nil || col.failure != nil || *limitHit || ctx.Err() != nil:
+					col.failure = nil
+					return repairStopped
+				}
+				return repairDone
+			},
+		}
+		if hasCopy {
+			r.changed = func(ctx context.Context) (bool, error) { return e.sandboxChanged(ctx, wsID) }
+		}
+		res := r.run(ctx, *spec, maxRepairs)
+		slog.InfoContext(ctx, "the check of a run", append([]any{"run", runID}, checkResultLog(res)...)...)
+		result = &res
+	}
+	e.Services.SetRunOutcome(ctx, runID, result, stopReason)
 }
 
 // dropRunFiles removes the files a run collected (FTR.NAB.CHAT-0001 R33): the

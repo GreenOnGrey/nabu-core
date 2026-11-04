@@ -59,7 +59,7 @@ var Ops = map[string]bool{
 	"fs/read": true, "fs/access": true, "fs/stat": true, "fs/readdir": true, "fs/write": true,
 	"fs/mkdir": true, "fs/glob": true, "grep": true, "exec": true, "abort": true,
 	// FTR.HMR.CMN-0007 tech §2.3: the changes of a run.
-	"workspace/changes": true,
+	"workspace/changes": true, "workspace/changed": true, // FTR.HMR.CMN-0008 R7
 }
 
 // Streaming reports operations whose interruption is not retried: their

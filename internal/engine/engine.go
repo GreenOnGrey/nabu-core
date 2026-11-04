@@ -61,6 +61,10 @@ type Config struct {
 	// Subagents are the limits of the subagents of the sessions of agents
 	// (FTR.NAB.CMN-0009 R6, R10); nil — SUBAGENTS_ENABLED=false.
 	Subagents *agent.SubagentLimits
+	// The stall detector of the turns (FTR.NAB.CMN-0010 R2, R4, R8).
+	StallDetector                     bool
+	StallRepeatLimit, StallErrorLimit int
+	StallWrapupTimeout                time.Duration
 }
 
 // Engine runs agents.
@@ -349,6 +353,14 @@ type collector struct {
 	onEvent                      func(agent.Event)
 	// first is called once, with the first piece of the answer.
 	first func()
+	// FTR.NAB.CMN-0010: the stall detector of the turn. abort stops the running
+	// prompt; stalled is the reason once it fired; wrapup marks the final
+	// request, where any tool call ends the turn (R4).
+	stall                *stallDetector
+	stallKind            string
+	stalled, stalledTool string
+	wrapup               bool
+	abort                func()
 }
 
 func stepTitle(server, tool string) string {
@@ -387,6 +399,9 @@ func (c *collector) handle(ev agent.Event) {
 			c.flush()
 		}
 	case agent.EventToolCall:
+		if c.wrapup {
+			c.abortTurn()
+		}
 		c.flush()
 		server, tool := ledger.SplitTool(ev.Name)
 		if c.args == nil {
@@ -424,6 +439,7 @@ func (c *collector) handle(ev agent.Event) {
 			a.Server = &server
 		}
 		c.e.Ledger.Audit(c.ctx, a, c.args[ev.ID], c.secrets) // AUD-01
+		c.observeStall(ev)
 	case agent.EventUsage:
 		c.total.Add(ev.Usage)
 		u := c.usage
@@ -437,6 +453,9 @@ func (c *collector) handle(ev agent.Event) {
 			c.handle(agent.Event{Type: agent.EventUsage, Usage: ev.Usage})
 		}
 	case agent.EventError:
+		if c.stalled != "" { // FTR.NAB.CMN-0010 R4: the abort of the detector during a request to the model
+			return
+		}
 		ev := ev
 		c.failure = &ev
 	case agent.EventCompaction:
@@ -906,6 +925,11 @@ func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked
 	if seg != nil {
 		col.onEvent = seg.event
 	}
+	if b.group != nil {
+		e.watchStall(col, "group")
+	} else {
+		e.watchStall(col, "personal")
+	}
 	op := lease.Operator()
 	stop := e.watchStop(ctx, op, msgID)
 	defer stop.end()
@@ -960,6 +984,8 @@ func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked
 			break // stopped before the answer began
 		}
 		stop.session(sess.OpSession)
+		openSession := sess.OpSession
+		col.abort = func() { _ = op.Abort(context.WithoutCancel(ctx), openSession) }
 		err = op.Prompt(stop.ctx, sess.OpSession, agent.PromptRequest{Text: prompt, Images: images, Deadline: deadline(ctx)}, col.handle)
 		if errors.Is(err, agent.ErrSessionGone) || errors.Is(err, agent.ErrStreamBroken) {
 			_, _ = e.Pool.Exec(ctx, `UPDATE harness_sessions SET closed_at = now() WHERE id = $1`, sess.ID)
@@ -968,6 +994,12 @@ func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked
 			}
 		}
 		break
+	}
+	if col.stalled != "" && err == nil && col.failure == nil && sess != nil && !stop.stopped.Load() { // FTR.NAB.CMN-0010 R4, R5
+		e.finishStalled(stop.ctx, op, sess.OpSession, col)
+		if !stop.stopped.Load() {
+			stallNote(col, u.Language)
+		}
 	}
 	col.flush()
 	if sess != nil {
