@@ -9,7 +9,8 @@ tmp=$(mktemp -d)
 grep -v '^#' "$lock" | while IFS="$(printf '\t')" read -r name version sha url members dest; do
   [ -n "$name" ] || continue
   file="$tmp/$name.archive"
-  curl -fsSL --retry 3 -o "$file" "$url"
+  # A release host answers 504 for a minute at times: a few seconds of retries do not outlast it.
+  curl -fsSL --retry 6 --retry-delay 15 -o "$file" "$url" || { echo "failed to download $name: $url" >&2; exit 1; }
   echo "$sha  $file" | sha256sum -c -
   out="$tmp/$name"
   mkdir -p "$out" "$root$dest"
