@@ -21,7 +21,7 @@ Nabu is three repositories checked out side by side, next to Hammurapi:
 - When the implementation deviates from a spec, write the deviation into the spec (version bump,
   "Принятые решения") in the same piece of work.
 - Do not commit, tag or push unless asked: the maintainer reviews and releases by tags.
-- English for code, comments, docs, CI, scripts, logs, test names, and the messages and tool descriptions that services return. Russian stays in test data that exercises Russian text and the specifications in `hammurapi-specs`. Other Russian here is a leftover to translate.
+- English for code, comments, docs, CI, scripts, logs, test names, and the messages and tool descriptions that services return. Russian stays in test data that exercises Russian text and the specifications in `hammurapi-specs`. Russian also stays where it is behaviour: code that reads or writes Russian text, and the Russian branch of messages.
 
 ## Stack and layout
 
