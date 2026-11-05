@@ -1,4 +1,4 @@
-# Проверки на каждый PR: линтер, тесты, синхронизация DEPLOY_WORKFLOW_REF, actionlint.
+# Checks on every PR: the linter, tests, the sync of DEPLOY_WORKFLOW_REF, actionlint.
 name: ci
 on:
   pull_request:
@@ -23,9 +23,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with: { go-version-file: go.mod }
-      - name: Юнит-тесты
+      - name: Unit tests
         run: go test ./...
-      - name: Интеграционные тесты (Postgres через dockertest)
+      - name: Integration tests (Postgres through dockertest)
         run: go test -tags integration -count=1 ./internal/itest/...
 
   # Contract tests against a real Pi of PI_VERSION (FTR.NAB.CMN-0001 qa §1, level K):
@@ -39,12 +39,12 @@ jobs:
         with: { go-version-file: go.mod }
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with: { node-version: "24" }
-      - name: Pi из deploy/versions.env
+      - name: Pi from deploy/versions.env
         run: |
           v=$(sed -n 's/^PI_VERSION=//p' deploy/versions.env)
           npm install -g --no-audit --no-fund "@earendil-works/pi-coding-agent@$v"
           pi --version
-      - name: Контрактные тесты
+      - name: Contract tests
         env: { PIRPC_PI_CMD: pi, NABU_PI_CMD: pi }
         run: |
           go test -count=1 ./pkg/pirpc/ ./internal/platform/agent/... ./internal/relay/ ./internal/workspace/
@@ -59,9 +59,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      # Кэш слоёв: без изменений в Dockerfile CI не обращается к snapshot.debian.org, который
-      # бывает недоступен (503); кэш пишется после каждого профиля, перезапуск продолжает с него.
-      - name: Сборка профиля base
+      # The layer cache: without changes in the Dockerfile, CI does not go to snapshot.debian.org, which
+      # is unavailable at times (503); the cache is written after each profile, and a rerun goes on from the point of failure.
+      - name: Build the profile base
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -74,7 +74,7 @@ jobs:
             type=gha,scope=sandbox-documents
             type=gha,scope=sandbox-code
           cache-to: type=gha,mode=max,scope=sandbox-base
-      - name: Сборка профиля documents
+      - name: Build the profile documents
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -87,7 +87,7 @@ jobs:
             type=gha,scope=sandbox-documents
             type=gha,scope=sandbox-code
           cache-to: type=gha,mode=max,scope=sandbox-documents
-      - name: Сборка профиля code
+      - name: Build the profile code
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -100,9 +100,9 @@ jobs:
             type=gha,scope=sandbox-documents
             type=gha,scope=sandbox-code
           cache-to: type=gha,mode=max,scope=sandbox-code
-      - name: Проверки профилей
+      - name: Checks of the profiles
         run: bash sandbox/test.sh nabu-sandbox-base:ci nabu-sandbox-documents:ci nabu-sandbox-code:ci
-      - name: CRITICAL и HIGH с исправлением в профиле code
+      - name: CRITICAL and HIGH with a fix in the profile code
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: nabu-sandbox-code:ci
@@ -118,7 +118,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: DEPLOY_WORKFLOW_REF совпадает с uses в release.yml
+      - name: DEPLOY_WORKFLOW_REF matches uses in release.yml
         run: bash deploy/sync-ref.sh --check
       - name: actionlint
         run: |

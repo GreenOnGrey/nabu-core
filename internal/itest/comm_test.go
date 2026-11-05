@@ -323,7 +323,7 @@ func TestCommTagsAndGraph(t *testing.T) {
 		t.Fatalf("search by a part of a word: %+v", l)
 	}
 
-	// VIEW-04: the nodes and the edges of the «Релиз» notes.
+	// VIEW-04: the nodes and the edges of the notes on the topic Релиз.
 	g, err := s.Graph(ctx, u, comm.Filter{Topic: &release}, 0, 150)
 	if err != nil {
 		t.Fatal(err)
@@ -756,7 +756,7 @@ func TestMemoryTasks(t *testing.T) {
 	if *back.TaskID != *week.TaskID || back.Status != "active" || back.Schedule.Cron != "0 10 * * 5" {
 		t.Fatalf("switched on again: %+v", back)
 	}
-	// «Отменить» in the Tasks section switches a memory task off.
+	// "Cancel" in the Tasks section switches a memory task off.
 	if c, err := ts.Cancel(ctx, uid, *back.TaskID); err != nil || c.Status != "cancelled" {
 		t.Fatalf("%+v %v", c, err)
 	}

@@ -14,7 +14,7 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/users"
 )
 
-// Collector performs a run of «Сбор коммуникаций» (FTR.NAB.CMN-0003 arch
+// Collector performs a run of "Collecting communications" (FTR.NAB.CMN-0003 arch
 // §3.1): it finds what changed in the sources of the user and starts the
 // runs of the collector agent. It finishes the run of the task itself.
 type Collector interface {

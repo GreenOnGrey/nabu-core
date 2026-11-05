@@ -107,7 +107,7 @@ type Access interface {
 }
 
 // granted returns the items of the user's access; nil — every item (no
-// access control). uuid.Nil is the access of «Все пользователи» alone.
+// access control). uuid.Nil is the access of "All users" alone.
 func (s *Service) granted(ctx context.Context, uid uuid.UUID) (map[uuid.UUID]bool, error) {
 	if s.Access == nil {
 		return nil, nil
@@ -765,7 +765,7 @@ const givesTool = `CASE WHEN c.allowed_tools IS NOT NULL THEN c.allowed_tools ? 
 // tokens carry no user: platform credentials only.
 func (s *Service) ForGroup(ctx context.Context, groupID uuid.UUID, skills []string, conv string, ttl time.Duration, owner uuid.UUID) (*SessionMCP, error) {
 	// FTR.NAB.CMN-0007 R12: a group agent has the access of its owner;
-	// without an owner (uuid.Nil) — that of «Все пользователи»
+	// without an owner (uuid.Nil): that of "All users"
 	g, err := s.granted(ctx, owner)
 	if err != nil {
 		return nil, err

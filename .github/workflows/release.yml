@@ -1,21 +1,21 @@
-# Релиз nabu-core (FTR.NAB.CMN-0001 arch §11, по образцу FTR.HMR.INFRA-0002):
-#   push тега vX.Y.Z  →  lint ∥ test → build → scan ∥ sandbox-images → deploy (+ проверки после выкатки)
-#   ручной запуск     →  выкатка уже собранного и подписанного образа тега, без
-#                        пересборки; с run_id и callback_url — запуск по
-#                        контракту выкатки FTR.HMR.CMN-0002.
-# Переменная репозитория или организации AUTO_DEPLOY=false выключает выкатку по
-# тегу (сборка, сканирование и публикация продолжаются).
+# Release of nabu-core (FTR.NAB.CMN-0001 arch §11, modelled on FTR.HMR.INFRA-0002):
+#   push of a tag vX.Y.Z  →  lint ∥ test → build → scan ∥ sandbox-images → deploy (+ checks after the rollout)
+#   manual run            →  a rollout of the already built and signed image of the tag, without
+#                            a rebuild; with run_id and callback_url, a run under
+#                            the rollout contract of FTR.HMR.CMN-0002.
+# The repository or organization variable AUTO_DEPLOY=false turns off the rollout on
+# a tag (the build, the scan and the publishing go on).
 name: release
 on:
   push:
     tags: ["v*.*.*"]
   workflow_dispatch:
     inputs:
-      ref: { description: "Тег (vX.Y.Z)", required: true, type: string }
-      service: { description: "Контракт: nabu-core", required: false, type: string }
-      environment: { description: "Контракт: окружение", required: false, default: production, type: string }
-      run_id: { description: "Контракт: run_id Hammurapi", required: false, type: string }
-      callback_url: { description: "Контракт: адрес вебхука результата", required: false, type: string }
+      ref: { description: "Tag (vX.Y.Z)", required: true, type: string }
+      service: { description: "Contract: nabu-core", required: false, type: string }
+      environment: { description: "Contract: environment", required: false, default: production, type: string }
+      run_id: { description: "Contract: run_id of Hammurapi", required: false, type: string }
+      callback_url: { description: "Contract: address of the result webhook", required: false, type: string }
 permissions: { contents: read }
 
 jobs:
@@ -35,14 +35,14 @@ jobs:
           EVENT: ${{ github.event_name }}
         run: |
           tag=${INPUT_REF:-$GITHUB_REF_NAME}
-          [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::тег «$tag» не в формате vX.Y.Z"; exit 1; }
+          [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::tag '$tag' is not in the format vX.Y.Z"; exit 1; }
           if [[ -n $INPUT_SERVICE && $INPUT_SERVICE != "${GITHUB_REPOSITORY#*/}" ]]; then
-            echo "::error::service=$INPUT_SERVICE, а это ${GITHUB_REPOSITORY#*/}"; exit 1
+            echo "::error::service=$INPUT_SERVICE, while this is ${GITHUB_REPOSITORY#*/}"; exit 1
           fi
           {
             echo "tag=$tag"
             echo "image=ghcr.io/${GITHUB_REPOSITORY,,}"
-            # Образ собирается только по push тега; ручной запуск выкатывает готовый.
+            # The image is built only on a push of a tag; a manual run rolls out a ready one.
             echo "rebuild=$([[ $EVENT == push ]] && echo true || echo false)"
             echo "pi_version=$(sed -n 's/^PI_VERSION=//p' deploy/versions.env)"
           } >>"$GITHUB_OUTPUT"
@@ -97,7 +97,7 @@ jobs:
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-      - name: Подпись образа (cosign, без ключа, OIDC GitHub)
+      - name: Sign the image (cosign, keyless, GitHub OIDC)
         env: { REF: "${{ needs.meta.outputs.image }}@${{ steps.push.outputs.digest }}" }
         run: cosign sign --yes "$REF"
 
@@ -119,7 +119,7 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
-      - name: Проверки профилей до публикации
+      - name: Checks of the profiles before publishing
         run: |
           docker buildx build --load --target sandbox-base --build-arg VERSION=${{ needs.meta.outputs.tag }} -t nabu-sandbox-base:check .
           docker buildx build --load --target sandbox-documents --build-arg VERSION=${{ needs.meta.outputs.tag }} -t nabu-sandbox-documents:check .
@@ -137,12 +137,12 @@ jobs:
           build-args: VERSION=${{ needs.meta.outputs.tag }}
           labels: org.opencontainers.image.revision=${{ github.sha }}
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-      - name: Подпись образа (cosign, без ключа, OIDC GitHub)
+      - name: Sign the image (cosign, keyless, GitHub OIDC)
         env: { REF: "${{ env.IMAGE }}@${{ steps.push.outputs.digest }}" }
         run: cosign sign --yes "$REF"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { persist-credentials: false, sparse-checkout: .trivyignore.yaml, sparse-checkout-cone-mode: false, path: ignore }
-      - name: CRITICAL и HIGH с исправлением блокируют выкатку
+      - name: CRITICAL and HIGH with a fix block the rollout
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: "${{ env.IMAGE }}@${{ steps.push.outputs.digest }}"
@@ -162,16 +162,16 @@ jobs:
       TRIVY_USERNAME: ${{ github.actor }}
       TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Отчёт в Code scanning (все уязвимости)
+      - name: Report to Code scanning (all vulnerabilities)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with: { image-ref: "${{ env.REF }}", format: sarif, output: trivy.sarif, version: v0.74.0, exit-code: "0" }
       - uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         if: always()
         with: { sarif_file: trivy.sarif, category: trivy-image }
-      # Принятые находки с причиной и сроком — .trivyignore.yaml (только для блокирующей проверки).
+      # Accepted findings with a reason and a deadline are in .trivyignore.yaml (only for the blocking check).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { persist-credentials: false, sparse-checkout: .trivyignore.yaml, sparse-checkout-cone-mode: false }
-      - name: CRITICAL и HIGH с исправлением блокируют выкатку
+      - name: CRITICAL and HIGH with a fix block the rollout
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: "${{ env.REF }}"
@@ -188,14 +188,14 @@ jobs:
     runs-on: ubuntu-24.04
     permissions: { contents: write }
     steps:
-      - name: Версии nabu-core и агента в описании релиза
+      - name: Versions of nabu-core and the agent in the release description
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.meta.outputs.tag }}
           NOTES: |
-            Образ: `${{ needs.meta.outputs.image }}:${{ needs.meta.outputs.tag }}` (`${{ needs.build.outputs.digest }}`), подписан cosign.
+            Image: `${{ needs.meta.outputs.image }}:${{ needs.meta.outputs.tag }}` (`${{ needs.build.outputs.digest }}`), signed with cosign.
             nabu-core: ${{ needs.meta.outputs.tag }}
-            Агент: Pi (@earendil-works/pi-coding-agent) ${{ needs.meta.outputs.pi_version }}
+            Agent: Pi (@earendil-works/pi-coding-agent) ${{ needs.meta.outputs.pi_version }}
         run: |
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --notes "$NOTES"

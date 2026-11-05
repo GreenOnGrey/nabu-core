@@ -202,7 +202,7 @@ func loadResources(ctx context.Context, q Querier) (*resources, error) {
 }
 
 // Effective computes the access of a user (arch §3.2). uuid.Nil is nobody in
-// particular: the access of «Все пользователи» alone — a group agent without
+// particular: the access of "All users" alone — a group agent without
 // an owner gets it (R12). A blocked user has no access, an administrator
 // included.
 func (s *Service) Effective(ctx context.Context, uid uuid.UUID) (*Access, error) {
@@ -399,7 +399,7 @@ func defaultModel(ctx context.Context, q Querier, uid uuid.UUID, a *Access, grou
 
 // ItemGranted reports whether the item is in the access of the user, without
 // computing the rest (the proxy of MCP asks on every call: R10). As in
-// Effective, uuid.Nil asks for «Все пользователи» alone and a blocked or
+// Effective, uuid.Nil asks for "All users" alone and a blocked or
 // unknown user has nothing.
 func (s *Service) ItemGranted(ctx context.Context, uid, item uuid.UUID) bool {
 	var ok bool

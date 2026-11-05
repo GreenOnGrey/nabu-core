@@ -82,7 +82,7 @@ type Engine struct {
 	Memory  *memory.Service
 	Tasks   *tasks.Service
 	// FTR.NAB.CMN-0003: the memory of communications — the store the digests
-	// read and the collector of «Сбор коммуникаций»; nil switches them off.
+	// read and the collector of "Collecting communications"; nil switches them off.
 	Comm      *comm.Service
 	Collector Collector
 	// MemoryOp is the pool of the collector agent (agent-memory, arch §3.4);
@@ -863,7 +863,7 @@ func (e *Engine) podLost(lease *agentpods.Lease, err error) bool {
 	return true
 }
 
-// modelChanged writes the divider «Модель: …» right before the first answer
+// modelChanged writes the divider "Model: …" right before the first answer
 // of another model in the conversation (FTR.NAB.CHAT-0001 R16, SEL-03): the
 // answer that was being written when the user chose finishes on the old one.
 func (e *Engine) modelChanged(ctx context.Context, uid, conv, msgID uuid.UUID, ch string, m agent.ModelSpec, name string) {

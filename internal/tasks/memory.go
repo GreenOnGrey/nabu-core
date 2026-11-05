@@ -64,7 +64,7 @@ type Exclusions struct {
 	Chats   []string `json:"chats"`
 }
 
-// CollectSettings are the settings of «Сбор коммуникаций».
+// CollectSettings are the settings of "Collecting communications".
 type CollectSettings struct {
 	Sources       []SourceRef `json:"sources"`
 	Interval      string      `json:"interval"` // 15m | 1h | 4h | 1d
@@ -72,14 +72,14 @@ type CollectSettings struct {
 	Exclusions    Exclusions  `json:"exclusions"`
 }
 
-// DigestDaySettings are the settings of «Сводка на день».
+// DigestDaySettings are the settings of "Daily summary".
 type DigestDaySettings struct {
 	Time    string `json:"time"` // 09:00
 	Days    []int  `json:"days"` // 1 — Monday … 7 — Sunday
 	Channel string `json:"channel"`
 }
 
-// DigestWeekSettings are the settings of «Сводка на неделю».
+// DigestWeekSettings are the settings of "Weekly summary".
 type DigestWeekSettings struct {
 	Weekday int    `json:"weekday"` // 1 — Monday … 7 — Sunday
 	Time    string `json:"time"`
@@ -403,7 +403,7 @@ func (s *Service) DisableMemoryTasks(ctx context.Context, uid uuid.UUID) error {
 	return err
 }
 
-// Pause pauses an active task until the user resumes it (R14: «Приостановить»).
+// Pause pauses an active task until the user resumes it (R14: "Pause").
 func (s *Service) Pause(ctx context.Context, uid, id uuid.UUID) (*Task, error) {
 	tag, err := s.Pool.Exec(ctx, `UPDATE scheduled_tasks SET status = 'paused', pause_kind = 'user', pause_reason = NULL, next_run_at = NULL
 		WHERE id = $1 AND user_id = $2 AND status = 'active'`, id, uid)

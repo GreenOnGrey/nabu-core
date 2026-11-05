@@ -114,7 +114,7 @@ func (s *Service) Sources(ctx context.Context, uid uuid.UUID) ([]SourceState, er
 	return out, rows.Err()
 }
 
-// CheckCollect is the gate of «Сбор коммуникаций» (R13, R21): the user
+// CheckCollect is the gate of "Collecting communications" (R13, R21): the user
 // consented and every chosen source is a connected source of the catalog.
 // settings are the stored settings of the task: { sources: [{ itemId, source }] }.
 func (s *Service) CheckCollect(ctx context.Context, uid uuid.UUID, settings []byte) error {
