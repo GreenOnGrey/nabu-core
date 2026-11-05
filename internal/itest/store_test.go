@@ -7,6 +7,7 @@ package itest
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,6 +27,7 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/channels"
 	"github.com/GreenOnGrey/nabu-core/internal/chat"
 	"github.com/GreenOnGrey/nabu-core/internal/clients"
+	"github.com/GreenOnGrey/nabu-core/internal/config"
 	"github.com/GreenOnGrey/nabu-core/internal/engine"
 	"github.com/GreenOnGrey/nabu-core/internal/ledger"
 	"github.com/GreenOnGrey/nabu-core/internal/memory"
@@ -434,6 +436,52 @@ func TestClientsAndRuns(t *testing.T) {
 	}
 	if kept, err := cs.Get(ctx, cl.ID); err != nil || !kept.Enabled {
 		t.Fatalf("a client with runs after delete: %+v %v", kept, err)
+	}
+	// SVC-12 (R17a): a client of the configuration is created once, with delegation; a reissued secret
+	// and the agents set by an administrator survive the next start with the same configuration
+	boot := []config.BootstrapClient{{Name: "installed", SecretSHA256: fmt.Sprintf("%x", sha256.Sum256([]byte("boot-secret"))),
+		URL: "https://installed.example.org"}}
+	if created, err := cs.Bootstrap(ctx, boot); err != nil || len(created) != 1 {
+		t.Fatalf("bootstrap: %v %v", created, err)
+	}
+	if _, err := cs.Authenticate(ctx, "installed", "boot-secret"); err != nil {
+		t.Fatal("the secret of a bootstrap client is refused")
+	}
+	var bc *clients.Client
+	all, _ := cs.List(ctx)
+	for i := range all {
+		if all[i].Name == "installed" {
+			bc = &all[i]
+		}
+	}
+	if bc == nil || !bc.CanDelegate || bc.CanImport || bc.URL != "https://installed.example.org" {
+		t.Fatalf("bootstrap client %+v", bc)
+	}
+	reissued, err := cs.Reissue(ctx, bc.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cs.Update(ctx, bc.ID, clients.Input{Agents: &[]string{"analysis"}}); err != nil {
+		t.Fatal(err)
+	}
+	if created, err := cs.Bootstrap(ctx, boot); err != nil || len(created) != 0 {
+		t.Fatalf("second bootstrap: %v %v", created, err)
+	}
+	if kept, err := cs.Get(ctx, bc.ID); err != nil || len(kept.Agents) != 1 || kept.Agents[0] != "analysis" {
+		t.Fatalf("agents after a restart: %+v %v", kept, err)
+	}
+	if _, err := cs.Authenticate(ctx, "installed", reissued.Secret); err != nil {
+		t.Fatal("the reissued secret is refused after a restart")
+	}
+	// a client the administrator deleted does not come back with the configured secret
+	if err := cs.Delete(ctx, bc.ID); err != nil {
+		t.Fatal(err)
+	}
+	if created, err := cs.Bootstrap(ctx, boot); err != nil || len(created) != 0 {
+		t.Fatalf("bootstrap after a delete: %v %v", created, err)
+	}
+	if _, err := cs.Authenticate(ctx, "installed", "boot-secret"); err == nil {
+		t.Fatal("a deleted bootstrap client is back")
 	}
 	// catalog
 	cat := &catalog.Service{Pool: pool, Box: box, Signer: signer, InternalURL: "http://api:8081"}
