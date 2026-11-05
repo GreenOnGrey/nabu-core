@@ -6,6 +6,7 @@ package config
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -54,6 +55,8 @@ type Config struct {
 	GitHubBaseURL      string // https://github.com (OAuth) — fakes in tests
 	GitHubAPIURL       string // https://api.github.com
 	BootstrapAdmins    []string
+	// BootstrapClients are the first service clients (FTR.NAB.CMN-0001 R17a).
+	BootstrapClients []BootstrapClient
 
 	SecretsKey []byte
 
@@ -204,6 +207,35 @@ func list(k string) []string {
 
 type parser struct{ errs []error }
 
+// BootstrapClient is a service client created at the start of api if it is absent
+// (FTR.NAB.CMN-0001 R17a, tech §5): the installer knows the secret and gives its hash.
+type BootstrapClient struct {
+	Name         string   `json:"name"`
+	SecretSHA256 string   `json:"secretSha256"`
+	URL          string   `json:"url"`
+	Agents       []string `json:"agents"`
+}
+
+func (p *parser) bootstrapClients(k string) []BootstrapClient {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return nil
+	}
+	// The shape only: the rules of a client are checked by clients.ValidateBootstrap at the start of api.
+	var out []BootstrapClient
+	dec := json.NewDecoder(strings.NewReader(v))
+	dec.DisallowUnknownFields()
+	err := dec.Decode(&out)
+	if err == nil && dec.More() {
+		err = errors.New("text after the array")
+	}
+	if err != nil {
+		p.errs = append(p.errs, fmt.Errorf("%s: a JSON array of {name, secretSha256, url, agents} is expected: %w", k, err))
+		return nil
+	}
+	return out
+}
+
 func (p *parser) dur(k, def string) time.Duration {
 	v := env(k, def)
 	if strings.HasSuffix(v, "d") {
@@ -329,6 +361,7 @@ func Load() (*Config, error) {
 		GitHubBaseURL:    strings.TrimRight(env("GITHUB_BASE_URL", "https://github.com"), "/"),
 		GitHubAPIURL:     strings.TrimRight(env("GITHUB_API_URL", "https://api.github.com"), "/"),
 		BootstrapAdmins:  list("BOOTSTRAP_ADMINS"),
+		BootstrapClients: p.bootstrapClients("BOOTSTRAP_CLIENTS"),
 
 		DatabaseURL: os.Getenv("DATABASE_URL"), KafkaBrokers: list("KAFKA_BROKERS"),
 		S3Endpoint: os.Getenv("S3_ENDPOINT"), S3AccessKey: os.Getenv("S3_ACCESS_KEY"), S3SecretKey: os.Getenv("S3_SECRET_KEY"),

@@ -467,6 +467,16 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 	if err := c.models.Bootstrap(ctx, cfg.BootstrapLLMType, cfg.BootstrapLLMURL, cfg.BootstrapLLMKey); err != nil {
 		slog.Error("bootstrap model connection", "err", err)
 	}
+	// FTR.NAB.CMN-0001 R17a: a product of the same install signs in without an administrator. A wrong
+	// configuration stops api; a failed write is logged like the other bootstrap steps and retried at the next start.
+	if err := clients.ValidateBootstrap(cfg.BootstrapClients); err != nil {
+		return err
+	}
+	if created, err := c.clients.Bootstrap(ctx, cfg.BootstrapClients); err != nil {
+		slog.Error("bootstrap service clients", "err", err)
+	} else if len(created) > 0 {
+		slog.Info("bootstrap service clients", "created", created)
+	}
 	// FTR.NAB.CMN-0008 tech §5.2: the built-in profiles of this version.
 	c.profiles.Cfg.Version = version
 	if ms, err := c.profiles.SyncBuiltins(ctx); err != nil {

@@ -11,6 +11,8 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"regexp"
 	"strings"
@@ -22,6 +24,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/GreenOnGrey/nabu-core/internal/apperr"
+	"github.com/GreenOnGrey/nabu-core/internal/config"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/httpx"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/jwt"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/postgres"
@@ -137,6 +140,38 @@ func (s *Service) Load(ctx context.Context, id uuid.UUID) (*httpx.Client, error)
 
 var nameRe = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
+var sha256HexRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// ValidateBootstrap checks the clients of BOOTSTRAP_CLIENTS (FTR.NAB.CMN-0001 R17a): an error stops api.
+func ValidateBootstrap(list []config.BootstrapClient) error {
+	var errs []error
+	seen := map[string]bool{}
+	for i, c := range list {
+		at := fmt.Sprintf("BOOTSTRAP_CLIENTS[%d]", i)
+		if !nameRe.MatchString(c.Name) {
+			errs = append(errs, fmt.Errorf("%s: name %q is not lower-case words with dashes", at, c.Name))
+		}
+		if seen[c.Name] {
+			errs = append(errs, fmt.Errorf("%s: %s is given twice", at, c.Name))
+		}
+		seen[c.Name] = true
+		if !sha256HexRe.MatchString(c.SecretSHA256) {
+			errs = append(errs, fmt.Errorf("%s: secretSha256 must be 64 lower-case hex digits", at))
+		}
+		if c.URL != "" && !strings.HasPrefix(c.URL, "https://") && !strings.HasPrefix(c.URL, "http://") {
+			errs = append(errs, fmt.Errorf("%s: url must start with https:// or http://", at))
+		}
+		agents := map[string]bool{}
+		for _, a := range c.Agents {
+			if !nameRe.MatchString(a) || agents[a] {
+				errs = append(errs, fmt.Errorf("%s: agent %q is not a unique name of a service agent", at, a))
+			}
+			agents[a] = true
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // Input is POST /clients and PATCH /clients/{id}.
 type Input struct {
 	Name        string          `json:"name"`
@@ -188,6 +223,38 @@ func (s *Service) Create(ctx context.Context, in Input) (*Created, error) {
 		return nil, err
 	}
 	return &Created{Client: *c, Secret: secret}, nil
+}
+
+// Bootstrap creates the clients of the configuration (checked by ValidateBootstrap) that it never
+// created before, with delegation (FTR.NAB.CMN-0001 R17a). An existing client belongs to the
+// administrators and stays as it is; a deleted one does not come back. It returns the created names.
+func (s *Service) Bootstrap(ctx context.Context, list []config.BootstrapClient) ([]string, error) {
+	var created []string
+	for _, c := range list {
+		h, _ := hex.DecodeString(c.SecretSHA256)
+		agents := c.Agents
+		if agents == nil {
+			agents = []string{}
+		}
+		made := false
+		err := pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx, `INSERT INTO bootstrap_clients (name) VALUES ($1) ON CONFLICT (name) DO NOTHING`, c.Name)
+			if err != nil || tag.RowsAffected() == 0 {
+				return err
+			}
+			tag, err = tx.Exec(ctx, `INSERT INTO service_clients (name, url, client_id, secret_hash, agents, can_delegate)
+				VALUES ($1, $2, $1, $3, $4, true) ON CONFLICT (name) DO NOTHING`, c.Name, c.URL, h, agents)
+			made = err == nil && tag.RowsAffected() > 0
+			return err
+		})
+		if err != nil {
+			return created, fmt.Errorf("client %s: %w", c.Name, err)
+		}
+		if made {
+			created = append(created, c.Name)
+		}
+	}
+	return created, nil
 }
 
 func deref(s *string) string {
