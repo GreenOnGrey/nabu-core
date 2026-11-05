@@ -88,7 +88,7 @@ type CollectMessage struct {
 	UserID  uuid.UUID `json:"userId"`
 }
 
-// Collect performs a run of «Сбор коммуникаций» (arch §3.1, tech §6.3): for
+// Collect performs a run of "Collecting communications" (arch §3.1, tech §6.3): for
 // every source of the user the adapter tells what changed since the cursor,
 // the threads worth reading become batches, and each batch is queued for a
 // run of the collector agent. No text of messages is read or stored here.

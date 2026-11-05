@@ -406,7 +406,7 @@ func (a *API) PatchAgent(ctx context.Context, uid uuid.UUID, name, tone *string,
 	if err != nil {
 		return nil, err
 	}
-	// R16: the divider «Модель: …» is written by the engine at the first answer of the new model
+	// R16: the divider "Model: …" is written by the engine at the first answer of the new model
 	a.Events.Publish(ctx, events.Event{Type: events.AgentUpdated, UserID: &uid, Data: v})
 	return v, nil
 }
@@ -499,7 +499,7 @@ func (a *API) Routes(r chi.Router, site bool) {
 			return err
 		}
 		var model *models.Choice
-		clear := string(in.Model) == "null" // R16: «По умолчанию»
+		clear := string(in.Model) == "null" // R16: "Default"
 		if len(in.Model) > 0 && !clear {
 			model = &models.Choice{}
 			if err := json.Unmarshal(in.Model, model); err != nil {

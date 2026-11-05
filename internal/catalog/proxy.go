@@ -101,7 +101,7 @@ func (s *Service) callGranted(ctx context.Context, uid uuid.UUID, ch string, ite
 		return false
 	}
 	if owner == nil {
-		return s.Access.ItemGranted(ctx, uuid.Nil, item) // «Все пользователи»
+		return s.Access.ItemGranted(ctx, uuid.Nil, item) // "All users"
 	}
 	return s.Access.ItemGranted(ctx, *owner, item)
 }

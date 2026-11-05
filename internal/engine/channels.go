@@ -162,7 +162,7 @@ func (s *segmenter) rest() string {
 // and the skills chosen by the owner; no personal access of members.
 func (e *Engine) groupRequest(ctx context.Context, u *users.User, ga *groups.Agent, conv uuid.UUID, label string) (*built, error) {
 	// FTR.NAB.CMN-0007 R12: a group agent has the access of its owner
-	// (without an owner — that of «Все пользователи»)
+	// (without an owner: that of "All users")
 	owner := uuid.Nil
 	if ga.OwnerID != nil {
 		owner = *ga.OwnerID
