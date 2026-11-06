@@ -210,7 +210,7 @@ jobs:
       ((needs.scan.result == 'success' && needs.sandbox-images.result == 'success' && vars.AUTO_DEPLOY != 'false') ||
        needs.meta.outputs.rebuild == 'false')
     permissions: { contents: read, packages: read, id-token: write }
-    uses: GreenOnGrey/nabu/.github/workflows/deploy-component.yml@v0.1.2
+    uses: GreenOnGrey/nabu/.github/workflows/deploy-component.yml@v0.1.3
     with:
       component: nabu-core
       tag: ${{ needs.meta.outputs.tag }}
