@@ -63,7 +63,9 @@ type Resolved struct {
 	Description string            `json:"description"`
 	Allow       []Host            `json:"allow"`
 	Env         map[string]string `json:"-"`
-	UpdatedAt   time.Time         `json:"-"`
+	// Secrets are the values of the secret variables: the events of a run mask them (FTR.HMR.DEV-0004 R10).
+	Secrets   []string  `json:"-"`
+	UpdatedAt time.Time `json:"-"`
 }
 
 // Hosts lists "host:port" for the description of a sandbox (R20).
@@ -225,6 +227,7 @@ func (s *Service) Resolve(ctx context.Context, names []string) ([]Resolved, erro
 				if v, err = s.Box.Open(e.ValueEnc); err != nil {
 					return nil, fmt.Errorf("proxy %s: open %s: %w", p.Name, e.Name, err)
 				}
+				r.Secrets = append(r.Secrets, v)
 			}
 			r.Env[e.Name] = v
 		}

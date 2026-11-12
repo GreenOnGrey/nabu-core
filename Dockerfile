@@ -101,10 +101,14 @@ USER 1000:1000
 # service agents that change repositories. Dependencies of a project come
 # through the proxy of package registries the agent is given (R18): npm, go
 # and uv are here, apt is not. Caches go into /work (HOME), not into the
-# small /tmp; the changes of a run skip them.
+# small /tmp; the changes of a run skip them. curl and procps (ps, pkill) are
+# for the service an agent runs and its processes (tech, decision 29); curl
+# reaches out only through the proxies of the sandbox.
 FROM sandbox-base AS sandbox-code
 ARG VERSION=dev
 USER root
+RUN apt-get update && apt-get install -y --no-install-recommends curl procps \
+ && rm -rf /var/lib/apt/lists/*
 COPY --from=golang:1.27-trixie /usr/local/go /usr/local/go
 COPY --from=node:24-trixie-slim /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 COPY --from=uv /uv /usr/local/bin/uv

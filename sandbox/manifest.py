@@ -34,6 +34,8 @@ TOOLS = [
     ("pdf", "pdftoppm", ["pdftoppm", "-v"], "documents"),
     ("pdf", "qpdf", ["qpdf", "--version"], "documents"),
     # FTR.HMR.CMN-0007 R25
+    ("utilities", "curl", ["curl", "--version"], "code"),
+    ("utilities", "ps", ["ps", "--version"], "code"),
     ("go", "go", ["go", "version"], "code"),
     ("go", "gopls", ["gopls", "version"], "code"),
     ("go", "gofumpt", ["gofumpt", "--version"], "code"),

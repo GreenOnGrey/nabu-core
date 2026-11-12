@@ -431,16 +431,25 @@ type Ephemeral struct {
 	TokenTTL time.Duration
 }
 
-func (m *Sandboxes) StartEphemeral(ctx context.Context, workspaceID, runID, profile string, opts Ephemeral) ([]proxies.Resolved, error) {
+// EphemeralStarted is a started temporary sandbox: its proxies and the secret
+// values in its environment, which the events of the run must not show
+// (FTR.HMR.DEV-0004 R10).
+type EphemeralStarted struct {
+	Proxies []proxies.Resolved
+	Secrets []string
+}
+
+func (m *Sandboxes) StartEphemeral(ctx context.Context, workspaceID, runID, profile string, opts Ephemeral) (EphemeralStarted, error) {
 	name := ephemeralPod(workspaceID)
 	prof, err := m.profile(ctx, sandboxprofile.Target{Kind: sandboxprofile.TargetService, Profile: profile})
 	if err != nil {
-		return nil, err
+		return EphemeralStarted{}, err
 	}
 	rs, err := m.resolveProxies(ctx, opts.Proxies)
 	if err != nil {
-		return nil, err
+		return EphemeralStarted{}, err
 	}
+	out := EphemeralStarted{Proxies: rs}
 	man := m.manifest(uuid.Nil, prof)
 	runToken := ""
 	if m.Space != nil && m.Space.Signer != nil {
@@ -452,10 +461,15 @@ func (m *Sandboxes) StartEphemeral(ctx context.Context, workspaceID, runID, prof
 	spec := man["spec"].(map[string]any)
 	spec["restartPolicy"] = "Never"
 	c := spec["containers"].([]map[string]any)[0]
+	wsToken := m.Space.Signer.Issue(jwt.Claims{Audience: jwt.AudWorkspace, Workspace: workspaceID, Kind: "sandbox"}, m.Cfg.TokenTTL)
+	out.Secrets = append(out.Secrets, wsToken, runToken)
+	for _, r := range rs {
+		out.Secrets = append(out.Secrets, r.Secrets...)
+	}
 	c["env"] = []map[string]any{
 		{"name": "NABU_SANDBOX_EPHEMERAL", "value": "1"},
 		{"name": "NABU_SANDBOX_WORKSPACE", "value": workspaceID},
-		{"name": "NABU_WORKSPACE_TOKEN", "value": m.Space.Signer.Issue(jwt.Claims{Audience: jwt.AudWorkspace, Workspace: workspaceID, Kind: "sandbox"}, m.Cfg.TokenTTL)},
+		{"name": "NABU_WORKSPACE_TOKEN", "value": wsToken},
 		{"name": "NABU_RELAY_URL", "value": m.Cfg.RelayURL},
 		{"name": "NABU_API_INTERNAL_URL", "value": m.Cfg.APIURL},
 		{"name": "NABU_SANDBOX_RUN_TOKEN", "value": runToken},
@@ -473,12 +487,16 @@ func (m *Sandboxes) StartEphemeral(ctx context.Context, workspaceID, runID, prof
 			{"name": "NABU_API_INTERNAL_URL", "value": m.Cfg.APIURL},
 		}
 	}
-	m.setup(rs, func(names []string) string { return egress.RunToken(m.Space.Signer, runID, names, opts.TokenTTL) }).apply(man)
+	m.setup(rs, func(names []string) string {
+		t := egress.RunToken(m.Space.Signer, runID, names, opts.TokenTTL)
+		out.Secrets = append(out.Secrets, t)
+		return t
+	}).apply(man)
 	if err := m.K8s.CreatePod(ctx, m.Cfg.Namespace, man); err != nil && !k8s.Conflict(err) {
-		return nil, err
+		return EphemeralStarted{}, err
 	}
 	go m.watchEphemeral(context.WithoutCancel(ctx), name, workspaceID, prof)
-	return rs, nil
+	return out, nil
 }
 
 // watchEphemeral records how a temporary sandbox started (FTR.NAB.CMN-0008
