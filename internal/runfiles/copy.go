@@ -138,11 +138,12 @@ const MaxNewFile = 10 << 20
 var alwaysSkipped = map[string]bool{"node_modules": true, ".venv": true, "venv": true, "__pycache__": true,
 	".pytest_cache": true, ".mypy_cache": true, ".ruff_cache": true, ".pnpm-store": true, ".cache": true, ".npm": true}
 
-// homePaths are the caches of Go in HOME=/work (GOPATH=/work/go) and the
-// service directory of the sandbox: exact paths from the root, so the
-// other files of a go/ directory of the repository are still changes.
-// XDG directories point into /work/.cache (Dockerfile).
-var homePaths = map[string]bool{"go/pkg": true, "go/bin": true, "nabu": true}
+// homePaths are the caches of Go in HOME=/work (GOPATH=/work/go), the
+// service directory of the sandbox and the full output of the tools of Pi
+// (.pi-output, the extension nabu-workspace; FTR.HMR.CMN-0007 tech decision 30):
+// exact paths from the root, so the other files of a go/ directory of the
+// repository are still changes. XDG directories point into /work/.cache (Dockerfile).
+var homePaths = map[string]bool{"go/pkg": true, "go/bin": true, "nabu": true, ".pi-output": true}
 
 // Collect compares root with the manifest and writes the archive of changes
 // to w: changes.json first, then the added and modified files.

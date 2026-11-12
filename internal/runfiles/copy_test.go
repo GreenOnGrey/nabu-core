@@ -76,7 +76,7 @@ func read(t *testing.T, b []byte) (Changes, map[string]string) {
 }
 
 // FTR.HMR.CMN-0007 RF-07, RF-08, RF-09: the copy is unpacked, the changes
-// skip dependencies, caches and ignored files, but not tracked ones.
+// skip dependencies, caches, the output of the tools of Pi and ignored files, but not tracked ones.
 func TestCollect(t *testing.T) {
 	root := t.TempDir()
 	m, err := Extract(bytes.NewReader(archive(t, map[string]string{
@@ -98,6 +98,8 @@ func TestCollect(t *testing.T) {
 	put(t, root, ".cache/go-build/x", "x")
 	put(t, root, "go/pkg/mod/x", "x")
 	put(t, root, "go/bin/gopls", "x")
+	put(t, root, ".pi-output/pi-bash-78bfa7af57363a34.log", "x")
+	put(t, root, "docs/.pi-output/notes.md", "x")
 	put(t, root, "go/tools.go", "package tools")
 	put(t, root, ".config/app.toml", "x")
 	put(t, root, "web/.cache/x", "x")
@@ -119,7 +121,7 @@ func TestCollect(t *testing.T) {
 	for _, ch := range c.Changes {
 		got = append(got, ch.Op+" "+ch.Path)
 	}
-	want := "added .config/app.toml|modified build/tracked.txt|added go/tools.go|added keep.log|modified main.go|added new_test.go|deleted old.go|added web/src/app.ts"
+	want := "added .config/app.toml|modified build/tracked.txt|added docs/.pi-output/notes.md|added go/tools.go|added keep.log|modified main.go|added new_test.go|deleted old.go|added web/src/app.ts"
 	if strings.Join(got, "|") != want {
 		t.Fatalf("changes:\n%s\nwant\n%s", strings.Join(got, "|"), want)
 	}
@@ -131,10 +133,10 @@ func TestCollect(t *testing.T) {
 		t.Fatalf("skipped %v", c.Skipped)
 	}
 	rc, files := read(t, b.Bytes())
-	if len(rc.Changes) != 8 || files["main.go"] != "package main // changed" || files["build/tracked.txt"] != "v2" || len(files) != 7 {
+	if len(rc.Changes) != 9 || files["main.go"] != "package main // changed" || files["build/tracked.txt"] != "v2" || len(files) != 8 {
 		t.Fatalf("archive %v %v", rc.Changes, files)
 	}
-	if st, err := Check(bytes.NewReader(b.Bytes()), 0, 0); err != nil || st.Files != 8 {
+	if st, err := Check(bytes.NewReader(b.Bytes()), 0, 0); err != nil || st.Files != 9 {
 		t.Fatalf("the archive of changes passes the check: %v %+v", err, st)
 	}
 }
