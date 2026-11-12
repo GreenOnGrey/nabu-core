@@ -259,8 +259,12 @@ func (s *Service) Delete(ctx context.Context, actor Actor, id uuid.UUID, confirm
 		if _, err := tx.Exec(ctx, `DELETE FROM user_groups WHERE id = $1`, id); err != nil {
 			return err
 		}
-		n, err := reconcile(ctx, tx, members)
-		s.log(ctx, tx, actor, "group.delete", "group:"+id.String(), g, map[string]any{"revokedConnections": n})
+		n, lost, err := reconcile(ctx, tx, members)
+		if err != nil {
+			return err
+		}
+		paused, err := PauseSourceTasks(ctx, tx, lost, "no access to the source: the group was deleted")
+		s.log(ctx, tx, actor, "group.delete", "group:"+id.String(), g, map[string]any{"revokedConnections": n, "pausedTasks": paused})
 		return err
 	})
 	if err == nil {
@@ -420,8 +424,12 @@ func (s *Service) RemoveMember(ctx context.Context, actor Actor, id, user uuid.U
 		if _, err := tx.Exec(ctx, `DELETE FROM user_group_members WHERE group_id = $1 AND user_id = $2`, id, user); err != nil {
 			return err
 		}
-		n, err := reconcile(ctx, tx, []uuid.UUID{user})
-		s.log(ctx, tx, actor, "group.members.remove", "group:"+id.String(), user, map[string]any{"revokedConnections": n})
+		n, lost, err := reconcile(ctx, tx, []uuid.UUID{user})
+		if err != nil {
+			return err
+		}
+		paused, err := PauseSourceTasks(ctx, tx, lost, "no access to the source: the group membership ended")
+		s.log(ctx, tx, actor, "group.members.remove", "group:"+id.String(), user, map[string]any{"revokedConnections": n, "pausedTasks": paused})
 		return err
 	})
 	if err == nil {
@@ -507,8 +515,12 @@ func (s *Service) PutGrants(ctx context.Context, actor Actor, id uuid.UUID, g Gr
 		if err != nil {
 			return err
 		}
-		n, err := reconcile(ctx, tx, members)
-		s.log(ctx, tx, actor, "group.grants", "group:"+id.String(), cur.Grants, map[string]any{"grants": g, "revokedConnections": n})
+		n, lost, err := reconcile(ctx, tx, members)
+		if err != nil {
+			return err
+		}
+		paused, err := PauseSourceTasks(ctx, tx, lost, "no access to the source: the grant of the group was revoked")
+		s.log(ctx, tx, actor, "group.grants", "group:"+id.String(), cur.Grants, map[string]any{"grants": g, "revokedConnections": n, "pausedTasks": paused})
 		return err
 	})
 	if err != nil {
@@ -594,25 +606,43 @@ func losing(ctx context.Context, q Querier, users []uuid.UUID) ([]loss, error) {
 }
 
 // reconcile deletes the connections of users to items out of their access:
-// personal credentials do not stay without a right to use them (R10).
-// The collection of communications pauses by itself without its source.
-func reconcile(ctx context.Context, q Querier, users []uuid.UUID) (int, error) {
+// personal credentials do not stay without a right to use them (R10). It
+// returns how many connections went and the users who lost an item: their
+// collection tasks are paused by the caller in the same transaction
+// (FTR.NAB.CHAT-0005 R27, R28, R32).
+func reconcile(ctx context.Context, q Querier, users []uuid.UUID) (int, []uuid.UUID, error) {
 	lost, err := losing(ctx, q, users)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
+	var who []uuid.UUID
+	seen := map[uuid.UUID]bool{}
 	for _, l := range lost {
 		if _, err := q.Exec(ctx, `DELETE FROM user_connections WHERE user_id = $1 AND item_id = $2`, l.user, l.item); err != nil {
-			return 0, err
+			return 0, nil, err
+		}
+		if !seen[l.user] {
+			seen[l.user] = true
+			who = append(who, l.user)
 		}
 	}
-	return len(lost), nil
+	return len(lost), who, nil
 }
 
 // Reconcile is reconcile for the given users outside a change of a group:
 // a lost role of an administrator, an unpublished item.
 func (s *Service) Reconcile(ctx context.Context, users []uuid.UUID) (int, error) {
-	n, err := reconcile(ctx, s.Pool, users)
+	n := 0
+	err := postgres.InTx(ctx, s.Pool, func(tx pgx.Tx) error {
+		var lost []uuid.UUID
+		var err error
+		n, lost, err = reconcile(ctx, tx, users)
+		if err != nil {
+			return err
+		}
+		_, err = PauseSourceTasks(ctx, tx, lost, "no access to the source")
+		return err
+	})
 	if err == nil {
 		s.changed(ctx)
 	}
@@ -657,8 +687,12 @@ func (s *Service) UserGroups(ctx context.Context, actor Actor, uid uuid.UUID, id
 				return err
 			}
 		}
-		n, err := reconcile(ctx, tx, []uuid.UUID{uid})
-		s.log(ctx, tx, actor, "user.groups", "user:"+uid.String(), before, map[string]any{"groups": ids, "revokedConnections": n})
+		n, lost, err := reconcile(ctx, tx, []uuid.UUID{uid})
+		if err != nil {
+			return err
+		}
+		paused, err := PauseSourceTasks(ctx, tx, lost, "no access to the source: the groups of the user changed")
+		s.log(ctx, tx, actor, "user.groups", "user:"+uid.String(), before, map[string]any{"groups": ids, "revokedConnections": n, "pausedTasks": paused})
 		return err
 	})
 	if err != nil {
@@ -718,14 +752,18 @@ func (s *Service) Log(ctx context.Context, target string, page httpx.Page) (http
 // administrator (ADM-02, users.Repo.RoleChanged): what only «admins» gave is
 // taken in it, so a failure keeps the role. Publish Changed after the commit.
 func (s *Service) AdminChanged(ctx context.Context, q Querier, actor Actor, uid uuid.UUID, admin bool) error {
-	n := 0
+	n, paused := 0, 0
 	if !admin {
+		var lost []uuid.UUID
 		var err error
-		if n, err = reconcile(ctx, q, []uuid.UUID{uid}); err != nil {
+		if n, lost, err = reconcile(ctx, q, []uuid.UUID{uid}); err != nil {
+			return err
+		}
+		if paused, err = PauseSourceTasks(ctx, q, lost, "no access to the source: the role of administrator ended"); err != nil {
 			return err
 		}
 	}
-	s.log(ctx, q, actor, "user.admin", "user:"+uid.String(), nil, map[string]any{"admin": admin, "revokedConnections": n})
+	s.log(ctx, q, actor, "user.admin", "user:"+uid.String(), nil, map[string]any{"admin": admin, "revokedConnections": n, "pausedTasks": paused})
 	return nil
 }
 

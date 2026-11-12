@@ -329,6 +329,11 @@ type Event struct {
 	// Of marks a tool call or result of a subagent, "<call>/<task>": the
 	// worker audits it (FTR.NAB.CMN-0009 R9), the answer does not show it.
 	Of string `json:"of,omitempty"`
+	// ResultCode and DurationMS come from result._meta["nabu/call"] of the
+	// MCP proxy (FTR.NAB.CHAT-0005 R3): ok, tool_error, transport_error,
+	// denied, file_rejected, file_too_large, auth.
+	ResultCode string `json:"resultCode,omitempty"`
+	DurationMS *int   `json:"durationMs,omitempty"`
 	Usage
 }
 

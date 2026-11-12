@@ -309,3 +309,31 @@ var (
 func init() {
 	Registry.MustRegister(EgressConnections, EgressBytes, EgressActive, ProxyUp, RunFilesBytes, RunChangesFiles)
 }
+
+// FTR.NAB.CHAT-0005 tech §«Наблюдаемость»: the usage tab of the catalog.
+var (
+	CatalogUsageRows = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "nabu_catalog_usage_rows", Help: "Rows of the aggregates of catalog usage by kind (daily, monthly).",
+	}, []string{"kind"})
+	CatalogUsageLag = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "nabu_catalog_usage_lag_seconds", Help: "Lag of the aggregates by job (recompute, close).",
+	}, []string{"job"})
+	CatalogUsageRecomputeSeconds = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name: "nabu_catalog_usage_recompute_seconds", Help: "Cost of a tick of the aggregation.",
+		Buckets: []float64{.5, 1, 2, 5, 10, 20, 30, 60, 120, 300},
+	})
+	CatalogUsagePublishBlocked = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_catalog_usage_publish_blocked_total", Help: "Refusals of unpublished catalog items by the kind of caller (user, group, service, client).",
+	}, []string{"caller"})
+	CatalogUsageReportRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_catalog_usage_report_requests_total", Help: "Requests of the usage report and the actions by path and code.",
+	}, []string{"path", "code"})
+	CatalogUsageGoalShare = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "nabu_catalog_usage_goal_share", Help: "The share of dead MCP items of the goal metric, percent.",
+	})
+)
+
+func init() {
+	Registry.MustRegister(CatalogUsageRows, CatalogUsageLag, CatalogUsageRecomputeSeconds, CatalogUsagePublishBlocked,
+		CatalogUsageReportRequests, CatalogUsageGoalShare)
+}

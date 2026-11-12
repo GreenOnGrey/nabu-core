@@ -94,10 +94,18 @@ type Item struct {
 	NewTools []string `json:"newTools"`
 	// CheckedAt is the time of the last successful check.
 	CheckedAt *time.Time `json:"checkedAt"`
-	Skills    []string   `json:"skills"`
-	SyncedAt  *time.Time `json:"syncedAt"`
-	CreatedAt time.Time  `json:"createdAt"`
-	snapshot  *string
+	// LastOkAt is the name of checkedAt in the usage report (FTR.NAB.CHAT-0005 R15).
+	LastOkAt *time.Time `json:"lastOkAt"`
+	// FTR.NAB.CHAT-0005 R13, R15: the current state of publication and the
+	// times of the last check (any outcome) and of the last successful one.
+	PublishedAt        *time.Time `json:"publishedAt"`
+	UnpublishedAt      *time.Time `json:"unpublishedAt"`
+	PublishedEstimated bool       `json:"publishedEstimated"`
+	LastCheckAt        *time.Time `json:"lastCheckAt"`
+	Skills             []string   `json:"skills"`
+	SyncedAt           *time.Time `json:"syncedAt"`
+	CreatedAt          time.Time  `json:"createdAt"`
+	snapshot           *string
 }
 
 // Access answers which items a user may use (FTR.NAB.CMN-0007).
@@ -153,7 +161,9 @@ var nameRe = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
 const itemCols = `id, type, name, COALESCE(title,''), COALESCE(description,''), source, mode, personal_auth, personal_auth_secret_enc IS NOT NULL,
 	platform_auth_enc, read_only, exposure, published, in_development, status, status_reason, tools, skills, skills_snapshot, synced_at, created_at,
-	allowed_tools, file_args, file_max_bytes, new_tools, checked_at, result_args, result_max_bytes, space_only_tools`
+	allowed_tools, file_args, file_max_bytes, new_tools, checked_at, result_args, result_max_bytes, space_only_tools,
+	published_at, unpublished_at, last_check_at,
+	coalesce((SELECT p.estimated FROM catalog_item_publications p WHERE p.item_id = catalog_items.id AND p.unpublished_at IS NULL), false)`
 
 func (s *Service) scan(row pgx.Row) (*Item, error) {
 	var it Item
@@ -162,7 +172,8 @@ func (s *Service) scan(row pgx.Row) (*Item, error) {
 	var platEnc []byte
 	if err := row.Scan(&it.ID, &it.Type, &it.Name, &it.Title, &it.Description, &src, &it.Mode, &pa, &hasSecret, &platEnc, &it.ReadOnly,
 		&it.Exposure, &it.Published, &it.InDevelopment, &it.Status, &it.StatusReason, &tools, &skills, &it.snapshot, &it.SyncedAt, &it.CreatedAt,
-		&allowed, &fileArgs, &it.FileMaxBytes, &newTools, &it.CheckedAt, &resultArgs, &it.ResultMaxBytes, &spaceOnly); err != nil {
+		&allowed, &fileArgs, &it.FileMaxBytes, &newTools, &it.CheckedAt, &resultArgs, &it.ResultMaxBytes, &spaceOnly,
+		&it.PublishedAt, &it.UnpublishedAt, &it.LastCheckAt, &it.PublishedEstimated); err != nil {
 		return nil, err
 	}
 	if len(allowed) > 0 {
@@ -187,6 +198,7 @@ func (s *Service) scan(row pgx.Row) (*Item, error) {
 		it.NewTools = []string{}
 	}
 	_ = json.Unmarshal(src, &it.Source)
+	it.LastOkAt = it.CheckedAt
 	if len(pa) > 0 {
 		it.PersonalAuth = &PersonalAuth{}
 		_ = json.Unmarshal(pa, it.PersonalAuth)
@@ -260,6 +272,20 @@ func (s *Service) Get(ctx context.Context, id uuid.UUID) (*Item, error) {
 		return nil, apperr.NotFound("not_found", "catalog item not found")
 	}
 	return it, err
+}
+
+// ItemIDByName resolves the name of an MCP server of a turn to the item of
+// the catalog; nil — the name is not in the catalog (FTR.NAB.CHAT-0005 R3).
+func (s *Service) ItemIDByName(ctx context.Context, name string) (*uuid.UUID, error) {
+	var id uuid.UUID
+	err := s.Pool.QueryRow(ctx, `SELECT id FROM catalog_items WHERE name = $1`, name).Scan(&id)
+	if postgres.IsNoRows(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &id, nil
 }
 
 // ByName loads an item by name or nil.
@@ -351,6 +377,12 @@ func (s *Service) Save(ctx context.Context, id *uuid.UUID, in Input) (*Item, err
 	var it *Item
 	var platEnc []byte
 	var paSecret []byte
+	wasPublished := false
+	if id != nil {
+		if cur, err := s.Get(ctx, *id); err == nil && cur != nil {
+			wasPublished = cur.Published && !cur.InDevelopment
+		}
+	}
 	if id == nil {
 		it = &Item{Type: in.Type, Name: strings.TrimSpace(in.Name), ReadOnly: true, Exposure: "deferred", FileMaxBytes: DefaultFileMaxBytes,
 			ResultMaxBytes: DefaultResultMaxBytes}
@@ -478,12 +510,42 @@ func (s *Service) Save(ctx context.Context, id *uuid.UUID, in Input) (*Item, err
 	if err != nil {
 		return nil, err
 	}
+	// FTR.NAB.CHAT-0005 R13: the intervals of publication follow the flag of the item
+	nowPublished := it.Published && !it.InDevelopment
+	if !wasPublished && nowPublished {
+		_, err = s.Pool.Exec(ctx, `UPDATE catalog_items SET published_at = now(), unpublished_at = NULL WHERE id = $1`, *id)
+		if err == nil {
+			_, err = s.Pool.Exec(ctx, `INSERT INTO catalog_item_publications (item_id, published_at) VALUES ($1, now())`, *id)
+		}
+	} else if wasPublished && !nowPublished {
+		_, err = s.Pool.Exec(ctx, `UPDATE catalog_items SET unpublished_at = now() WHERE id = $1`, *id)
+		if err == nil {
+			_, err = s.Pool.Exec(ctx, `UPDATE catalog_item_publications SET unpublished_at = now()
+				WHERE item_id = $1 AND unpublished_at IS NULL`, *id)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
 	s.changed(ctx)
 	return s.Get(ctx, *id)
 }
 
-// Delete removes an item and the connections of users.
+// Delete removes an item and the connections of users. FTR.NAB.CHAT-0005
+// R23: the open interval is closed and a tombstone keeps the name and the
+// date for the report; the aggregates outlive the item.
 func (s *Service) Delete(ctx context.Context, id uuid.UUID) error {
+	var name, title string
+	_ = s.Pool.QueryRow(ctx, `SELECT name, coalesce(title,'') FROM catalog_items WHERE id = $1`, id).Scan(&name, &title)
+	if _, err := s.Pool.Exec(ctx, `INSERT INTO catalog_item_tombstones (item_id, name, title, type, deleted_at)
+		SELECT id, name, coalesce(title,''), type, now() FROM catalog_items WHERE id = $1
+		ON CONFLICT (item_id) DO NOTHING`, id); err != nil {
+		return err
+	}
+	if _, err := s.Pool.Exec(ctx, `UPDATE catalog_item_publications SET unpublished_at = now()
+		WHERE item_id = $1 AND unpublished_at IS NULL`, id); err != nil {
+		return err
+	}
 	tag, err := s.Pool.Exec(ctx, `DELETE FROM catalog_items WHERE id = $1`, id)
 	if err != nil {
 		return err
@@ -491,8 +553,23 @@ func (s *Service) Delete(ctx context.Context, id uuid.UUID) error {
 	if tag.RowsAffected() == 0 {
 		return apperr.NotFound("not_found", "catalog item not found")
 	}
+	_, _ = s.Pool.Exec(ctx, `INSERT INTO admin_log (actor_email, action, target, after)
+		VALUES ('system', 'catalog.delete', $1, '{}'::jsonb)`, "catalog_item:"+id.String())
+	if s.Events != nil { // FTR.NAB.CHAT-0005 R31
+		s.Events.Publish(ctx, events.Event{Type: "catalog.changed", Data: map[string]any{
+			"action": "catalog.delete", "itemId": id.String(), "itemName": firstNonEmptyStr(title, name), "reason": ""}})
+	}
 	s.changed(ctx)
 	return nil
+}
+
+func firstNonEmptyStr(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func (s *Service) changed(ctx context.Context) {
@@ -562,7 +639,8 @@ func (s *Service) Check(ctx context.Context, id uuid.UUID, email string, admin u
 	}
 	tools, _ := json.Marshal(res.Tools)
 	if status != "ok" {
-		_, err = s.Pool.Exec(ctx, `UPDATE catalog_items SET status = $2, status_reason = NULLIF($3,''), updated_at = now() WHERE id = $1`, id, status, reason)
+		_, err = s.Pool.Exec(ctx, `UPDATE catalog_items SET status = $2, status_reason = NULLIF($3,''), last_check_at = now(),
+			updated_at = now() WHERE id = $1`, id, status, reason)
 		if err != nil {
 			return nil, err
 		}
@@ -583,7 +661,8 @@ func (s *Service) Check(ctx context.Context, id uuid.UUID, email string, admin u
 	spaceOnly, _ := json.Marshal(nonNilS(it.SpaceOnlyTools))
 	nt, _ := json.Marshal(it.NewTools)
 	_, err = s.Pool.Exec(ctx, `UPDATE catalog_items SET status = 'ok', status_reason = NULL, tools = $2, allowed_tools = $3, read_only = $4, file_args = $5,
-		new_tools = $6, result_args = $7, space_only_tools = $8, checked_at = now(), updated_at = now() WHERE id = $1`,
+		new_tools = $6, result_args = $7, space_only_tools = $8, checked_at = now(), last_check_at = now(),
+		updated_at = now() WHERE id = $1`,
 		id, tools, allowed, it.ReadOnly, fileArgs, nt, resultArgs, spaceOnly)
 	if err != nil {
 		return nil, err
@@ -880,15 +959,20 @@ func (s *Service) ForSession(ctx context.Context, uid uuid.UUID, ch, conv string
 }
 
 // ForServiceAgent resolves platform MCP items and skills by name for a
-// service agent (R15: only platform items).
-func (s *Service) ForServiceAgent(ctx context.Context, mcpNames, skillNames []string, runID string, ttl time.Duration) (*SessionMCP, error) {
+// service agent (R15: only platform items). Names of the configuration that
+// do not resolve to a published platform item are returned in unavailable:
+// the run must fail with catalog_item_unavailable naming the item instead of
+// running silently without it (FTR.NAB.CHAT-0005 R32, A13).
+func (s *Service) ForServiceAgent(ctx context.Context, mcpNames, skillNames []string, runID string, ttl time.Duration) (*SessionMCP, []string, error) {
 	out := &SessionMCP{Headers: map[string]map[string]string{}, SkillSnapshots: map[string]string{}}
+	unavailable := []string{}
 	for _, n := range mcpNames {
 		it, err := s.ByName(ctx, n)
 		if err != nil {
-			return nil, err
+			return nil, unavailable, err
 		}
-		if it == nil || it.Type != "mcp" || it.Mode == nil || *it.Mode != "platform" || !it.Published {
+		if it == nil || it.Type != "mcp" || it.Mode == nil || *it.Mode != "platform" || !it.Published || it.InDevelopment {
+			unavailable = append(unavailable, n)
 			continue
 		}
 		tok := s.Signer.Issue(jwt.Claims{Audience: jwt.AudMCP, Subject: "proxy:" + it.ID.String(), Run: runID, Channel: "run"}, ttl)
@@ -897,22 +981,24 @@ func (s *Service) ForServiceAgent(ctx context.Context, mcpNames, skillNames []st
 		out.Headers[it.Name] = map[string]string{"Authorization": "Bearer " + tok}
 	}
 	if len(skillNames) == 0 {
-		return out, nil
+		return out, unavailable, nil
 	}
-	rows, err := s.Pool.Query(ctx, `SELECT skills, skills_snapshot FROM catalog_items WHERE type = 'skill' AND skills_snapshot IS NOT NULL`)
+	rows, err := s.Pool.Query(ctx, `SELECT skills, skills_snapshot FROM catalog_items
+		WHERE type = 'skill' AND skills_snapshot IS NOT NULL AND published AND NOT in_development`)
 	if err != nil {
-		return nil, err
+		return nil, unavailable, err
 	}
 	defer rows.Close()
 	want := map[string]bool{}
 	for _, n := range skillNames {
 		want[n] = true
 	}
+	found := map[string]bool{}
 	for rows.Next() {
 		var skills []byte
 		var snap string
 		if err := rows.Scan(&skills, &snap); err != nil {
-			return nil, err
+			return nil, unavailable, err
 		}
 		var names []string
 		_ = json.Unmarshal(skills, &names)
@@ -920,10 +1006,19 @@ func (s *Service) ForServiceAgent(ctx context.Context, mcpNames, skillNames []st
 			if want[n] {
 				out.Skills = append(out.Skills, n)
 				out.SkillSnapshots[n] = snap
+				found[n] = true
 			}
 		}
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, unavailable, err
+	}
+	for _, n := range skillNames {
+		if !found[n] {
+			unavailable = append(unavailable, n)
+		}
+	}
+	return out, unavailable, nil
 }
 
 // Bundle reads a skills snapshot from S3.
