@@ -177,7 +177,7 @@ func TestProxies(t *testing.T) {
 		t.Fatal(err)
 	}
 	p, err := px.Get(ctx, "packages")
-	if err != nil || len(p.Allow) != 5 {
+	if err != nil || len(p.Allow) != 6 {
 		t.Fatalf("PX-01: %+v %v", p, err)
 	}
 	// PX-02: a private registry with a token

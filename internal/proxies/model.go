@@ -206,7 +206,9 @@ type ecosystem struct {
 }
 
 var template = map[string]ecosystem{
-	EcoGo: {allow: []Host{{Host: "proxy.golang.org", Port: 443}, {Host: "sum.golang.org", Port: 443}},
+	// proxy.golang.org sends the archives of large modules to storage.googleapis.com
+	// (FTR.HMR.CMN-0007 tech §3.2, decision 28).
+	EcoGo: {allow: []Host{{Host: "proxy.golang.org", Port: 443}, {Host: "sum.golang.org", Port: 443}, {Host: "storage.googleapis.com", Port: 443}},
 		env: []Env{{Name: "GOPROXY", Value: "https://proxy.golang.org"}, {Name: "GOFLAGS", Value: "-mod=mod"}}},
 	EcoNPM: {allow: []Host{{Host: "registry.npmjs.org", Port: 443}}},
 	EcoPyPI: {allow: []Host{{Host: "pypi.org", Port: 443}, {Host: "files.pythonhosted.org", Port: 443}},
