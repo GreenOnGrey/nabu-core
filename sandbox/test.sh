@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test.sh <base image> <documents image> [<code image>] — checks of the
 # built-in sandbox profiles (FTR.NAB.CMN-0008 qa, PRF-01…07; FTR.HMR.CMN-0007
-# qa, PF-01): the images run as user 1000 with a read-only root and /tmp as
+# qa, PF-01, PF-02, PF-05): the images run as user 1000 with a read-only root and /tmp as
 # tmpfs, like in a sandbox pod.
 set -euo pipefail
 base=$1 documents=$2 code=${3:-}
@@ -57,6 +57,11 @@ if [[ -n $code ]]; then
   echo "PF-01: tools of code"
   run "$code" 'for c in go gopls gofumpt golangci-lint node npm npx pnpm tsc eslint prettier uv ruff pytest mypy git python3; do
     command -v $c >/dev/null || { echo "no $c"; exit 1; }; done && test ! -e /usr/bin/apt-get -o ! -w /var/lib/dpkg' || fail "PF-01"
+  echo "PF-05: curl and procps in code, not in base and documents"
+  run "$code" 'command -v curl && command -v ps && command -v pkill && ps -e >/dev/null' >/dev/null || fail "PF-05"
+  for img in "$base" "$documents"; do
+    if run "$img" 'command -v curl' >/dev/null; then fail "PF-05 $img: curl"; fi
+  done
   echo "PF-02: Go, Python and JavaScript work offline in /work"
   # exec on /tmp and /work as on the emptyDir of a pod: go test runs the binaries it builds
   docker run --rm --read-only --user 1000:1000 --tmpfs /tmp:rw,exec,size=256m --tmpfs /work:rw,exec,size=1g,uid=1000 --network none "$code" bash -c '

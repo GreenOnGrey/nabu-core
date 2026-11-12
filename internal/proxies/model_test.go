@@ -63,13 +63,13 @@ func TestValidEnv(t *testing.T) {
 	}
 }
 
-// PX-01, PX-02, PX-07: the template of "packages" and private registries.
+// PX-01, PX-02, PX-07, PX-22: the template of "packages" and private registries.
 func TestBuild(t *testing.T) {
 	allow, env, err := Build(Spec{Ecosystems: []string{EcoGo, EcoNPM, EcoPyPI}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(allow) != 5 || allow[0].String() != "proxy.golang.org:443" {
+	if len(allow) != 6 || allow[0].String() != "proxy.golang.org:443" || allow[2].String() != "storage.googleapis.com:443" {
 		t.Fatalf("allow %v", allow)
 	}
 	if e, _ := findEnv(env, "GOPROXY"); e.Value != "https://proxy.golang.org" {
