@@ -68,7 +68,7 @@ const (
 )
 
 // ResultCodes is the list of the audit result codes (R3), the same as the
-// constraint audit_result_code_chk of migration 0019.
+// constraint audit_result_code_chk of migration 0020.
 var ResultCodes = []string{"ok", "tool_error", "transport_error", "denied", "file_rejected", "file_too_large", "auth"}
 
 // Config is the thresholds and windows of the report (tech §«Конфигурация»).

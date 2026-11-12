@@ -106,7 +106,7 @@ func (s *Service) ReconcilePublished(ctx context.Context, actor Actor) (int, boo
 	var done bool
 	if err := s.Pool.QueryRow(ctx, `SELECT coalesce((value->>'done')::boolean, false) FROM settings WHERE key = 'catalog_access_reconcile'`).Scan(&done); err != nil {
 		if postgres.IsNoRows(err) {
-			return 0, false, nil // migration 0020 did not run yet
+			return 0, false, nil // migration 0021 did not run yet
 		}
 		return 0, false, err
 	}

@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// MIG-07: the migrations of the feature are 0019 and 0020 — the numbers from
+// MIG-07: the migrations of the feature are 0020 and 0021 — the numbers from
 // arch A25 (0015/0016) are taken by the repository; both are the latest.
 func TestMigrationsPresent(t *testing.T) {
 	files, err := filepath.Glob("../../migrations/*.sql")
@@ -31,16 +31,16 @@ func TestMigrationsPresent(t *testing.T) {
 		}
 		found[filepath.Base(f)] = true
 	}
-	for _, want := range []string{"0019_catalog_usage.sql", "0020_catalog_usage_actions.sql"} {
+	for _, want := range []string{"0020_catalog_usage.sql", "0021_catalog_usage_actions.sql"} {
 		if !found[want] {
 			t.Fatalf("migration %s is missing; have %v", want, found)
 		}
 	}
-	if max != 20 {
-		t.Fatalf("the latest migration is %04d, want 0020", max)
+	if max != 21 {
+		t.Fatalf("the latest migration is %04d, want 0021", max)
 	}
-	// every migration has Down, the aggregates live in 0019 and the journal values in 0020
-	for _, f := range []string{"0019_catalog_usage.sql", "0020_catalog_usage_actions.sql"} {
+	// every migration has Down, the aggregates live in 0020 and the journal values in 0021
+	for _, f := range []string{"0020_catalog_usage.sql", "0021_catalog_usage_actions.sql"} {
 		b, err := os.ReadFile(filepath.Join("../../migrations", f))
 		if err != nil {
 			t.Fatal(err)
