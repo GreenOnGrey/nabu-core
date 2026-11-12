@@ -351,6 +351,8 @@ type collector struct {
 	compactions                  []agent.Event
 	contextTokens, contextWindow int64
 	onEvent                      func(agent.Event)
+	// costUnknown marks the usage of a turn on a model without a known price (FTR.HMR.DEV-0004 R6).
+	costUnknown bool
 	// first is called once, with the first piece of the answer.
 	first func()
 	// FTR.NAB.CMN-0010: the stall detector of the turn. abort stops the running
@@ -380,6 +382,10 @@ func (c *collector) flush() {
 }
 
 func (c *collector) handle(ev agent.Event) {
+	if ev.Type == agent.EventUsage && c.costUnknown { // FTR.HMR.DEV-0004 R6: zero is not free
+		f := false
+		ev.CostKnown = &f
+	}
 	if c.onEvent != nil {
 		c.onEvent(ev)
 	}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -340,11 +341,13 @@ func (e *Engine) serviceTurn(ctx context.Context, runID uuid.UUID, ag *services.
 		// proxies of the agent.
 		files := e.runHasFiles(ctx, runID)
 		hasCopy = files
-		rs, err := e.Sandboxes.StartEphemeral(ctx, wsID, runID.String(), ag.WorkspaceProfile,
+		st, err := e.Sandboxes.StartEphemeral(ctx, wsID, runID.String(), ag.WorkspaceProfile,
 			space.Ephemeral{Files: files, Proxies: ag.Proxies, TokenTTL: time.Duration(ag.Limits.TimeoutSec)*time.Second + 10*time.Minute})
 		if err != nil {
 			return "", "workspace_not_connected", err.Error(), total, false
 		}
+		rs := st.Proxies
+		secrets = append(secrets, st.Secrets...) // FTR.HMR.DEV-0004 R10: the tokens of the sandbox and the proxies
 		defer e.Sandboxes.StopEphemeral(context.WithoutCancel(ctx), wsID)
 		if files {
 			// Runs before StopEphemeral: the changes are taken from the live sandbox.
@@ -372,6 +375,7 @@ func (e *Engine) serviceTurn(ctx context.Context, runID uuid.UUID, ag *services.
 		audit: ledger.Entry{AgentKind: "service", Agent: ag.Name, ClientID: &cid, InitiatorEmail: initiator, Channel: "client:" + clientName}}
 	connID, _ := uuid.Parse(model.ConnectionID)
 	col.usage = ledger.UsageRow{RunID: &runID, ClientID: &cid, Agent: ag.Name, Model: model.ModelID, ConnectionID: &connID}
+	col.costUnknown = !e.Models.PriceKnown(ctx, connID, model.ModelID)
 	e.watchStall(col, "service")
 	col.abort = func() { _ = e.Op.Abort(context.WithoutCancel(ctx), resp.SessionID) }
 	limitHit := false
@@ -380,9 +384,11 @@ func (e *Engine) serviceTurn(ctx context.Context, runID uuid.UUID, ag *services.
 		case agent.EventTextDelta:
 			e.Services.AppendEvent(ctx, runID, "text_delta", map[string]string{"delta": ev.Delta})
 		case agent.EventToolCall:
-			e.Services.AppendEvent(ctx, runID, "tool_call", map[string]any{"id": ev.ID, "name": ev.Name, "args": ev.Args})
+			// FTR.HMR.DEV-0004 R10, arch §4.4: the events of a run are read by its client: no secrets in them
+			e.Services.AppendEvent(ctx, runID, "tool_call", map[string]any{"id": ev.ID, "name": ev.Name, "args": maskArgs(ev.Args, secrets)})
 		case agent.EventToolResult:
-			e.Services.AppendEvent(ctx, runID, "tool_result", map[string]any{"id": ev.ID, "name": ev.Name, "isError": ev.IsError, "summary": clip(ev.Summary, 2000)})
+			e.Services.AppendEvent(ctx, runID, "tool_result", map[string]any{"id": ev.ID, "name": ev.Name, "isError": ev.IsError,
+				"summary": clip(ledger.Mask(ev.Summary, secrets, math.MaxInt), 2000)})
 		case agent.EventUsage:
 			e.Services.AppendEvent(ctx, runID, "usage", ev.Usage)
 			var t agent.Usage
@@ -585,4 +591,18 @@ func (e *Engine) collectChanges(ctx context.Context, runID uuid.UUID, wsID strin
 		return
 	}
 	e.Services.SetChangesCount(ctx, runID, out.Files)
+}
+
+// maskArgs hides the secrets of a run in the arguments of a tool call
+// (FTR.HMR.DEV-0004 R10); what stops being JSON after it is kept as a string.
+func maskArgs(raw json.RawMessage, secrets []string) json.RawMessage {
+	if len(raw) == 0 {
+		return raw
+	}
+	s := ledger.Mask(string(raw), secrets, math.MaxInt)
+	if json.Valid([]byte(s)) {
+		return json.RawMessage(s)
+	}
+	b, _ := json.Marshal(s)
+	return b
 }
