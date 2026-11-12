@@ -111,6 +111,19 @@ func (s *Service) AdminRoutes(r chi.Router, hookKey []byte) {
 		httpx.JSON(w, 200, map[string]any{"items": out})
 		return nil
 	}))
+	r.Get("/catalog/{id}", httpx.Handler(func(w http.ResponseWriter, r *http.Request) error {
+		// FTR.NAB.CHAT-0005 R13, R15: the card carries the publication state and the check times.
+		id, err := itemID(r)
+		if err != nil {
+			return err
+		}
+		it, err := s.Get(r.Context(), id)
+		if err != nil {
+			return err
+		}
+		httpx.JSON(w, 200, it)
+		return nil
+	}))
 	r.Post("/catalog", httpx.Handler(func(w http.ResponseWriter, r *http.Request) error {
 		var in Input
 		if err := httpx.Decode(r, &in); err != nil {

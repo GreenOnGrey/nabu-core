@@ -243,6 +243,49 @@ func callResult(status int, isErr bool, err error) string {
 	return "ok"
 }
 
+// callerKind is the label of the caller of a refused unpublished item
+// (FTR.NAB.CHAT-0005 R32, OBS-02).
+func callerKind(c jwt.Claims) string {
+	switch {
+	case c.Channel == "run":
+		return "service"
+	case strings.HasPrefix(c.Channel, "group:"):
+		return "group"
+	case strings.HasPrefix(c.Channel, "client:"):
+		return "client"
+	}
+	return "user"
+}
+
+// withCallMeta adds result._meta["nabu/call"] to the answer of a tools/call:
+// the classified code and the duration for the audit of the engine
+// (FTR.NAB.CHAT-0005 R3, tech §«Движок, прокси и доступ»).
+func withCallMeta(raw []byte, code string, d time.Duration) []byte {
+	meta := map[string]any{"code": code, "durationMs": d.Milliseconds()}
+	var msg map[string]json.RawMessage
+	if json.Unmarshal(raw, &msg) != nil || msg["result"] == nil {
+		return raw
+	}
+	var result map[string]json.RawMessage
+	if json.Unmarshal(msg["result"], &result) != nil {
+		return raw
+	}
+	var old map[string]any
+	_ = json.Unmarshal(result["_meta"], &old)
+	if old == nil {
+		old = map[string]any{}
+	}
+	b, _ := json.Marshal(meta)
+	old["nabu/call"] = json.RawMessage(b)
+	result["_meta"], _ = json.Marshal(old)
+	msg["result"], _ = json.Marshal(result)
+	out, err := json.Marshal(msg)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
 // statusOf finds the HTTP status in an error of mcp.CallTool ("…: HTTP 401").
 func statusOf(err error) int {
 	if err == nil {
@@ -287,6 +330,7 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 	}
 	it, err := s.Get(r.Context(), itemID)
 	if err != nil || !it.Published || it.InDevelopment {
+		metrics.CatalogUsagePublishBlocked.WithLabelValues(callerKind(c)).Inc()                // FTR.NAB.CHAT-0005 R32, OBS-02
 		rpcError(w, http.StatusConflict, "catalog_item_unavailable: the item was unpublished") // CAT-08
 		return
 	}
@@ -430,13 +474,14 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 		if fr != nil {
 			result = fr.result
 		}
-		observe(it, call.Params.Name, result, time.Since(start))
+		elapsed := time.Since(start)
+		observe(it, call.Params.Name, result, elapsed)
 		w.WriteHeader(resp.StatusCode)
 		if failed {
-			_, _ = w.Write(raw)
+			_, _ = w.Write(withCallMeta(raw, result, elapsed))
 			return
 		}
-		_, _ = w.Write(withResultNote(raw, note, fr))
+		_, _ = w.Write(withCallMeta(withResultNote(raw, note, fr), result, elapsed))
 		return
 	}
 	for _, h := range []string{"Content-Type", "Mcp-Session-Id", "Cache-Control"} {
@@ -448,8 +493,19 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 	filterTools := func(raw []byte) []byte { return filterToolsList(raw, it, only) }
 	w.WriteHeader(resp.StatusCode)
 	if !filter {
-		// a call is streamed through; its last message tells the result (OBS-01)
-		var seen resultSniffer
+		if isCall {
+			// FTR.NAB.CHAT-0005 R3: the answer of a call carries the code and the duration of
+			// the call in result._meta["nabu/call"] — the only source of the audit.
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+			var seen resultSniffer
+			seen.write(raw)
+			code := callResult(resp.StatusCode, seen.isError(), nil)
+			elapsed := time.Since(start)
+			observe(it, call.Params.Name, code, elapsed)
+			_, _ = w.Write(withCallMeta(raw, code, elapsed))
+			return
+		}
+		// not a call: streamed through
 		fl, _ := w.(http.Flusher)
 		buf := make([]byte, 32<<10)
 		for {
@@ -459,16 +515,10 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 				if fl != nil {
 					fl.Flush()
 				}
-				if isCall {
-					seen.write(buf[:n])
-				}
 			}
 			if err != nil {
 				break
 			}
-		}
-		if isCall {
-			observe(it, call.Params.Name, callResult(resp.StatusCode, seen.isError(), nil), time.Since(start))
 		}
 		return
 	}

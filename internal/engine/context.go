@@ -280,3 +280,16 @@ func hasSkill(sk *agent.Skills, name string) bool {
 func skillPrompt(name, prompt string) string {
 	return "/skill:" + name + " " + prompt
 }
+
+// skillUsage records the telemetry of skills (FTR.NAB.CHAT-0005 R24): a
+// skill collected into the set of a session or explicitly activated. The
+// implicit use of a skill is not observed and is not recorded.
+func (e *Engine) skillUsage(ctx context.Context, uid uuid.UUID, names []string, sessionID, channel, kind string) {
+	for _, n := range names {
+		if _, err := e.Pool.Exec(ctx, `INSERT INTO skill_usage_events (item_id, item_name, session_id, user_id, channel, kind)
+			SELECT id, coalesce(nullif(title,''), name), NULLIF($2,''), $3, $4, $5
+			FROM catalog_items WHERE type = 'skill' AND skills ? $1`, n, sessionID, uid, channel, kind); err != nil {
+			slog.WarnContext(ctx, "skill usage event", "err", err, "skill", n)
+		}
+	}
+}

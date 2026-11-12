@@ -33,6 +33,7 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/apperr"
 	"github.com/GreenOnGrey/nabu-core/internal/auth"
 	"github.com/GreenOnGrey/nabu-core/internal/catalog"
+	"github.com/GreenOnGrey/nabu-core/internal/catalogusage"
 	"github.com/GreenOnGrey/nabu-core/internal/channels"
 	"github.com/GreenOnGrey/nabu-core/internal/channels/email"
 	"github.com/GreenOnGrey/nabu-core/internal/chat"
@@ -76,16 +77,18 @@ import (
 
 // core holds the dependencies shared by api and worker.
 type core struct {
-	cfg       *config.Config
-	pool      *pgxpool.Pool
-	s3        storage.Storage
-	box       *crypto.Box
-	signer    *jwt.Signer
-	events    *events.PGPublisher
-	operator  *agent.Client
-	users     *users.Repo
-	models    *models.Service
-	catalog   *catalog.Service
+	cfg      *config.Config
+	pool     *pgxpool.Pool
+	s3       storage.Storage
+	box      *crypto.Box
+	signer   *jwt.Signer
+	events   *events.PGPublisher
+	operator *agent.Client
+	users    *users.Repo
+	models   *models.Service
+	catalog  *catalog.Service
+	// FTR.NAB.CHAT-0005: the usage tab of the catalog.
+	usage     *catalogusage.Service
 	memory    *memory.Service
 	comm      *comm.Service
 	tasks     *tasks.Service
@@ -225,6 +228,8 @@ func newCore(ctx context.Context, cfg *config.Config) (*core, error) {
 	c.registry = &channels.Registry{Pool: pool, Box: box, Events: pub}
 	// FTR.NAB.CMN-0007: the access of users by groups
 	c.access = &access.Service{Pool: pool, Events: pub}
+	// FTR.NAB.CHAT-0005: the aggregates, the report and the actions of the usage tab.
+	c.usage = &catalogusage.Service{Pool: pool, Cfg: catalogusage.ConfigFrom(cfg), Events: pub, Access: c.access}
 	c.registry.Granted = c.access.Channels
 	c.models.Access = c.access.Effective
 	c.catalog.Access = c.access
@@ -638,6 +643,7 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 		wc, _ := c.chatAPI.Whisper.(*whisper.Client)
 		r.Get("/voice", whisper.StatusHandler(cfg.WhisperURL, wc))
 		c.catalog.AdminRoutes(r, cfg.SecretsKey)
+		c.usage.Routes(r) // FTR.NAB.CHAT-0005: the usage tab and its actions
 		c.services.AdminRoutes(r)
 		c.profiles.AdminRoutes(r)
 		c.proxies.AdminRoutes(r, c.proxyChecker)
@@ -855,7 +861,8 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 		}
 	})
 	g.Go(func() error { c.tasks.Run(gctx); return nil })
-	g.Go(func() error { pods.Run(gctx); return nil }) // one manager of agent pods per instance (advisory lock)
+	g.Go(func() error { return c.usageLoop(gctx, cfg) }) // FTR.NAB.CHAT-0005 R5: the recompute of the aggregates
+	g.Go(func() error { pods.Run(gctx); return nil })    // one manager of agent pods per instance (advisory lock)
 	if sandboxes != nil {
 		g.Go(func() error { sandboxes.Run(gctx); return nil })
 		// FTR.NAB.CMN-0008 tech §5.6, §5.7: checks of custom images and the
@@ -1065,6 +1072,10 @@ func RunCleaner(ctx context.Context, cfg *config.Config) error {
 	} else {
 		slog.Info("cleaned", "what", "communications", "notes", purged.Notes, "people", purged.People, "topics", purged.Topics)
 	}
+	// FTR.NAB.CHAT-0005 tech §«Ретеншен»: aggregates first, then intervals, tombstones and pins.
+	if _, err := (&catalogusage.Service{Pool: pool, Cfg: catalogusage.ConfigFrom(cfg)}).Sweep(ctx); err != nil {
+		return fmt.Errorf("catalog usage retention: %w", err)
+	}
 	// the mail log is kept as long as the audit (arch §8)
 	if _, err := pool.Exec(ctx, `DELETE FROM email_log WHERE at < now() - make_interval(secs => $1)`, cfg.AuditRetention.Seconds()); err != nil {
 		return fmt.Errorf("mail log: %w", err)
@@ -1209,6 +1220,32 @@ func (c *core) proxyChecker() proxies.Checker {
 		return nil
 	}
 	return egress.Check(c.cfg.EgressURL, c.signer)
+}
+
+// usageLoop recomputes the aggregates of catalog usage every
+// CATALOG_USAGE_TICK and runs the one-time reconciliation of access of the
+// rollout window (FTR.NAB.CHAT-0005 R5, R32, arch A22).
+func (c *core) usageLoop(ctx context.Context, cfg *config.Config) error {
+	if n, ran, err := c.usage.Reconcile(ctx); err != nil {
+		slog.Warn("catalog access reconcile", "err", err)
+	} else if ran {
+		slog.Info("catalog access reconciled", "revoked", n)
+	}
+	if err := c.usage.Recompute(ctx); err != nil && ctx.Err() == nil {
+		slog.Error("catalog usage recompute", "err", err)
+	}
+	t := time.NewTicker(cfg.CatalogUsageTick)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+			if err := c.usage.Recompute(ctx); err != nil && ctx.Err() == nil {
+				slog.Error("catalog usage recompute", "err", err)
+			}
+		}
+	}
 }
 
 // every runs fn every d until ctx ends.

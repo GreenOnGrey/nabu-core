@@ -198,7 +198,7 @@ func (e *Engine) taskTurn(ctx context.Context, lease *agentpods.Lease, ri *tasks
 		return "", operatorClass(err), operatorText(err), e.podLost(lease, err)
 	}
 	defer op.Close(context.WithoutCancel(ctx), resp.SessionID)
-	col := &collector{e: e, ctx: ctx, uid: user.ID, secrets: b.secrets,
+	col := &collector{e: e, ctx: ctx, uid: user.ID, secrets: b.secrets, sessionID: resp.SessionID,
 		audit: ledger.Entry{AgentKind: "personal", Agent: b.persona.Agent.Name, UserID: &user.ID, Channel: "task:" + ri.TaskID.String()}}
 	connID, _ := uuid.Parse(b.model.ConnectionID)
 	col.usage = ledger.UsageRow{UserID: &user.ID, Model: b.model.ModelID, ConnectionID: &connID}
@@ -305,9 +305,16 @@ func (e *Engine) serviceTurn(ctx context.Context, runID uuid.UUID, ag *services.
 	if err != nil {
 		return "", "agent_not_configured", err.Error(), total, false
 	}
-	cat, err := e.Catalog.ForServiceAgent(ctx, ag.MCP, ag.Skills, runID.String(), tokenTTL)
+	cat, unavailable, err := e.Catalog.ForServiceAgent(ctx, ag.MCP, ag.Skills, runID.String(), tokenTTL)
 	if err != nil {
 		return "", string(agent.ErrAgentCrashed), err.Error(), total, false
+	}
+	if len(unavailable) > 0 {
+		// FTR.NAB.CHAT-0005 R32: a regular agent does not fail silently when an item of its
+		// configuration is unpublished or gone; the run names the items.
+		metrics.CatalogUsagePublishBlocked.WithLabelValues("service").Inc() // OBS-05
+		return "", "catalog_item_unavailable", "catalog_item_unavailable: the items of the configuration are unavailable: " +
+			strings.Join(unavailable, ", "), total, false
 	}
 	req := agent.SessionRequest{Kind: agent.KindRun, Model: model, Label: ag.Name + " " + runID.String()[:8],
 		Secrets: agent.Secrets{LLMKey: key, MCPHeaders: map[string]map[string]string{}}, SystemAppend: ag.Instructions,
@@ -368,8 +375,11 @@ func (e *Engine) serviceTurn(ctx context.Context, runID uuid.UUID, ag *services.
 	}
 	defer e.Op.Close(context.WithoutCancel(ctx), resp.SessionID)
 	var cid = clientID
-	col := &collector{e: e, ctx: ctx, secrets: secrets,
+	col := &collector{e: e, ctx: ctx, secrets: secrets, sessionID: resp.SessionID,
 		audit: ledger.Entry{AgentKind: "service", Agent: ag.Name, ClientID: &cid, InitiatorEmail: initiator, Channel: "client:" + clientName}}
+	if cat.Skills != nil {
+		e.skillUsage(ctx, uuid.Nil, cat.Skills, resp.SessionID, "run", "collected") // FTR.NAB.CHAT-0005 R24
+	}
 	connID, _ := uuid.Parse(model.ConnectionID)
 	col.usage = ledger.UsageRow{RunID: &runID, ClientID: &cid, Agent: ag.Name, Model: model.ModelID, ConnectionID: &connID}
 	e.watchStall(col, "service")

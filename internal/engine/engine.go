@@ -361,6 +361,11 @@ type collector struct {
 	stalled, stalledTool string
 	wrapup               bool
 	abort                func()
+	// FTR.NAB.CHAT-0005 R3: the session of the turn, the boundaries of the
+	// calls and the items the names of the servers resolve to (cached per turn).
+	sessionID string
+	toolStart map[string]time.Time
+	itemIDs   map[string]*uuid.UUID
 }
 
 func stepTitle(server, tool string) string {
@@ -403,6 +408,10 @@ func (c *collector) handle(ev agent.Event) {
 			c.abortTurn()
 		}
 		c.flush()
+		if c.toolStart == nil {
+			c.toolStart = map[string]time.Time{}
+		}
+		c.toolStart[ev.ID] = time.Now()
 		server, tool := ledger.SplitTool(ev.Name)
 		if c.args == nil {
 			c.args = map[string]string{}
@@ -438,6 +447,7 @@ func (c *collector) handle(ev agent.Event) {
 		if server != "" {
 			a.Server = &server
 		}
+		c.attribute(&a, ev, server)
 		c.e.Ledger.Audit(c.ctx, a, c.args[ev.ID], c.secrets) // AUD-01
 		c.observeStall(ev)
 	case agent.EventUsage:
@@ -465,6 +475,54 @@ func (c *collector) handle(ev agent.Event) {
 	}
 }
 
+// attribute adds the item, the session, the duration and the classified code
+// to an audit record (FTR.NAB.CHAT-0005 R3): the code and the duration come
+// from the answer of the proxy, the duration is measured here when absent.
+func (c *collector) attribute(a *ledger.Entry, ev agent.Event, server string) {
+	if c.sessionID != "" {
+		id := c.sessionID
+		a.SessionID = &id
+	}
+	code := ev.ResultCode
+	if code == "" {
+		code = ledger.ResultOK
+		if ev.IsError {
+			code = ledger.ResultToolError
+		}
+	}
+	a.ResultCode = &code
+	var ms int
+	if ev.DurationMS != nil {
+		ms = *ev.DurationMS
+	} else if start, ok := c.toolStart[ev.ID]; ok {
+		ms = int(time.Since(start).Milliseconds())
+	}
+	if ms > 0 {
+		a.DurationMS = &ms
+	}
+	a.ItemID = c.itemID(server)
+}
+
+// itemID resolves the server name of the turn to an item once (R3): the
+// same name is not asked of the catalog again in the turn.
+func (c *collector) itemID(server string) *uuid.UUID {
+	if server == "" || server == "workspace" || server == "nabu" {
+		return nil
+	}
+	if c.itemIDs == nil {
+		c.itemIDs = map[string]*uuid.UUID{}
+	}
+	if v, ok := c.itemIDs[server]; ok {
+		return v
+	}
+	id, err := c.e.Catalog.ItemIDByName(c.ctx, server)
+	if err != nil {
+		return nil // the next call asks again
+	}
+	c.itemIDs[server] = id
+	return id
+}
+
 // subagentTool audits a tool call of a subagent like one of the agent
 // (FTR.NAB.CMN-0009 R9).
 func (c *collector) subagentTool(ev agent.Event) {
@@ -488,6 +546,7 @@ func (c *collector) subagentTool(ev agent.Event) {
 	if server != "" {
 		a.Server = &server
 	}
+	c.attribute(&a, ev, server)
 	c.e.Ledger.Audit(c.ctx, a, c.args[key], c.secrets)
 	delete(c.args, key)
 }
@@ -984,6 +1043,15 @@ func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked
 			break // stopped before the answer began
 		}
 		stop.session(sess.OpSession)
+		col.sessionID = sess.ID.String() // FTR.NAB.CHAT-0005 R3
+		if sess.Fresh && b.req.Skills != nil {
+			// FTR.NAB.CHAT-0005 R24: the set of skills of a new session is collected;
+			// the names are recorded once per session.
+			e.skillUsage(ctx, u.ID, b.req.Skills.Names, col.sessionID, ch, "collected")
+		}
+		if skill != "" {
+			e.skillUsage(ctx, u.ID, []string{skill}, col.sessionID, ch, "activated")
+		}
 		openSession := sess.OpSession
 		col.abort = func() { _ = op.Abort(context.WithoutCancel(ctx), openSession) }
 		err = op.Prompt(stop.ctx, sess.OpSession, agent.PromptRequest{Text: prompt, Images: images, Deadline: deadline(ctx)}, col.handle)

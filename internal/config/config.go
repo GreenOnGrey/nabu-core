@@ -136,6 +136,24 @@ type Config struct {
 	AuditRetention    time.Duration
 	TopicArchiveAfter time.Duration
 
+	// FTR.NAB.CHAT-0005 tech §«Конфигурация»: the usage tab of the catalog.
+	CatalogUsageUnusedDays     int
+	CatalogUsageReferenceDays  int
+	CatalogUsagePinDays        int
+	CatalogUsageSingleUserMax  int
+	CatalogUsageErrorsShare    float64
+	CatalogUsageErrorsMinCalls int
+	CatalogUsageAuthShare      float64
+	CatalogUsageAuthMinCalls   int
+	CatalogUsageQuickDays      int
+	CatalogUsageDrilldownDays  int
+	CatalogUsageToolsCandidate int
+	CatalogUsageTick           time.Duration
+	// CatalogUsageCloseAfter is the time of the day a past day is closed, "00:15".
+	CatalogUsageCloseAfter    string
+	CatalogUsageRetentionDays int
+	CatalogUsageMonthlyMonths int
+
 	TaskTick        time.Duration
 	TaskRunTimeout  time.Duration
 	TaskMinInterval time.Duration
@@ -404,6 +422,15 @@ func Load() (*Config, error) {
 		PreviewMaxBytes: p.bytes("PREVIEW_MAX_BYTES", "25MB"), PreviewParallel: p.int("PREVIEW_PARALLEL", 2),
 
 		AuditRetention: p.dur("AUDIT_RETENTION", "365d"), TopicArchiveAfter: p.dur("TOPIC_ARCHIVE_AFTER", "14d"),
+
+		CatalogUsageUnusedDays: p.int("CATALOG_USAGE_UNUSED_DAYS", 30), CatalogUsageReferenceDays: p.int("CATALOG_USAGE_REFERENCE_DAYS", 90),
+		CatalogUsagePinDays: p.int("CATALOG_USAGE_PIN_DAYS", 90), CatalogUsageSingleUserMax: p.int("CATALOG_USAGE_SINGLE_USER_MAX", 1),
+		CatalogUsageErrorsShare: p.float("CATALOG_USAGE_ERRORS_SHARE", 0.7), CatalogUsageErrorsMinCalls: p.int("CATALOG_USAGE_ERRORS_MIN_CALLS", 20),
+		CatalogUsageAuthShare: p.float("CATALOG_USAGE_AUTH_SHARE", 0.5), CatalogUsageAuthMinCalls: p.int("CATALOG_USAGE_AUTH_MIN_CALLS", 20),
+		CatalogUsageQuickDays: p.int("CATALOG_USAGE_QUICK_DAYS", 7), CatalogUsageDrilldownDays: p.int("CATALOG_USAGE_DRILLDOWN_DAYS", 31),
+		CatalogUsageToolsCandidate: p.int("CATALOG_USAGE_TOOLS_CANDIDATE", 10), CatalogUsageTick: p.dur("CATALOG_USAGE_TICK", "1h"),
+		CatalogUsageCloseAfter: env("CATALOG_USAGE_CLOSE_AFTER", "00:15"), CatalogUsageRetentionDays: p.int("CATALOG_USAGE_RETENTION_DAYS", 400),
+		CatalogUsageMonthlyMonths: p.int("CATALOG_USAGE_MONTHLY_MONTHS", 36),
 
 		TaskTick: p.dur("TASK_TICK", "15s"), TaskRunTimeout: p.dur("TASK_RUN_TIMEOUT", "30m"),
 		TaskMinInterval: p.dur("TASK_MIN_INTERVAL", "15m"), TaskMaxActive: p.int("TASK_MAX_ACTIVE", 20),

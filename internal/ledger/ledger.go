@@ -51,7 +51,28 @@ type Entry struct {
 	// Subagent: the call of a subagent of the agent, "<call>/<task> <description>"
 	// (FTR.NAB.CMN-0009 R9).
 	Subagent *string `json:"subagent,omitempty"`
+	// FTR.NAB.CHAT-0005 R3: attribution of the call to a catalog item, the
+	// session (harness_sessions.id), its duration and the classified result.
+	ItemID     *uuid.UUID `json:"itemId,omitempty"`
+	SessionID  *string    `json:"sessionId,omitempty"`
+	DurationMS *int       `json:"durationMs,omitempty"`
+	ResultCode *string    `json:"resultCode,omitempty"`
 }
+
+// Result codes of the audit (FTR.NAB.CHAT-0005 R3): the same set as the
+// result label of the MCP proxy metrics (FTR.NAB.CMN-0006 arch §4.3).
+const (
+	ResultOK             = "ok"
+	ResultToolError      = "tool_error"
+	ResultTransportError = "transport_error"
+	ResultDenied         = "denied"
+	ResultFileRejected   = "file_rejected"
+	ResultFileTooLarge   = "file_too_large"
+	ResultAuth           = "auth"
+)
+
+// ResultCodes is the list of the audit_result_code_chk constraint.
+var ResultCodes = []string{ResultOK, ResultToolError, ResultTransportError, ResultDenied, ResultFileRejected, ResultFileTooLarge, ResultAuth}
 
 // Ledger writes and reads usage and audit.
 type Ledger struct{ Pool *pgxpool.Pool }
@@ -98,8 +119,9 @@ func (l *Ledger) Audit(ctx context.Context, e Entry, args string, secrets []stri
 		m := Mask(*e.Error, secrets, 1000)
 		e.Error = &m
 	}
-	if _, err := l.Pool.Exec(context.WithoutCancel(ctx), `INSERT INTO audit (agent_kind, agent, user_id, client_id, initiator_email, channel, server, tool, args_summary, result, error, group_agent_id, subagent)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, e.AgentKind, e.Agent, e.UserID, e.ClientID, e.InitiatorEmail, e.Channel, e.Server, e.Tool, a, e.Result, e.Error, e.GroupAgentID, e.Subagent); err != nil {
+	if _, err := l.Pool.Exec(context.WithoutCancel(ctx), `INSERT INTO audit (agent_kind, agent, user_id, client_id, initiator_email, channel, server, tool, args_summary, result, error, group_agent_id, subagent, item_id, session_id, duration_ms, result_code)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`, e.AgentKind, e.Agent, e.UserID, e.ClientID, e.InitiatorEmail, e.Channel, e.Server, e.Tool, a, e.Result, e.Error, e.GroupAgentID, e.Subagent,
+		e.ItemID, e.SessionID, e.DurationMS, e.ResultCode); err != nil {
 		slog.ErrorContext(ctx, "audit write failed", "err", err, "tool", e.Tool)
 	}
 }

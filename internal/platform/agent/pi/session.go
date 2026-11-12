@@ -255,6 +255,7 @@ func (s *Session) run(ctx context.Context, p pirpc.PromptParams, emit func(agent
 				text := resultText(te.Result)
 				ev := agent.Event{Type: agent.EventToolResult, ID: te.ToolCallID, Name: te.ToolName, IsError: te.IsError,
 					Summary: clip(text, maxFieldBytes)}
+				ev.ResultCode, ev.DurationMS = callMeta(te.Result) // FTR.NAB.CHAT-0005 R3
 				if te.IsError && text == "Tool "+te.ToolName+" not found" {
 					notFound[te.ToolCallID] = ev
 					return
@@ -452,6 +453,24 @@ func toolLoaded(details json.RawMessage) bool {
 		NabuToolLoaded bool `json:"nabuToolLoaded"`
 	}
 	return json.Unmarshal(details, &d) == nil && d.NabuToolLoaded
+}
+
+// callMeta reads result._meta["nabu/call"] of the MCP proxy: the classified
+// result of the call and its duration (FTR.NAB.CHAT-0005 R3).
+func callMeta(raw json.RawMessage) (string, *int) {
+	var r struct {
+		Meta map[string]struct {
+			Code       string `json:"code"`
+			DurationMS *int   `json:"durationMs"`
+		} `json:"_meta"`
+	}
+	if json.Unmarshal(raw, &r) != nil {
+		return "", nil
+	}
+	if c, ok := r.Meta["nabu/call"]; ok {
+		return c.Code, c.DurationMS
+	}
+	return "", nil
 }
 
 func resultText(raw json.RawMessage) string {
