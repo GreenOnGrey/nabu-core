@@ -571,6 +571,28 @@ func (s *Service) Def(ctx context.Context, conn uuid.UUID, model string) (*agent
 	return nil, nil
 }
 
+// PriceKnown tells whether Nabu knows the price of a model of a connection
+// (FTR.HMR.DEV-0004 R6): its cost came from the catalog, the provider, a probe
+// or an administrator, not the default zero. An unknown model or a stored
+// description without sources counts as known when it has a price.
+func (s *Service) PriceKnown(ctx context.Context, conn uuid.UUID, model string) bool {
+	d, err := s.Def(ctx, conn, model)
+	if err != nil {
+		return true
+	}
+	return priceKnown(d)
+}
+
+func priceKnown(d *agent.ModelDef) bool {
+	if d == nil {
+		return true
+	}
+	if src, ok := d.Sources[FCost]; ok {
+		return src != SrcDefault
+	}
+	return d.Cost != (agent.Cost{})
+}
+
 // ResolvePersonal resolves the model of a personal agent: the user's choice
 // when it is still available, otherwise the default (R19).
 func (s *Service) ResolvePersonal(ctx context.Context, conn *uuid.UUID, model *string) (agent.ModelSpec, string, error) {
