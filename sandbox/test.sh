@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test.sh <base image> <documents image> [<code image>] — checks of the
 # built-in sandbox profiles (FTR.NAB.CMN-0008 qa, PRF-01…07; FTR.HMR.CMN-0007
-# qa, PF-01, PF-02, PF-05): the images run as user 1000 with a read-only root and /tmp as
+# qa, PF-01, PF-02, PF-05, PF-06): the images run as user 1000 with a read-only root and /tmp as
 # tmpfs, like in a sandbox pod.
 set -euo pipefail
 base=$1 documents=$2 code=${3:-}
@@ -69,6 +69,14 @@ if [[ -n $code ]]; then
     printf "package x\nimport \"testing\"\nfunc TestF(t *testing.T) { if F() != 1 { t.Fatal() } }\n" >x_test.go && go test ./... &&
     cd /work && uv venv -q .venv && printf "def test_a():\n    assert 1\n" >t_a.py && pytest -q t_a.py && ruff check t_a.py &&
     printf "const a: number = 1; console.log(a)\n" >a.ts && tsc --strict a.ts && node a.js' || fail "PF-02"
+  echo "PF-06: PostgreSQL in code on a read-only root, a second pg-start finds it running"
+  docker run --rm --read-only --user 1000:1000 --tmpfs /tmp:rw,size=256m --tmpfs /work:rw,size=1g,uid=1000 --network none "$code" bash -c '
+    url=$(pg-start) && test "$(pg-start)" = "$url" && psql "$url" -qAtc "CREATE DATABASE t" &&
+    psql -d t -qAtc "SELECT 1" | grep -qx 1 && pg_ctl stop -m fast >/dev/null && test "$(pg-start)" = "$url" &&
+    psql -qAtc "SELECT count(*) FROM pg_database WHERE datname = '"'t'"'" | grep -qx 1' || fail "PF-06"
+  for img in "$base" "$documents"; do
+    if run "$img" 'test -e /usr/lib/postgresql || command -v pg-start' >/dev/null; then fail "PF-06 $img: postgres"; fi
+  done
 fi
 
 echo "ok"

@@ -1,0 +1,38 @@
+#!/bin/bash
+# pg-start — a local PostgreSQL for the tests of a service in the code profile
+# (FTR.HMR.CMN-0007 tech §4, decision 31). It starts the server once per
+# sandbox and prints its URL; a second call finds it running and prints the
+# URL again, so a check command may call it every time:
+#
+#   NABU_TEST_DATABASE_URL=$(pg-start) go test -tags integration ./...
+#
+# The data lives in PGDATA (/work/.cache/pg: not a change of the run), the
+# server listens on 127.0.0.1 only and trusts every local connection: the
+# sandbox has one user. `pg_ctl stop` stops it.
+set -euo pipefail
+
+data=${PGDATA:-/work/.cache/pg}
+port=${PGPORT:-5432}
+url="postgres://postgres@127.0.0.1:${port}/postgres?sslmode=disable"
+
+# the server answers, not only a live PID in postmaster.pid: a pid file left by a killed sandbox may name
+# another process of this one
+if pg_isready -q -h 127.0.0.1 -p "$port" -t 2; then
+  echo "$url"
+  exit 0
+fi
+if [[ ! -s $data/PG_VERSION ]]; then
+  rm -rf "$data"
+  mkdir -p "$data"
+  initdb -D "$data" -U postgres --auth=trust -E UTF8 --locale=C.UTF-8 --no-sync >"$data.initdb.log" 2>&1 \
+    || { cat "$data.initdb.log" >&2; exit 1; }
+fi
+# nothing answers: a pid file is one of a killed server (no signal to its PID: it may be another process now)
+rm -f "$data/postmaster.pid"
+# tests, not durability: no fsync, small buffers; the socket in /tmp, the root is read-only
+if ! pg_ctl -D "$data" -l "$data/server.log" -w -t 60 start \
+  -o "-c listen_addresses=127.0.0.1 -p ${port} -k /tmp -c fsync=off -c synchronous_commit=off -c full_page_writes=off -c shared_buffers=64MB -c max_connections=100 -c jit=off" >/dev/null; then
+  tail -n 30 "$data/server.log" >&2
+  exit 1
+fi
+echo "$url"
