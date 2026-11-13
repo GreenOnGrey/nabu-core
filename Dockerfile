@@ -103,12 +103,23 @@ USER 1000:1000
 # and uv are here, apt is not. Caches go into /work (HOME), not into the
 # small /tmp; the changes of a run skip them. curl and procps (ps, pkill) are
 # for the service an agent runs and its processes (tech, decision 29); curl
-# reaches out only through the proxies of the sandbox.
+# reaches out only through the proxies of the sandbox. PostgreSQL is for the
+# integration tests of services (decision 31): no cluster at install time,
+# pg-start makes one in /work/.cache/pg as user 1000 and prints its URL;
+# initdb needs a name for that user. No SSL: the snakeoil key of ssl-cert
+# goes, one key in every image is a leak. JIT is off; its LLVM stays installed:
+# removing it would leave dpkg broken for images built on this one.
 FROM sandbox-base AS sandbox-code
 ARG VERSION=dev
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends curl procps \
- && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /etc/postgresql-common/createcluster.d \
+ && echo 'create_main_cluster = false' >/etc/postgresql-common/createcluster.d/nabu.conf \
+ && apt-get update && apt-get install -y --no-install-recommends curl procps postgresql-17 \
+ && rm -rf /var/lib/apt/lists/* /var/lib/postgresql/* \
+ && rm -f /etc/ssl/private/ssl-cert-snakeoil.key /etc/ssl/certs/ssl-cert-snakeoil.pem \
+ && ls /etc/postgresql | (! grep -q .) \
+ && groupadd -g 1000 sandbox && useradd -u 1000 -g 1000 -d /work -M -s /bin/bash sandbox
+COPY --chmod=755 sandbox/code/pg-start /usr/local/bin/pg-start
 COPY --from=golang:1.27-trixie /usr/local/go /usr/local/go
 COPY --from=node:24-trixie-slim /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 COPY --from=uv /uv /usr/local/bin/uv
@@ -127,9 +138,10 @@ RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv-build \
  && uv-build pip install --python /opt/py/bin/python --require-hashes --no-deps --no-cache -r /tmp/requirements.txt \
  && rm -rf /tmp/sandbox /tmp/requirements.txt \
  && test ! -e /opt/py/bin/pip
-ENV PATH=/opt/py/bin:/usr/local/go/bin:/work/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+ENV PATH=/opt/py/bin:/usr/local/go/bin:/work/go/bin:/usr/lib/postgresql/17/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     GOPATH=/work/go GOCACHE=/work/.cache/go-build GOTOOLCHAIN=local \
     UV_CACHE_DIR=/work/.cache/uv npm_config_cache=/work/.npm \
+    PGDATA=/work/.cache/pg PGHOST=127.0.0.1 PGPORT=5432 PGUSER=postgres \
     XDG_CACHE_HOME=/work/.cache XDG_CONFIG_HOME=/work/.cache/config XDG_DATA_HOME=/work/.cache/share XDG_STATE_HOME=/work/.cache/state
 LABEL org.opencontainers.image.title="nabu-sandbox-code"
 USER 1000:1000
