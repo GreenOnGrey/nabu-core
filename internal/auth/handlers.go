@@ -1,5 +1,7 @@
 package auth
 
+// The test cases named in this file are also of FTR.NAB.CMN-0001.
+
 import (
 	"context"
 	"crypto/rand"

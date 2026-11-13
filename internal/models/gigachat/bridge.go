@@ -1,5 +1,7 @@
 package gigachat
 
+// The test cases named in this file are also of FTR.NAB.CHAT-0001.
+
 import (
 	"bytes"
 	"context"
