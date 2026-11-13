@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
@@ -46,7 +47,7 @@ type Source struct {
 
 // PersonalAuth is how a user grants personal access.
 type PersonalAuth struct {
-	Kind         string   `json:"kind"` // oauth | token | delegation
+	Kind         string   `json:"kind"` // oauth | mcp_oauth | token | delegation
 	AuthorizeURL string   `json:"authorizeUrl,omitempty"`
 	TokenURL     string   `json:"tokenUrl,omitempty"`
 	ClientID     string   `json:"clientId,omitempty"`
@@ -58,6 +59,12 @@ type PersonalAuth struct {
 	// Audience of the Nabu JWT for delegation to a product (FTR.HMR.CMN-0006 tech §3.6).
 	Audience  string `json:"audience,omitempty"`
 	HasSecret bool   `json:"hasSecret,omitempty"`
+	// The OAuth of MCP (FTR.NAB.ADM-0001 tech §3.1): what the discovery found —
+	// read only — and why it failed.
+	Issuer       string     `json:"issuer,omitempty"`
+	Resource     string     `json:"resource,omitempty"`
+	RegisteredAt *time.Time `json:"registeredAt,omitempty"`
+	Error        *AuthError `json:"error,omitempty"`
 }
 
 // Item is a catalog item as administrators see it (secrets as last4 only).
@@ -130,6 +137,8 @@ type Service struct {
 	CheckMCP func(ctx context.Context, req agent.MCPCheckRequest) (*agent.MCPCheckResponse, error)
 	// GitToken reads private skill repositories (optional).
 	GitToken string
+	// HTTP is the client of the OAuth discovery of MCP servers; nil — the default.
+	HTTP *http.Client
 
 	userEmail UserEmail
 	// ChannelOf is the channel of the latest user message of a conversation:
@@ -314,13 +323,13 @@ func (s *Service) validate(it *Item) error {
 				return apperr.Unprocessable("invalid_auth", "personal access needs personalAuth").With("field", "personalAuth")
 			}
 			switch pa.Kind {
-			case "token", "delegation":
+			case "token", "delegation", KindMCPOAuth:
 			case "oauth":
 				if !validURL(pa.AuthorizeURL) || !validURL(pa.TokenURL) || pa.ClientID == "" {
 					return apperr.Unprocessable("invalid_auth", "OAuth needs authorizeUrl, tokenUrl and clientId").With("field", "personalAuth")
 				}
 			default:
-				return apperr.Unprocessable("invalid_auth", "personalAuth.kind is oauth, token or delegation").With("field", "personalAuth")
+				return apperr.Unprocessable("invalid_auth", "personalAuth.kind is oauth, mcp_oauth, token or delegation").With("field", "personalAuth")
 			}
 		}
 		if it.Exposure != "direct" && it.Exposure != "deferred" {
@@ -377,8 +386,22 @@ func (s *Service) Save(ctx context.Context, id *uuid.UUID, in Input) (*Item, err
 		m := *in.Mode
 		it.Mode = &m
 	}
-	if in.PersonalAuth != nil {
+	prevURL, prevPA := it.Source.URL, it.PersonalAuth
+	if in.PersonalAuth != nil && in.PersonalAuth.Kind == KindMCPOAuth {
+		// FTR.NAB.ADM-0001 R1: the fields of OAuth are what the discovery found;
+		// those of the request are ignored
+		pa := PersonalAuth{Kind: KindMCPOAuth}
+		if prevPA != nil && prevPA.Kind == KindMCPOAuth {
+			pa = *prevPA
+			pa.HasSecret = false
+		}
+		it.PersonalAuth = &pa
+	} else if in.PersonalAuth != nil {
+		if prevPA != nil && prevPA.Kind == KindMCPOAuth {
+			paSecret = nil // a secret of the registered client is not a secret of a manual client
+		}
 		pa := *in.PersonalAuth
+		pa.Issuer, pa.Resource, pa.RegisteredAt, pa.Error = "", "", nil, nil
 		if pa.ClientSecret != "" {
 			enc, err := s.Box.Seal(pa.ClientSecret)
 			if err != nil {
@@ -478,6 +501,22 @@ func (s *Service) Save(ctx context.Context, id *uuid.UUID, in Input) (*Item, err
 	if err != nil {
 		return nil, err
 	}
+	if it.Mode != nil && *it.Mode == "personal" && it.PersonalAuth != nil && it.PersonalAuth.Kind == KindMCPOAuth &&
+		(it.PersonalAuth.ClientID == "" || it.Source.URL != prevURL || prevPA == nil || prevPA.Kind != KindMCPOAuth) {
+		// a new item, a new address or a new kind: discover and register (tech §3.1)
+		if prevPA != nil && prevPA.Kind == KindMCPOAuth && prevPA.ClientID != "" && it.Source.URL != prevURL {
+			// the tokens of the users were issued to the old client for the old server (R3)
+			if _, err := s.Pool.Exec(ctx, `DELETE FROM user_connections WHERE item_id = $1`, *id); err != nil {
+				return nil, err
+			}
+			if _, err := s.Pool.Exec(ctx, `DELETE FROM oauth_states WHERE item_id = $1`, *id); err != nil {
+				return nil, err
+			}
+		}
+		if _, err := s.setupMCPOAuth(ctx, *id, it.Source.URL); err != nil {
+			return nil, err
+		}
+	}
 	s.changed(ctx)
 	return s.Get(ctx, *id)
 }
@@ -534,7 +573,7 @@ func (s *Service) Check(ctx context.Context, id uuid.UUID, email string, admin u
 			if email != "" {
 				headers = s.delegationHeaders(ctx, it, email)
 			}
-		case "oauth", "token":
+		case "oauth", KindMCPOAuth, "token":
 			tok, err := s.userToken(ctx, admin, it)
 			if admin == uuid.Nil || err != nil {
 				// as before: the server may list its tools without a token
@@ -687,7 +726,7 @@ func (s *Service) Connect(ctx context.Context, uid, id uuid.UUID, token string) 
 	}
 	if it.Type == "mcp" && it.Mode != nil && *it.Mode == "personal" {
 		switch it.PersonalAuth.Kind {
-		case "oauth":
+		case "oauth", KindMCPOAuth:
 			return s.startOAuth(ctx, uid, it)
 		case "token":
 			token = strings.TrimSpace(token)

@@ -90,6 +90,16 @@ var (
 		Name: "nabu_memory_search_seconds", Help: "Duration of the search, the table and the graph of communications.",
 		Buckets: []float64{.01, .025, .05, .1, .25, .5, 1, 2, 3, 5},
 	}, []string{"kind"})
+	// FTR.NAB.ADM-0001 arch §7: the OAuth of MCP and the source VK WorkSpace.
+	MCPOAuthRegister = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_mcp_oauth_register_total", Help: "Registrations of the client of Nabu at the authorization servers of MCP by result.",
+	}, []string{"result"})
+	MemoryVKTruncated = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_memory_vk_truncated_messages_total", Help: "Chats of VK Teams where a run of the collection stopped at the limit of messages.",
+	}, []string{"source"})
+	MemoryVKReadCursorFallback = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "nabu_memory_vk_read_cursor_fallback_total", Help: "Reads of a chat day of VK Teams by the collector without the cursor of the batch.",
+	})
 	ServiceRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nabu_service_agent_runs_total", Help: "Service agent runs by agent and result.",
 	}, []string{"agent", "result"})
@@ -177,7 +187,8 @@ func init() {
 		HTTPRequests, HTTPDuration, KafkaLag, AgentSessions, AgentProcessStarts, SubagentRuns, SubagentDuration, SubagentRejected, AgentStalls, LLMRequests, LLMErrors, LLMTokens, LLMCost,
 		Turns, WorkspaceConnections, WorkspaceCalls, Sandboxes, TaskRuns, ServiceRuns, ChannelMessages,
 		ChannelInbound, ChannelOutbound, EmailAuthRejected, IMAPConnected, VKTeamsPollLag, PendingConfirmations, Users, PurgeDeleted,
-		MemoryMaskedSecrets, MemoryDeniedTools, MemoryDigests, MemorySearch, MemoryCollect, MemoryCollectSeconds, MemoryEmbedPending)
+		MemoryMaskedSecrets, MemoryDeniedTools, MemoryDigests, MemorySearch, MemoryCollect, MemoryCollectSeconds, MemoryEmbedPending,
+		MCPOAuthRegister, MemoryVKTruncated, MemoryVKReadCursorFallback)
 }
 
 // FTR.NAB.CMN-0006 tech §3.7: calls of tools of catalog MCP servers through

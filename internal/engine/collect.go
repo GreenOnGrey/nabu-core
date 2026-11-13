@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"strings"
 	"time"
 
@@ -30,7 +31,7 @@ import (
 const CollectorAgent = "memory-collector"
 
 // CollectorInstructionsVersion names the instructions a run worked with.
-const CollectorInstructionsVersion = "2"
+const CollectorInstructionsVersion = "3"
 
 // collectorInstructions are shipped with the release: the administrator
 // changes only the model (arch §3.3). The run has no tools that change
@@ -39,7 +40,7 @@ const collectorInstructions = `You are the collector of a user's work communicat
 
 How to work:
 1. Call comm_batch. It gives the threads of this run, how to read each (readWith), the note already saved for a thread and the open commitments with the participants.
-2. For every thread: read it with the tool and the arguments from readWith; name its key subjects and call comm_topic_find with them (see topics below); then call comm_note_save. Save a note for every thread, even a short one.
+2. For every thread: read it with the tool and the arguments from readWith, and also with every call in alsoReadWith when the batch gives it (the discussions of a chat day). A chat answers from the end of the day back: read further pages with next_cursor until the messages are older than dayKey; if the source refuses the cursor of readWith, call it without the cursor and page back the same way. Name its key subjects and call comm_topic_find with them (see topics below); then call comm_note_save. Save a note for every thread, even a short one.
 3. After the note of a thread is saved, call commitment_save for every commitment in its new messages, and commitment_close for an open commitment that a new message shows is done.
 4. When all threads are done, answer with one line: how many notes you saved.
 
@@ -102,7 +103,11 @@ func (e *Engine) Collect(ctx context.Context, u *users.User, ri *tasks.RunInfo) 
 	}
 	var set tasks.CollectSettings
 	_ = json.Unmarshal(ri.Settings, &set)
-	ex := collect.Exclusions{Senders: set.Exclusions.Senders, Folders: set.Exclusions.Folders, Chats: set.Exclusions.Chats}
+	ex := collect.Exclusions{Senders: set.Exclusions.Senders, Folders: set.Exclusions.Folders, Chats: set.Exclusions.Chats,
+		IncludeMuted: set.IncludeMuted, Location: time.UTC}
+	if loc, err := time.LoadLocation(u.Timezone); err == nil && u.Timezone != "" {
+		ex.Location = loc // a chat note is a chat for a day of the user (FTR.NAB.ADM-0001 tech §4.2)
+	}
 	if e.CollectCfg.BotAddresses != nil {
 		ex.BotAddresses = e.CollectCfg.BotAddresses(ctx)
 	}
@@ -110,6 +115,8 @@ func (e *Engine) Collect(ctx context.Context, u *users.User, ri *tasks.RunInfo) 
 	since := now.AddDate(0, 0, -max(e.CollectCfg.BackfillDays, 1))
 	var queue []CollectMessage
 	sources := 0
+	var truncated []truncatedOf
+	rateLimited := false
 	for _, src := range set.Sources {
 		ad, ok := e.Comm.AdapterOf(ctx, src.ItemID)
 		if !ok {
@@ -136,6 +143,9 @@ func (e *Engine) Collect(ctx context.Context, u *users.User, ri *tasks.RunInfo) 
 				}
 				e.Ledger.Audit(ctx, ledger.Entry{AgentKind: "service", Agent: CollectorAgent, UserID: &u.ID, Channel: "task:" + ri.TaskID.String(),
 					Server: &src.Source, Tool: tool, Result: resultOf(err), Error: sourceError(err)}, "", nil) // R30: no arguments, no text
+				if errors.Is(err, catalog.ErrSourceRateLimited) {
+					return nil, collect.ErrRateLimited // not tried again: the next tick repeats (FTR.NAB.ADM-0001 tech §4.3)
+				}
 				if err == nil || attempt == 2 || ctx.Err() != nil {
 					return json.RawMessage(text), err
 				}
@@ -150,6 +160,13 @@ func (e *Engine) Collect(ctx context.Context, u *users.User, ri *tasks.RunInfo) 
 		if errors.Is(err, collect.ErrAccess) {
 			_ = e.Comm.CommitCursors(ctx, u.ID, false)
 			return e.pauseCollect(ctx, u, ri, tasks.PauseSourceAccess)
+		}
+		if errors.Is(err, collect.ErrRateLimited) {
+			// the source keeps its cursor and is read at the next tick; the batches of
+			// the other sources go on (FTR.NAB.ADM-0001 tech §4.3)
+			rateLimited = true
+			metrics.MemoryCollect.WithLabelValues("rate_limited").Inc()
+			continue
 		}
 		if err != nil {
 			slog.WarnContext(ctx, "collect: changes", "user", u.ID, "source", src.Source, "err", err)
@@ -166,12 +183,23 @@ func (e *Engine) Collect(ctx context.Context, u *users.User, ri *tasks.RunInfo) 
 		for _, t := range cs.Threads {
 			read += len(t.Messages)
 		}
-		counts, _ := json.Marshal(map[string]int{"messages": read, "threads": len(cs.Threads), "new": len(threads), "skippedAutomatic": cs.Skipped})
+		counts, _ := json.Marshal(map[string]int{"messages": read, "threads": len(cs.Threads), "new": len(threads), "skippedAutomatic": cs.Skipped,
+			"truncatedChats": len(cs.Truncated)})
+		for range cs.Truncated {
+			metrics.MemoryVKTruncated.WithLabelValues(src.Source).Inc()
+		}
 		e.Ledger.Audit(ctx, ledger.Entry{AgentKind: "service", Agent: CollectorAgent, UserID: &u.ID, Channel: "task:" + ri.TaskID.String(),
 			Server: &src.Source, Tool: "memory.collect.changes", Result: "ok"}, string(counts), nil)
 		ids, err := e.Comm.CreateBatches(ctx, u.ID, &ri.RunID, src.ItemID, src.Source, threads, cursor == "", e.CollectCfg.BatchThreads, cs.Cursor)
 		if err != nil {
 			return err
+		}
+		if len(cs.Truncated) > 0 {
+			t := truncatedOf{chats: cs.Truncated}
+			if len(ids) > 0 {
+				t.batch = ids[0]
+			}
+			truncated = append(truncated, t)
 		}
 		for _, id := range ids {
 			queue = append(queue, CollectMessage{BatchID: id, UserID: u.ID})
@@ -186,7 +214,32 @@ func (e *Engine) Collect(ctx context.Context, u *users.User, ri *tasks.RunInfo) 
 		if sources == 0 {
 			summary = "no_sources"
 		}
-		return e.Tasks.Finish(ctx, ri.RunID, true, summary, "", "", nil)
+		if rateLimited {
+			summary = "rate_limited"
+		}
+		all := map[string]int{}
+		for _, t := range truncated {
+			maps.Copy(all, t.chats)
+		}
+		return e.Tasks.Finish(ctx, ri.RunID, true, withTruncated(summary, all), "", "", nil)
+	}
+	// the result of the tick names the truncated chats: they are kept on the
+	// first batch of their source, or on the first batch of the tick
+	perBatch := map[uuid.UUID]map[string]int{}
+	for _, t := range truncated {
+		id := t.batch
+		if id == uuid.Nil {
+			id = queue[0].BatchID
+		}
+		if perBatch[id] == nil {
+			perBatch[id] = map[string]int{}
+		}
+		maps.Copy(perBatch[id], t.chats)
+	}
+	for id, m := range perBatch {
+		if err := e.Comm.SetTruncated(ctx, u.ID, id, m); err != nil {
+			return err
+		}
 	}
 	for _, m := range queue {
 		b, _ := json.Marshal(m)
@@ -198,6 +251,24 @@ func (e *Engine) Collect(ctx context.Context, u *users.User, ri *tasks.RunInfo) 
 	}
 	e.publish(ctx, "comm.collect", u.ID, map[string]any{"status": "running"})
 	return nil
+}
+
+// truncatedOf are the truncated chats of a source and the first batch of the
+// source (uuid.Nil — the source had nothing new).
+type truncatedOf struct {
+	batch uuid.UUID
+	chats map[string]int
+}
+
+// withTruncated adds to the result of a run the chats where it stopped at
+// the limit of messages, as a second line "truncated:{json}" (FTR.NAB.ADM-0001
+// R10, design §3.3).
+func withTruncated(summary string, truncated map[string]int) string {
+	if len(truncated) == 0 {
+		return summary
+	}
+	b, _ := json.Marshal(truncated)
+	return summary + "\ntruncated:" + string(b)
 }
 
 func failedErr(failed bool) error {
@@ -450,7 +521,7 @@ func (e *Engine) finishTick(ctx context.Context, u *users.User, taskRun uuid.UUI
 	if err := e.Comm.CommitCursors(ctx, u.ID, ok && tick.OverBudget == 0); err != nil {
 		slog.ErrorContext(ctx, "collect: cursors", "user", u.ID, "err", err)
 	}
-	summary := fmt.Sprintf("messages:%d notes:%d", tick.Messages, tick.Notes)
+	summary := withTruncated(fmt.Sprintf("messages:%d notes:%d", tick.Messages, tick.Notes), tick.Truncated)
 	counts, _ := json.Marshal(map[string]int{"messages": tick.Messages, "notes": tick.Notes, "failedBatches": tick.Failed, "overBudgetBatches": tick.OverBudget})
 	e.Ledger.Audit(ctx, ledger.Entry{AgentKind: "service", Agent: CollectorAgent, UserID: &u.ID, Channel: "task:" + ri.TaskID.String(),
 		Tool: "memory.collect", Result: resultOf(failedErr(!ok))}, string(counts), nil) // R30

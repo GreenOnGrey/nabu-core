@@ -151,6 +151,9 @@ type Config struct {
 	MemoryBackfillPoolShare  float64
 	MemoryEmbedBatch         int
 	MemoryGmailOverlap       time.Duration
+	// FTR.NAB.ADM-0001 tech §6: the source VK WorkSpace.
+	MemoryVKOverlap   time.Duration
+	MemoryVKChatLimit int
 	// MemoryAgentAddr is the pool of the collector agent (agent-memory); empty — the common pool.
 	MemoryAgentAddr   string
 	TaskCatchupWindow time.Duration
@@ -413,8 +416,9 @@ func Load() (*Config, error) {
 		MemoryHousekeepingEvery: p.dur("MEMORY_HOUSEKEEPING_EVERY", "10m"),
 		MemoryBackfillPoolShare: p.float("MEMORY_BACKFILL_POOL_SHARE", 0.3), MemoryEmbedBatch: p.int("MEMORY_EMBED_BATCH", 64),
 		MemoryGmailOverlap: p.dur("MEMORY_GMAIL_OVERLAP", "24h"),
-		MemoryAgentAddr:    strings.TrimRight(os.Getenv("MEMORY_AGENT_ADDR"), "/"),
-		TaskMaxFailures:    p.int("TASK_MAX_FAILURES", 3), TaskCatchupWindow: p.dur("TASK_CATCHUP_WINDOW", "1h"),
+		MemoryVKOverlap:    p.dur("MEMORY_VK_OVERLAP", "1h"), MemoryVKChatLimit: p.int("MEMORY_VK_CHAT_LIMIT", 1000),
+		MemoryAgentAddr: strings.TrimRight(os.Getenv("MEMORY_AGENT_ADDR"), "/"),
+		TaskMaxFailures: p.int("TASK_MAX_FAILURES", 3), TaskCatchupWindow: p.dur("TASK_CATCHUP_WINDOW", "1h"),
 		DefaultTimezone: env("DEFAULT_TIMEZONE", "Europe/Moscow"), DefaultLanguage: env("DEFAULT_LANGUAGE", "en"),
 
 		RunFilesMaxFiles: p.int("RUN_FILES_MAX_FILES", 5000), RunFilesMaxBytes: p.bytes("RUN_FILES_MAX_BYTES", "200MB"),

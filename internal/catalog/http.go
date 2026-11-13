@@ -99,7 +99,7 @@ func (s *Service) AdminRoutes(r chi.Router, hookKey []byte) {
 		out := make([]adminItem, 0, len(items))
 		for _, it := range items {
 			a := adminItem{Item: it}
-			if it.PersonalAuth != nil && it.PersonalAuth.Kind == "oauth" {
+			if it.PersonalAuth != nil && oauthKind(it.PersonalAuth.Kind) {
 				a.CallbackURL = s.CallbackURL(it.ID)
 			}
 			if it.Type == "skill" && it.Source.Kind == "git" {
@@ -164,6 +164,18 @@ func (s *Service) AdminRoutes(r chi.Router, hookKey []byte) {
 			return err
 		}
 		httpx.JSON(w, 200, it)
+		return nil
+	}))
+	r.Post("/catalog/{id}/oauth/register", httpx.Handler(func(w http.ResponseWriter, r *http.Request) error {
+		id, err := itemID(r)
+		if err != nil {
+			return err
+		}
+		res, err := s.Reregister(r.Context(), id)
+		if err != nil {
+			return err
+		}
+		httpx.JSON(w, 200, res)
 		return nil
 	}))
 	r.Post("/catalog/{id}/sync", httpx.Handler(func(w http.ResponseWriter, r *http.Request) error {

@@ -18,6 +18,11 @@ import (
 // of the user: the access was revoked or expired (R17).
 var ErrAccess = errors.New("no access to the source")
 
+// ErrRateLimited is returned by a Caller when the server asked to slow down
+// (HTTP 429): the tick is repeated later, it is not a failure
+// (FTR.NAB.ADM-0001 tech §4.3).
+var ErrRateLimited = errors.New("the source limits the rate of requests")
+
 // Caller calls a tool of the MCP server of the source with the personal
 // access of the user and returns the text of its result.
 type Caller func(ctx context.Context, tool string, args any) (json.RawMessage, error)
@@ -44,6 +49,12 @@ type Thread struct {
 	DayKey       string   `json:"dayKey,omitempty"`
 	Participants []string `json:"participants,omitempty"`
 	Messages     []Msg    `json:"messages"`
+	// Parts are more keys the agent reads for this note with the read tool:
+	// the discussions of the messages of a chat day (FTR.NAB.ADM-0001 arch §3.3).
+	Parts []string `json:"parts,omitempty"`
+	// ReadFrom is where the read call starts: the message after the day
+	// (FTR.NAB.ADM-0001 tech §4.2); empty — from the latest messages.
+	ReadFrom string `json:"readFrom,omitempty"`
 }
 
 // Exclusions are what is never collected for the user (R4): the senders,
@@ -51,6 +62,12 @@ type Thread struct {
 type Exclusions struct {
 	Senders, Folders, Chats []string
 	BotAddresses            []string
+	// IncludeMuted are the muted groups the user returned to the collection
+	// (FTR.NAB.ADM-0001 R8).
+	IncludeMuted []string
+	// Location is the time zone of the user: a chat note is a chat for a day
+	// of the user. nil — UTC.
+	Location *time.Location
 }
 
 // ChangeSet is what changed in a source since a cursor.
@@ -60,6 +77,9 @@ type ChangeSet struct {
 	Cursor string
 	// Skipped counts the messages left out as automatic.
 	Skipped int
+	// Truncated names the chats where the run stopped at the limit of
+	// messages, with how many it read (FTR.NAB.ADM-0001 R10).
+	Truncated map[string]int
 }
 
 // ToolCall is how the collector agent reads a thread.
@@ -90,6 +110,18 @@ type Adapter interface {
 	TimePrecision(source string) string
 	// CheckTools fails when the server lacks a tool the adapter needs.
 	CheckTools(tools []string) error
+}
+
+// PartReader is an adapter whose notes have parts: the calls that read them
+// (FTR.NAB.ADM-0001 arch §3.3).
+type PartReader interface {
+	ReadPartCalls(source string, t Thread) []ToolCall
+}
+
+// SourceChecker is an adapter of several sources, each with its own tools:
+// a source is offered only when the server has its tools (FTR.NAB.ADM-0001 R4).
+type SourceChecker interface {
+	CheckSourceTools(source string, tools []string) error
 }
 
 var registry = map[string]Adapter{}

@@ -3,6 +3,7 @@ package comm
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 	"time"
 
@@ -247,20 +248,59 @@ type Tick struct {
 	OverBudget      int
 	Notes, Messages int
 	ErrorClass      string
+	// Truncated are the chats where the tick stopped at the limit of
+	// messages, with how many it read (FTR.NAB.ADM-0001 R10).
+	Truncated map[string]int
 }
 
 // TickState sums the batches of a run of the task.
 func (s *Service) TickState(ctx context.Context, uid, taskRun uuid.UUID) (Tick, error) {
 	var t Tick
 	err := s.as(ctx, uid, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `SELECT count(*) FILTER (WHERE status IN ('queued','running')),
+		if err := tx.QueryRow(ctx, `SELECT count(*) FILTER (WHERE status IN ('queued','running')),
 				count(*) FILTER (WHERE status = 'failed' AND error_class IS DISTINCT FROM 'budget'),
 				count(*) FILTER (WHERE status = 'failed' AND error_class = 'budget'),
 				COALESCE(sum(notes), 0), COALESCE(sum(messages), 0),
 				COALESCE(max(error_class) FILTER (WHERE status = 'failed' AND error_class IS DISTINCT FROM 'budget'), '')
-			FROM comm_batches WHERE user_id = $1 AND task_run_id = $2`, uid, taskRun).Scan(&t.Pending, &t.Failed, &t.OverBudget, &t.Notes, &t.Messages, &t.ErrorClass)
+			FROM comm_batches WHERE user_id = $1 AND task_run_id = $2`, uid, taskRun).Scan(&t.Pending, &t.Failed, &t.OverBudget, &t.Notes, &t.Messages, &t.ErrorClass); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `SELECT truncated FROM comm_batches WHERE user_id = $1 AND task_run_id = $2 AND truncated IS NOT NULL`, uid, taskRun)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var raw []byte
+			if err := rows.Scan(&raw); err != nil {
+				return err
+			}
+			var m map[string]int
+			if json.Unmarshal(raw, &m) == nil {
+				for k, v := range m {
+					if t.Truncated == nil {
+						t.Truncated = map[string]int{}
+					}
+					t.Truncated[k] = v
+				}
+			}
+		}
+		return rows.Err()
 	})
 	return t, err
+}
+
+// SetTruncated keeps on a batch the chats where the tick stopped at the
+// limit of messages (FTR.NAB.ADM-0001 R10).
+func (s *Service) SetTruncated(ctx context.Context, uid, batch uuid.UUID, truncated map[string]int) error {
+	if len(truncated) == 0 {
+		return nil
+	}
+	b, _ := json.Marshal(truncated)
+	return s.as(ctx, uid, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE comm_batches SET truncated = $3 WHERE user_id = $1 AND id = $2`, uid, batch, b)
+		return err
+	})
 }
 
 // CommitCursors ends a tick: with every batch done the pending cursors become
@@ -417,9 +457,20 @@ func (s *Service) ProxyGuard(ctx context.Context, uid, run, item uuid.UUID, meth
 		return refuse("the call does not name a thread of the batch")
 	}
 	for _, t := range b.Threads {
-		if t.Key == key {
+		if t.Key == key || slices.Contains(t.Parts, key) { // FTR.NAB.ADM-0001 arch §6: a discussion of a chat day
+			if t.Key == key && t.ReadFrom != "" && !hasCursor(args) {
+				metrics.MemoryVKReadCursorFallback.Inc() // the server refused the cursor, or the agent left it out
+			}
 			return tools, ""
 		}
 	}
 	return refuse("the thread " + key + " is not in the batch of this run")
+}
+
+// hasCursor reports whether a read call starts from a cursor.
+func hasCursor(args json.RawMessage) bool {
+	var a struct {
+		Cursor string `json:"cursor"`
+	}
+	return json.Unmarshal(args, &a) == nil && a.Cursor != ""
 }

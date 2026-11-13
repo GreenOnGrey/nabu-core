@@ -3,7 +3,9 @@ package comm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"slices"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -82,12 +84,97 @@ func (s *Service) SetSource(ctx context.Context, item uuid.UUID, adapter *string
 	return err
 }
 
+// itemTools are the tools of an item its last check stored, only the
+// allowed ones when there is a list; checked — there was a check.
+func itemTools(raw, allowedRaw []byte) ([]string, bool) {
+	var tools []struct {
+		Name string `json:"name"`
+	}
+	var allowed []string
+	hasList := len(allowedRaw) > 0 && json.Unmarshal(allowedRaw, &allowed) == nil
+	if json.Unmarshal(raw, &tools) != nil || len(tools) == 0 {
+		return nil, false
+	}
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		if !hasList || slices.Contains(allowed, t.Name) {
+			names = append(names, t.Name)
+		}
+	}
+	return names, true
+}
+
+// MutedGroup is a group of VK Teams with the notifications off.
+type MutedGroup struct {
+	ChatSN string `json:"chatSn"`
+	Name   string `json:"name"`
+}
+
+// mutedGroups lists the muted groups of the user whose name has q
+// (FTR.NAB.ADM-0001 tech §3.2), up to 50.
+func (a *API) mutedGroups(ctx context.Context, uid, item uuid.UUID, q string) ([]MutedGroup, error) {
+	srcs, err := a.Store.Sources(ctx, uid)
+	if err != nil {
+		return nil, err
+	}
+	i := slices.IndexFunc(srcs, func(x SourceState) bool { return x.ItemID == item && x.Source == "vkteams" })
+	if i < 0 {
+		return nil, apperr.NotFound("not_found", "the item gives no source VK Teams")
+	}
+	if !srcs[i].Connected {
+		return nil, apperr.Conflict("comm_source_not_connected", "the source is not connected: connect it in Connections")
+	}
+	if a.CallSource == nil {
+		return nil, apperr.Unavailable("source_unavailable", "the source is not reachable")
+	}
+	out := []MutedGroup{}
+	cursor := ""
+	for page := 0; page < 10 && len(out) < 50; page++ {
+		args := map[string]any{"include_types": []string{"group"}, "limit": 100}
+		if q = strings.TrimSpace(q); q != "" {
+			args["name_query"] = q
+		}
+		if cursor != "" {
+			args["cursor"] = cursor
+		}
+		raw, _ := json.Marshal(args)
+		text, err := a.CallSource(ctx, uid, item, "messenger-list-chats", raw)
+		if err != nil {
+			if errors.Is(err, collect.ErrAccess) {
+				return nil, apperr.Conflict("source_access", "no access to the source: connect it again in Connections")
+			}
+			return nil, apperr.Unavailable("source_unavailable", "the source did not answer")
+		}
+		var res struct {
+			Chats []struct {
+				ChatSN        string `json:"chat_sn"`
+				Name          string `json:"name"`
+				Notifications *bool  `json:"notifications_enabled"`
+			} `json:"chats"`
+			NextCursor *string `json:"next_cursor"`
+		}
+		if json.Unmarshal([]byte(text), &res) != nil {
+			return nil, apperr.Unavailable("source_unavailable", "the source gave an unexpected answer")
+		}
+		for _, c := range res.Chats {
+			if c.Notifications != nil && !*c.Notifications && len(out) < 50 {
+				out = append(out, MutedGroup{ChatSN: c.ChatSN, Name: c.Name})
+			}
+		}
+		if res.NextCursor == nil || *res.NextCursor == "" {
+			break
+		}
+		cursor = *res.NextCursor
+	}
+	return out, nil
+}
+
 // Sources lists the sources the user can collect from: the sources of the
 // catalog items marked by the administrator, with whether the user connected
 // the item.
 func (s *Service) Sources(ctx context.Context, uid uuid.UUID) ([]SourceState, error) {
 	rows, err := s.Pool.Query(ctx, `SELECT c.id, COALESCE(c.adapter,''), COALESCE(NULLIF(c.title,''), c.name),
-		EXISTS (SELECT 1 FROM user_connections uc WHERE uc.item_id = c.id AND uc.user_id = $1)
+		EXISTS (SELECT 1 FROM user_connections uc WHERE uc.item_id = c.id AND uc.user_id = $1), c.tools, c.allowed_tools
 		FROM catalog_items c WHERE c.comm_source AND c.published AND c.type = 'mcp' ORDER BY c.name`, uid)
 	if err != nil {
 		return nil, err
@@ -98,11 +185,17 @@ func (s *Service) Sources(ctx context.Context, uid uuid.UUID) ([]SourceState, er
 		var id uuid.UUID
 		var adapter, itemTitle string
 		var connected bool
-		if err := rows.Scan(&id, &adapter, &itemTitle, &connected); err != nil {
+		var toolsRaw, allowedRaw []byte
+		if err := rows.Scan(&id, &adapter, &itemTitle, &connected, &toolsRaw, &allowedRaw); err != nil {
 			return nil, err
 		}
 		srcs, _ := adapterSources(adapter)
+		tools, checked := itemTools(toolsRaw, allowedRaw)
+		ad, _ := collect.Get(adapter)
 		for _, src := range srcs {
+			if sc, ok := ad.(collect.SourceChecker); ok && checked && sc.CheckSourceTools(src.Key, tools) != nil {
+				continue // FTR.NAB.ADM-0001 R4: the server lacks a tool of this source
+			}
 			// an adapter of any provider (mail) has no title of its own: the item names the mailbox
 			title := src.Title
 			if title == "" {

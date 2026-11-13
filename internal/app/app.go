@@ -779,6 +779,7 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 	// FTR.NAB.CMN-0004: conversations and tasks run in the pod of their owner.
 	eng.Collector = eng
 	collect.SetGmailOverlap(cfg.MemoryGmailOverlap)
+	collect.SetVKSettings(cfg.MemoryVKOverlap, cfg.MemoryVKChatLimit)
 	eng.CollectCfg = engine.CollectConfig{BatchThreads: cfg.MemoryBatchThreads, RunTimeout: cfg.MemoryRunTimeout, BackfillDays: cfg.MemoryBackfillDays,
 		BackfillSlots: max(1, int(float64(cfg.MemoryCollectConcurrency)*cfg.MemoryBackfillPoolShare)),
 		BotAddresses:  c.botAddresses}
@@ -1098,6 +1099,13 @@ func (c *core) userToday(ctx context.Context, uid uuid.UUID) time.Time {
 // commAPI is the API of the memory of communications (FTR.NAB.CMN-0003 tech §3).
 func (c *core) commAPI(cfg *config.Config) *comm.API {
 	return &comm.API{Store: c.comm, Sources: c.commSources, Timezone: c.userLocation, GraphMaxNodes: cfg.MemoryGraphMaxNodes, Semantic: c.comm.Semantic,
+		CallSource: func(ctx context.Context, uid, item uuid.UUID, tool string, args json.RawMessage) (string, error) {
+			text, err := c.catalog.CallSource(ctx, uid, item, tool, args)
+			if errors.Is(err, catalog.ErrSourceAccess) {
+				return "", collect.ErrAccess
+			}
+			return text, err
+		},
 		Collect: func(ctx context.Context, uid uuid.UUID) (comm.CollectState, error) {
 			st := comm.CollectState{Status: "off"}
 			mt, err := c.tasks.MemoryTaskOf(ctx, uid, tasks.KindCollect)
