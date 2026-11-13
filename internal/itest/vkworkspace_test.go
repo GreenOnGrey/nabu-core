@@ -36,6 +36,7 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/platform/mcp"
 	"github.com/GreenOnGrey/nabu-core/internal/services"
 	"github.com/GreenOnGrey/nabu-core/internal/tasks"
+	"github.com/GreenOnGrey/nabu-core/migrations"
 )
 
 // fakeVK is an MCP server with the tools of VK WorkSpace and the shapes of
@@ -551,5 +552,52 @@ func TestMCPOAuthCatalog(t *testing.T) {
 	}
 	if _, err := cat.Reregister(ctx, uuid.New()); err == nil {
 		t.Fatal("re-registration of a missing item")
+	}
+}
+
+// CAT-NODEV-01, CAT-NODEV-02 (FTR.NAB.ADM-0001 R13): the catalog has no mark «in development».
+func TestCatalogNoInDevelopment(t *testing.T) {
+	ctx := context.Background()
+	box, _ := crypto.NewBox(key)
+	cat := &catalog.Service{Pool: pool, Box: box, Signer: jwt.NewSigner("https://nabu.test", key)}
+	if err := cat.StarterCatalog(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var kind, url string
+	var published bool
+	if err := pool.QueryRow(ctx, `SELECT personal_auth->>'kind', source->>'url', published FROM catalog_items WHERE name = 'vk-workspace'`).Scan(&kind, &url, &published); err != nil {
+		t.Fatal(err)
+	}
+	if kind != catalog.KindMCPOAuth || url != "https://ai.workspace.vk.ru/mcp" || published {
+		t.Fatalf("CAT-NODEV-02: %s %s published=%v", kind, url, published)
+	}
+	// an item marked before the migration: the migration clears the mark and the item connects
+	mode := "platform"
+	it, err := cat.Save(ctx, nil, catalog.Input{Type: "mcp", Name: "dev-" + uuid.NewString()[:6], Source: &catalog.Source{Kind: "url", URL: "https://x/mcp"},
+		Mode: &mode, Published: ptr(true)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE catalog_items SET in_development = true WHERE id = $1`, it.ID); err != nil {
+		t.Fatal(err)
+	}
+	up, err := migrations.FS.ReadFile("0021_catalog_no_in_development.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt := string(up)
+	stmt = stmt[strings.Index(stmt, "-- +goose Up")+len("-- +goose Up") : strings.Index(stmt, "-- +goose Down")]
+	if _, err := pool.Exec(ctx, stmt); err != nil {
+		t.Fatal(err)
+	}
+	uid := newUser(t, "nodev-"+uuid.NewString()[:6]+"@x.org")
+	if _, err := cat.Connect(ctx, uid, it.ID, ""); err != nil {
+		t.Fatalf("CAT-NODEV-01: %v", err)
+	}
+	items, _ := cat.ForUser(ctx, uid)
+	for _, i := range items {
+		if i.ID == it.ID && i.Status != "available" {
+			t.Fatalf("CAT-NODEV-01: status %s", i.Status)
+		}
 	}
 }

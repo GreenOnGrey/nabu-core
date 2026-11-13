@@ -59,7 +59,7 @@ func (s *Service) GroupSkills(ctx context.Context, owner uuid.UUID, chosen []str
 func (s *Service) skillsOf(ctx context.Context, uid uuid.UUID, connected bool, want map[string]bool) ([]Skill, error) {
 	rows, err := s.Pool.Query(ctx, `SELECT c.id, COALESCE(NULLIF(c.title,''), c.name), c.skills, c.skills_snapshot
 		FROM catalog_items c
-		WHERE c.type = 'skill' AND c.published AND NOT c.in_development AND c.skills_snapshot IS NOT NULL
+		WHERE c.type = 'skill' AND c.published AND c.skills_snapshot IS NOT NULL
 		  AND (NOT $2 OR EXISTS (SELECT 1 FROM user_connections u WHERE u.item_id = c.id AND u.user_id = $1)) ORDER BY c.name`, uid, connected)
 	if err != nil {
 		return nil, err
