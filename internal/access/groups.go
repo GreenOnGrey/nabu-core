@@ -1,5 +1,7 @@
 package access
 
+// The test cases named in this file are also of FTR.NAB.CMN-0007.
+
 import (
 	"context"
 	"encoding/json"
