@@ -185,7 +185,7 @@ func loadResources(ctx context.Context, q Querier) (*resources, error) {
 		r.channels = append(r.channels, k)
 	}
 	rows.Close()
-	rows, err = q.Query(ctx, `SELECT id, type, COALESCE(NULLIF(title,''), name), mode FROM catalog_items WHERE published AND NOT in_development`)
+	rows, err = q.Query(ctx, `SELECT id, type, COALESCE(NULLIF(title,''), name), mode FROM catalog_items WHERE published`)
 	if err != nil {
 		return nil, err
 	}
@@ -403,7 +403,7 @@ func defaultModel(ctx context.Context, q Querier, uid uuid.UUID, a *Access, grou
 // unknown user has nothing.
 func (s *Service) ItemGranted(ctx context.Context, uid, item uuid.UUID) bool {
 	var ok bool
-	_ = s.Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM catalog_items c WHERE c.id = $2 AND c.published AND NOT c.in_development
+	_ = s.Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM catalog_items c WHERE c.id = $2 AND c.published
 		AND ($1 = '00000000-0000-0000-0000-000000000000'::uuid OR EXISTS (SELECT 1 FROM users WHERE id = $1 AND status <> 'blocked'))
 		AND (
 		COALESCE((SELECT is_admin FROM users WHERE id = $1), false) OR EXISTS (

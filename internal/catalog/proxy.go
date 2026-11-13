@@ -181,7 +181,7 @@ func (s *Service) CallTool(ctx context.Context, uid, itemID uuid.UUID, tool stri
 	if err != nil {
 		return "", true, err
 	}
-	if !it.Published || it.InDevelopment {
+	if !it.Published {
 		return "", true, ErrUnavailable()
 	}
 	if !it.allowed(tool) {
@@ -286,7 +286,7 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 		return
 	}
 	it, err := s.Get(r.Context(), itemID)
-	if err != nil || !it.Published || it.InDevelopment {
+	if err != nil || !it.Published {
 		rpcError(w, http.StatusConflict, "catalog_item_unavailable: the item was unpublished") // CAT-08
 		return
 	}
@@ -577,7 +577,7 @@ func (s *Service) CallSource(ctx context.Context, uid, itemID uuid.UUID, tool st
 	if err != nil {
 		return "", err
 	}
-	if !it.Published || it.InDevelopment {
+	if !it.Published {
 		return "", ErrUnavailable()
 	}
 	if !it.allowed(tool) {

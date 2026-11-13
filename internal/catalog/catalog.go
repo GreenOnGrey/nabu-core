@@ -69,22 +69,21 @@ type PersonalAuth struct {
 
 // Item is a catalog item as administrators see it (secrets as last4 only).
 type Item struct {
-	ID            uuid.UUID         `json:"id"`
-	Type          string            `json:"type"` // mcp | skill
-	Name          string            `json:"name"`
-	Title         string            `json:"title"`
-	Description   string            `json:"description"`
-	Source        Source            `json:"source"`
-	Mode          *string           `json:"mode"`
-	PersonalAuth  *PersonalAuth     `json:"personalAuth"`
-	PlatformAuth  map[string]string `json:"platformAuth"` // header → last4
-	ReadOnly      bool              `json:"readOnly"`
-	Exposure      string            `json:"exposure"`
-	Published     bool              `json:"published"`
-	InDevelopment bool              `json:"inDevelopment"`
-	Status        *string           `json:"status"`
-	StatusReason  *string           `json:"statusReason"`
-	Tools         []agent.MCPTool   `json:"tools"`
+	ID           uuid.UUID         `json:"id"`
+	Type         string            `json:"type"` // mcp | skill
+	Name         string            `json:"name"`
+	Title        string            `json:"title"`
+	Description  string            `json:"description"`
+	Source       Source            `json:"source"`
+	Mode         *string           `json:"mode"`
+	PersonalAuth *PersonalAuth     `json:"personalAuth"`
+	PlatformAuth map[string]string `json:"platformAuth"` // header → last4
+	ReadOnly     bool              `json:"readOnly"`
+	Exposure     string            `json:"exposure"`
+	Published    bool              `json:"published"`
+	Status       *string           `json:"status"`
+	StatusReason *string           `json:"statusReason"`
+	Tools        []agent.MCPTool   `json:"tools"`
 	// AllowedTools are the tools the agent sees (FTR.NAB.CMN-0006 R13); nil —
 	// the old rule of ReadOnly. With a list ReadOnly is computed: every
 	// allowed tool only reads.
@@ -161,7 +160,7 @@ type Service struct {
 var nameRe = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
 const itemCols = `id, type, name, COALESCE(title,''), COALESCE(description,''), source, mode, personal_auth, personal_auth_secret_enc IS NOT NULL,
-	platform_auth_enc, read_only, exposure, published, in_development, status, status_reason, tools, skills, skills_snapshot, synced_at, created_at,
+	platform_auth_enc, read_only, exposure, published, status, status_reason, tools, skills, skills_snapshot, synced_at, created_at,
 	allowed_tools, file_args, file_max_bytes, new_tools, checked_at, result_args, result_max_bytes, space_only_tools`
 
 func (s *Service) scan(row pgx.Row) (*Item, error) {
@@ -170,7 +169,7 @@ func (s *Service) scan(row pgx.Row) (*Item, error) {
 	var hasSecret bool
 	var platEnc []byte
 	if err := row.Scan(&it.ID, &it.Type, &it.Name, &it.Title, &it.Description, &src, &it.Mode, &pa, &hasSecret, &platEnc, &it.ReadOnly,
-		&it.Exposure, &it.Published, &it.InDevelopment, &it.Status, &it.StatusReason, &tools, &skills, &it.snapshot, &it.SyncedAt, &it.CreatedAt,
+		&it.Exposure, &it.Published, &it.Status, &it.StatusReason, &tools, &skills, &it.snapshot, &it.SyncedAt, &it.CreatedAt,
 		&allowed, &fileArgs, &it.FileMaxBytes, &newTools, &it.CheckedAt, &resultArgs, &it.ResultMaxBytes, &spaceOnly); err != nil {
 		return nil, err
 	}
@@ -300,7 +299,6 @@ type Input struct {
 	SpaceOnlyTools *[]string  `json:"spaceOnlyTools"`
 	Exposure       *string    `json:"exposure"`
 	Published      *bool      `json:"published"`
-	InDevelopment  *bool      `json:"inDevelopment"`
 }
 
 func validURL(u string) bool {
@@ -426,9 +424,6 @@ func (s *Service) Save(ctx context.Context, id *uuid.UUID, in Input) (*Item, err
 	if in.Published != nil {
 		it.Published = *in.Published
 	}
-	if in.InDevelopment != nil {
-		it.InDevelopment = *in.InDevelopment
-	}
 	if in.PlatformAuth != nil {
 		old, _ := s.platformHeaders(platEnc)
 		next := map[string]string{}
@@ -478,13 +473,14 @@ func (s *Service) Save(ctx context.Context, id *uuid.UUID, in Input) (*Item, err
 		nt = []byte("[]")
 	}
 	var err error
+	// in_development is written false: the mark is gone (FTR.NAB.ADM-0001 R13, migration 0021)
 	if id == nil {
 		var nid uuid.UUID
 		err = s.Pool.QueryRow(ctx, `INSERT INTO catalog_items (type, name, title, description, source, mode, personal_auth, personal_auth_secret_enc,
 			platform_auth_enc, read_only, exposure, published, in_development, allowed_tools, file_args, file_max_bytes,
 			result_args, result_max_bytes, space_only_tools)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING id`,
-			it.Type, it.Name, it.Title, it.Description, src, it.Mode, pa, paSecret, platEnc, it.ReadOnly, it.Exposure, it.Published, it.InDevelopment,
+			it.Type, it.Name, it.Title, it.Description, src, it.Mode, pa, paSecret, platEnc, it.ReadOnly, it.Exposure, it.Published, false,
 			allowed, fileArgs, it.FileMaxBytes, resultArgs, it.ResultMaxBytes, spaceOnly).Scan(&nid)
 		if postgres.IsUniqueViolation(err) {
 			return nil, apperr.Conflict("name_taken", "an item with this name exists").With("field", "name")
@@ -495,7 +491,7 @@ func (s *Service) Save(ctx context.Context, id *uuid.UUID, in Input) (*Item, err
 			personal_auth_secret_enc = $7, platform_auth_enc = $8, read_only = $9, exposure = $10, published = $11, in_development = $12,
 			allowed_tools = $13, file_args = $14, file_max_bytes = $15, new_tools = $16,
 			result_args = $17, result_max_bytes = $18, space_only_tools = $19, updated_at = now()
-			WHERE id = $1`, *id, it.Title, it.Description, src, it.Mode, pa, paSecret, platEnc, it.ReadOnly, it.Exposure, it.Published, it.InDevelopment,
+			WHERE id = $1`, *id, it.Title, it.Description, src, it.Mode, pa, paSecret, platEnc, it.ReadOnly, it.Exposure, it.Published, false,
 			allowed, fileArgs, it.FileMaxBytes, nt, resultArgs, it.ResultMaxBytes, spaceOnly)
 	}
 	if err != nil {
@@ -635,24 +631,23 @@ func (s *Service) Check(ctx context.Context, id uuid.UUID, email string, admin u
 
 // UserItem is a published item as a user sees it.
 type UserItem struct {
-	ID            uuid.UUID  `json:"id"`
-	Type          string     `json:"type"`
-	Name          string     `json:"name"`
-	Title         string     `json:"title"`
-	Description   string     `json:"description"`
-	Mode          *string    `json:"mode"`
-	AuthKind      string     `json:"authKind,omitempty"`
-	ReadOnly      bool       `json:"readOnly"`
-	Status        string     `json:"status"` // available | in_development | unavailable
-	Connected     bool       `json:"connected"`
-	ConnectedAt   *time.Time `json:"connectedAt"`
-	InDevelopment bool       `json:"inDevelopment"`
+	ID          uuid.UUID  `json:"id"`
+	Type        string     `json:"type"`
+	Name        string     `json:"name"`
+	Title       string     `json:"title"`
+	Description string     `json:"description"`
+	Mode        *string    `json:"mode"`
+	AuthKind    string     `json:"authKind,omitempty"`
+	ReadOnly    bool       `json:"readOnly"`
+	Status      string     `json:"status"` // available | unavailable
+	Connected   bool       `json:"connected"`
+	ConnectedAt *time.Time `json:"connectedAt"`
 }
 
 // ForUser lists published items with the user's state (CAT-08: unpublished items disappear).
 func (s *Service) ForUser(ctx context.Context, uid uuid.UUID) ([]UserItem, error) {
 	rows, err := s.Pool.Query(ctx, `SELECT c.id, c.type, c.name, COALESCE(c.title,''), COALESCE(c.description,''), c.mode,
-		COALESCE(c.personal_auth->>'kind',''), c.read_only, c.in_development, c.status, u.connected_at
+		COALESCE(c.personal_auth->>'kind',''), c.read_only, c.status, u.connected_at
 		FROM catalog_items c LEFT JOIN user_connections u ON u.item_id = c.id AND u.user_id = $1
 		WHERE c.published ORDER BY c.type, COALESCE(c.title, c.name)`, uid)
 	if err != nil {
@@ -663,14 +658,12 @@ func (s *Service) ForUser(ctx context.Context, uid uuid.UUID) ([]UserItem, error
 	for rows.Next() {
 		var u UserItem
 		var status *string
-		if err := rows.Scan(&u.ID, &u.Type, &u.Name, &u.Title, &u.Description, &u.Mode, &u.AuthKind, &u.ReadOnly, &u.InDevelopment, &status, &u.ConnectedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.Type, &u.Name, &u.Title, &u.Description, &u.Mode, &u.AuthKind, &u.ReadOnly, &status, &u.ConnectedAt); err != nil {
 			return nil, err
 		}
 		u.Connected = u.ConnectedAt != nil
 		u.Status = "available"
-		if u.InDevelopment {
-			u.Status = "in_development"
-		} else if status != nil && *status == "error" {
+		if status != nil && *status == "error" {
 			u.Status = "unavailable"
 		}
 		if u.Title == "" {
@@ -718,7 +711,7 @@ func (s *Service) Connect(ctx context.Context, uid, id uuid.UUID, token string) 
 	if err != nil {
 		return nil, err
 	}
-	if !it.Published || it.InDevelopment {
+	if !it.Published {
 		return nil, ErrUnavailable()
 	}
 	if s.Access != nil && !s.Access.ItemGranted(ctx, uid, id) { // FTR.NAB.CMN-0007 R10
@@ -811,7 +804,7 @@ func (s *Service) ForGroup(ctx context.Context, groupID uuid.UUID, skills []stri
 	}
 	rows, err := s.Pool.Query(ctx, `SELECT c.id, c.type, c.name, COALESCE(c.title,''), COALESCE(c.description,''), c.exposure, c.skills, c.skills_snapshot,
 			COALESCE(`+fmt.Sprintf(givesTool, "$1")+`, false)
-		FROM catalog_items c WHERE c.published AND NOT c.in_development AND (c.type = 'skill' OR c.mode = 'platform') ORDER BY c.name`, documentsTool)
+		FROM catalog_items c WHERE c.published AND (c.type = 'skill' OR c.mode = 'platform') ORDER BY c.name`, documentsTool)
 	if err != nil {
 		return nil, err
 	}
@@ -870,7 +863,7 @@ func (s *Service) ForSession(ctx context.Context, uid uuid.UUID, ch, conv string
 			md5(COALESCE(c.tools::text, '') || '|' || COALESCE(c.allowed_tools::text, '') || '|' || c.exposure),
 			COALESCE(`+fmt.Sprintf(givesTool, "$2")+`, false)
 		FROM catalog_items c JOIN user_connections u ON u.item_id = c.id AND u.user_id = $1
-		WHERE c.published AND NOT c.in_development ORDER BY c.name`, uid, documentsTool)
+		WHERE c.published ORDER BY c.name`, uid, documentsTool)
 	if err != nil {
 		return nil, err
 	}
@@ -985,32 +978,36 @@ func (s *Service) StarterCatalog(ctx context.Context) error {
 	}
 	type seed struct {
 		name, title, mode, auth string
-		readOnly, dev           bool
+		readOnly                bool
 	}
 	seeds := []seed{
-		{"confluence", "Confluence", "personal", "oauth", false, false},
-		{"jira", "Jira", "personal", "oauth", false, false},
-		{"figma", "Figma", "personal", "oauth", false, false},
-		{"vk-workspace", "VK WorkSpace", "personal", "token", false, true},
-		{"grafana", "Grafana", "platform", "", true, false},
-		{"victoriametrics", "VictoriaMetrics", "platform", "", true, false},
-		{"victorialogs", "VictoriaLogs", "platform", "", true, false},
-		{"backstage", "Backstage", "platform", "", true, false},
-		{"kubernetes", "Kubernetes", "platform", "", true, false},
-		{"postgresql", "PostgreSQL", "platform", "", true, false},
-		{"clickhouse", "ClickHouse", "platform", "", true, false},
-		{"greenplum", "Greenplum", "platform", "", true, false},
-		{"web-search", "Web search", "platform", "", false, false},
+		{"confluence", "Confluence", "personal", "oauth", false},
+		{"jira", "Jira", "personal", "oauth", false},
+		{"figma", "Figma", "personal", "oauth", false},
+		{"vk-workspace", "VK WorkSpace", "personal", KindMCPOAuth, false},
+		{"grafana", "Grafana", "platform", "", true},
+		{"victoriametrics", "VictoriaMetrics", "platform", "", true},
+		{"victorialogs", "VictoriaLogs", "platform", "", true},
+		{"backstage", "Backstage", "platform", "", true},
+		{"kubernetes", "Kubernetes", "platform", "", true},
+		{"postgresql", "PostgreSQL", "platform", "", true},
+		{"clickhouse", "ClickHouse", "platform", "", true},
+		{"greenplum", "Greenplum", "platform", "", true},
+		{"web-search", "Web search", "platform", "", false},
 	}
 	for _, sd := range seeds {
-		src, _ := json.Marshal(Source{Kind: "url", URL: "https://mcp.example.invalid/" + sd.name})
+		addr := "https://mcp.example.invalid/" + sd.name
+		if sd.name == "vk-workspace" {
+			addr = "https://ai.workspace.vk.ru/mcp" // FTR.NAB.ADM-0001: the first save registers the client
+		}
+		src, _ := json.Marshal(Source{Kind: "url", URL: addr})
 		var pa []byte
 		if sd.mode == "personal" {
 			pa, _ = json.Marshal(PersonalAuth{Kind: sd.auth})
 		}
-		if _, err := s.Pool.Exec(ctx, `INSERT INTO catalog_items (type, name, title, source, mode, personal_auth, read_only, published, in_development, status, status_reason)
-			VALUES ('mcp',$1,$2,$3,$4,$5,$6,false,$7,'unconfigured','set the address and credentials, then publish') ON CONFLICT (name) DO NOTHING`,
-			sd.name, sd.title, src, sd.mode, pa, sd.readOnly, sd.dev); err != nil {
+		if _, err := s.Pool.Exec(ctx, `INSERT INTO catalog_items (type, name, title, source, mode, personal_auth, read_only, published, status, status_reason)
+			VALUES ('mcp',$1,$2,$3,$4,$5,$6,false,'unconfigured','set the address and credentials, then publish') ON CONFLICT (name) DO NOTHING`,
+			sd.name, sd.title, src, sd.mode, pa, sd.readOnly); err != nil {
 			return fmt.Errorf("starter catalog %s: %w", sd.name, err)
 		}
 	}
