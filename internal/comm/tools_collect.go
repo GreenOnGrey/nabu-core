@@ -74,14 +74,15 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 					loc = time.UTC
 				}
 				type threadOut struct {
-					ThreadKey       string           `json:"threadKey"`
-					DayKey          string           `json:"dayKey"`
-					Source          string           `json:"source"`
-					ReadWith        collect.ToolCall `json:"readWith"`
-					Participants    []string         `json:"participants"`
-					NewMessageIDs   []string         `json:"newMessageIds"`
-					KnownMessageIDs []string         `json:"knownMessageIds"`
-					Note            any              `json:"note"`
+					ThreadKey       string             `json:"threadKey"`
+					DayKey          string             `json:"dayKey"`
+					Source          string             `json:"source"`
+					ReadWith        collect.ToolCall   `json:"readWith"`
+					AlsoReadWith    []collect.ToolCall `json:"alsoReadWith,omitempty"`
+					Participants    []string           `json:"participants"`
+					NewMessageIDs   []string           `json:"newMessageIds"`
+					KnownMessageIDs []string           `json:"knownMessageIds"`
+					Note            any                `json:"note"`
 				}
 				out := struct {
 					UserEmail       string           `json:"userEmail"`
@@ -95,6 +96,9 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 					for _, t := range b.Threads {
 						to := threadOut{ThreadKey: t.Key, DayKey: t.DayKey, Source: b.Source, ReadWith: ad.ReadCall(b.Source, t), Participants: t.Participants,
 							NewMessageIDs: []string{}, KnownMessageIDs: []string{}}
+						if pr, ok := ad.(collect.PartReader); ok {
+							to.AlsoReadWith = pr.ReadPartCalls(b.Source, t) // FTR.NAB.ADM-0001 R9
+						}
 						for _, p := range t.Participants {
 							people[strings.ToLower(p)] = true
 						}

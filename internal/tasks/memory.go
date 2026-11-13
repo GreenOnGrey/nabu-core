@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"net/http"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -57,6 +58,11 @@ type SourceRef struct {
 	Source string    `json:"source"`
 }
 
+// groupChatRe is the chat_sn of a group of VK Teams (FTR.NAB.ADM-0001 tech §3.2).
+var groupChatRe = regexp.MustCompile(`^[0-9]+@chat\.agent$`)
+
+const maxIncludeMuted = 200
+
 // Exclusions are what the user asked not to collect (R4).
 type Exclusions struct {
 	Senders []string `json:"senders"`
@@ -70,6 +76,9 @@ type CollectSettings struct {
 	Interval      string      `json:"interval"` // 15m | 1h | 4h | 1d
 	RoundTheClock bool        `json:"roundTheClock"`
 	Exclusions    Exclusions  `json:"exclusions"`
+	// IncludeMuted are the muted groups of VK Teams collected all the same
+	// (FTR.NAB.ADM-0001 R8, tech §3.2).
+	IncludeMuted []string `json:"includeMuted"`
 }
 
 // DigestDaySettings are the settings of "Daily summary".
@@ -89,7 +98,8 @@ type DigestWeekSettings struct {
 func defaultSettings(kind string) any {
 	switch kind {
 	case KindCollect:
-		return &CollectSettings{Sources: []SourceRef{}, Interval: "1h", Exclusions: Exclusions{Senders: []string{}, Folders: []string{}, Chats: []string{}}}
+		return &CollectSettings{Sources: []SourceRef{}, Interval: "1h", Exclusions: Exclusions{Senders: []string{}, Folders: []string{}, Chats: []string{}},
+			IncludeMuted: []string{}}
 	case KindDigestDay:
 		return &DigestDaySettings{Time: "09:00", Days: []int{1, 2, 3, 4, 5}, Channel: domain.ChannelWeb}
 	}
@@ -194,6 +204,15 @@ func (s *Service) memoryPlan(ctx context.Context, uid uuid.UUID, kind string, ra
 				if strings.ContainsAny(x, " \t\n\"'(){}") {
 					return "", "", nil, apperr.Unprocessable("invalid_exclusion", "an exclusion is an address or an identifier without spaces, quotes and brackets: "+x).With("field", "exclusions")
 				}
+			}
+		}
+		v.IncludeMuted = cleanList(v.IncludeMuted)
+		if len(v.IncludeMuted) > maxIncludeMuted {
+			return "", "", nil, apperr.Unprocessable("invalid_exclusion", fmt.Sprintf("at most %d muted groups are returned to the collection", maxIncludeMuted)).With("field", "includeMuted")
+		}
+		for _, x := range v.IncludeMuted {
+			if !groupChatRe.MatchString(x) { // FTR.NAB.ADM-0001 TEAMS-11
+				return "", "", nil, apperr.Unprocessable("invalid_exclusion", "a muted group is a chat of VK Teams: "+x).With("field", "includeMuted")
 			}
 		}
 	case *DigestDaySettings:

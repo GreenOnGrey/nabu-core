@@ -51,6 +51,9 @@ type API struct {
 	OnDeleteAll func(ctx context.Context, uid uuid.UUID)
 	// GraphMaxNodes is MEMORY_GRAPH_MAX_NODES.
 	GraphMaxNodes int
+	// CallSource calls a tool of a source with the personal access of the
+	// user: the muted groups of VK Teams (FTR.NAB.ADM-0001 tech §3.2).
+	CallSource func(ctx context.Context, uid, item uuid.UUID, tool string, args json.RawMessage) (string, error)
 }
 
 func (a *API) today(ctx context.Context, uid uuid.UUID) time.Time {
@@ -225,6 +228,18 @@ func (a *API) Routes(r chi.Router) {
 		return nil
 	}))
 
+	r.Get("/comm/sources/{itemId}/muted-groups", a.allowed(func(w http.ResponseWriter, r *http.Request, uid uuid.UUID) error {
+		item, err := httpx.ParamUUID(r, "itemId")
+		if err != nil {
+			return err
+		}
+		groups, err := a.mutedGroups(r.Context(), uid, item, r.URL.Query().Get("q"))
+		if err != nil {
+			return err
+		}
+		httpx.JSON(w, 200, map[string]any{"items": groups})
+		return nil
+	}))
 	r.Get("/comm/notes", a.user(func(w http.ResponseWriter, r *http.Request, uid uuid.UUID) error {
 		f, err := parseFilter(r)
 		if err != nil {

@@ -46,6 +46,9 @@ func (s *Service) startOAuth(ctx context.Context, uid uuid.UUID, it *Item) (*Con
 	if len(pa.Scopes) > 0 {
 		q.Set("scope", strings.Join(pa.Scopes, " "))
 	}
+	if pa.Resource != "" {
+		q.Set("resource", pa.Resource) // RFC 8707 (FTR.NAB.ADM-0001 tech §4.1, step 5)
+	}
 	sep := "?"
 	if strings.Contains(pa.AuthorizeURL, "?") {
 		sep = "&"
@@ -65,6 +68,9 @@ func (s *Service) tokenRequest(ctx context.Context, id uuid.UUID, pa *PersonalAu
 	var secretEnc []byte
 	_ = s.Pool.QueryRow(ctx, `SELECT personal_auth_secret_enc FROM catalog_items WHERE id = $1`, id).Scan(&secretEnc)
 	form.Set("client_id", pa.ClientID)
+	if pa.Resource != "" {
+		form.Set("resource", pa.Resource)
+	}
 	if len(secretEnc) > 0 {
 		sec, err := s.Box.Open(secretEnc)
 		if err != nil {
@@ -78,7 +84,11 @@ func (s *Service) tokenRequest(ctx context.Context, id uuid.UUID, pa *PersonalAu
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
-	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
+	c := http.Client{Timeout: 20 * time.Second}
+	if s.HTTP != nil {
+		c.Transport = s.HTTP.Transport
+	}
+	resp, err := c.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +158,7 @@ func (s *Service) userToken(ctx context.Context, uid uuid.UUID, it *Item) (strin
 	if err != nil || len(cred) == 0 {
 		return "", errNoCredential
 	}
-	if exp == nil || time.Until(*exp) > 2*time.Minute || len(ref) == 0 || it.PersonalAuth.Kind != "oauth" {
+	if exp == nil || time.Until(*exp) > 2*time.Minute || len(ref) == 0 || !oauthKind(it.PersonalAuth.Kind) {
 		return s.Box.Open(cred)
 	}
 	rt, err := s.Box.Open(ref)

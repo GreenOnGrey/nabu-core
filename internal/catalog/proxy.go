@@ -565,6 +565,9 @@ func (s *Service) readOnlyTool(it *Item, name string) bool {
 // was revoked, expired or refused (FTR.NAB.CMN-0003 R17).
 var ErrSourceAccess = errors.New("no access to the source")
 
+// ErrSourceRateLimited: the server of the source answered HTTP 429 (FTR.NAB.ADM-0001 tech §4.3).
+var ErrSourceRateLimited = errors.New("the source limits the rate of requests")
+
 // CallSource calls a tool of a personal MCP server with the access of the
 // user, outside a session of an agent: the adapters of the sources of
 // communications learn what changed with it (FTR.NAB.CMN-0003 arch §3.1).
@@ -595,6 +598,9 @@ func (s *Service) CallSource(ctx context.Context, uid, itemID uuid.UUID, tool st
 	if err != nil {
 		if strings.Contains(err.Error(), "HTTP 401") || strings.Contains(err.Error(), "HTTP 403") {
 			return "", ErrSourceAccess
+		}
+		if strings.Contains(err.Error(), "HTTP 429") {
+			return "", ErrSourceRateLimited
 		}
 		return "", err
 	}

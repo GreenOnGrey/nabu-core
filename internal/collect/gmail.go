@@ -131,6 +131,9 @@ func SetGmailOverlap(d time.Duration) {
 	if m, ok := registry["mail"].(*Mail); ok && d > 0 {
 		m.Overlap = d
 	}
+	if v, ok := registry["vkworkspace"].(*VKWorkSpace); ok && d > 0 {
+		v.MailOverlap = d
+	}
 }
 
 // gmailMaxHalvings bounds how many times a window too large for one tick is halved.
