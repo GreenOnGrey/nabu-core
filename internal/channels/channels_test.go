@@ -2,6 +2,7 @@ package channels
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -65,5 +66,20 @@ func TestTexts(t *testing.T) {
 	}
 	if !strings.Contains(T("ru-RU", "tg.blocked"), "час") || !strings.Contains(T("de", "tg.blocked"), "hour") {
 		t.Fatal("language choice")
+	}
+	// FTR.NAB.CHAT-0001 R6: /start lists every command, in the language, one per line
+	for lang, want := range map[string][]string{"ru": {"Команды:", "/new — Начать с чистого контекста", "/help — Список команд"},
+		"de": {"Commands:", "/new — Start with a clean context", "/help — The list of commands"}} {
+		lines := strings.Split(Help(lang), "\n")
+		if len(lines) != len(commandList(lang))+1 || lines[0] != want[0] || lines[1] != want[1] || lines[len(lines)-1] != want[2] {
+			t.Fatalf("%s: %q", lang, Help(lang))
+		}
+	}
+	// the menu of the bot and the answer name the same commands with the same descriptions
+	for _, ru := range commandList("ru") {
+		i := slices.IndexFunc(commandList("en"), func(c command) bool { return c.name == ru.name })
+		if i < 0 || commandList("en")[i].description == "" || ru.description == "" {
+			t.Fatalf("command %q: en %v, ru %v", ru.name, commandList("en"), ru)
+		}
 	}
 }

@@ -562,6 +562,22 @@ func TestChatSkillsAndVoice(t *testing.T) {
 	if out := r.outbound(); len(out) != 1 || out[0] != "— Context reset —" {
 		t.Fatalf("SKL-08 /new: %v", out)
 	}
+	// SKL-12: /start and /help in VK Teams — the list of the commands, not a message to the agent
+	vk := func(text string) error {
+		return r.api.Receive(ctx, channels.Inbound{UserID: uid, Channel: domain.ChannelVKTeams, Text: text})
+	}
+	r.outbound() // the texts of the earlier steps are read, not asserted
+	turns := len(r.op.prompts)
+	if err := vk("/start"); err != nil {
+		t.Fatal(err)
+	}
+	if out := r.outbound(); len(out) != 1 || !strings.HasPrefix(out[0], "Commands:") || !strings.Contains(out[0], "\n/new — ") || !strings.Contains(out[0], "\n/help — ") {
+		t.Fatalf("SKL-12 /start: %v", out)
+	}
+	r.drain()
+	if len(r.op.prompts) != turns {
+		t.Fatalf("SKL-12: /start went to the agent: %q", r.op.last().Text)
+	}
 
 	// VOC-04, VOC-08: a voice message becomes its text
 	w := &fakeWhisper{}
@@ -581,6 +597,14 @@ func TestChatSkillsAndVoice(t *testing.T) {
 	r.drain()
 	if p := r.op.last(); !strings.Contains(p.Text, "[Voice message") || !strings.Contains(p.Text, "позвонить Ивану") {
 		t.Fatalf("R21: the agent gets the mark of a voice message: %q", p.Text)
+	}
+	// SKL-12: the answer is in the language of the profile
+	r.outbound()
+	if err := vk("/help"); err != nil {
+		t.Fatal(err)
+	}
+	if out := r.outbound(); len(out) != 1 || !strings.HasPrefix(out[0], "Команды:") || !strings.Contains(out[0], "\n/new — Начать с чистого контекста") {
+		t.Fatalf("SKL-12 /help: %v", out)
 	}
 	// VOC-09: the recognizer is down — the file goes to the agent and the bot says so
 	w.fail = true
