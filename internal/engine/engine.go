@@ -473,6 +473,19 @@ func (c *collector) handle(ev agent.Event) {
 	}
 }
 
+// auditModelError records a failed turn in the audit (FTR.NAB.CMN-0001 R28): the class of the provider's error
+// and the message of the provider next to the tool calls, so an administrator sees what the model answered. The
+// text of the conversation stays out of the audit, as in R30.
+func (c *collector) auditModelError(class, text string) {
+	a := c.audit
+	a.Tool, a.Result = "model", "error"
+	if text != "" {
+		t := text
+		a.Error = &t
+	}
+	c.e.Ledger.Audit(c.ctx, a, class, c.secrets)
+}
+
 // subagentTool audits a tool call of a subagent like one of the agent
 // (FTR.NAB.CMN-0009 R9).
 func (c *collector) subagentTool(ev agent.Event) {
@@ -1037,6 +1050,7 @@ func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked
 	switch {
 	case col.failure != nil:
 		res.errClass, res.errText = string(col.failure.ErrorClass), col.failure.Message
+		col.auditModelError(res.errClass, res.errText) // R28: what the provider answered, for the administrator
 	case err != nil:
 		res.errClass, res.errText = operatorClass(err), operatorText(err)
 	}

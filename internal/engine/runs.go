@@ -467,6 +467,7 @@ func (e *Engine) serviceTurn(ctx context.Context, runID uuid.UUID, ag *services.
 		_ = e.Op.Abort(context.WithoutCancel(ctx), resp.SessionID)
 		return summary, "limit_exceeded", fmt.Sprintf("the run took longer than %d seconds", ag.Limits.TimeoutSec), total, false
 	case col.failure != nil:
+		col.auditModelError(string(col.failure.ErrorClass), col.failure.Message) // R28
 		return summary, string(col.failure.ErrorClass), col.failure.Message, total, false
 	case err != nil:
 		return summary, operatorClass(err), operatorText(err), total, false

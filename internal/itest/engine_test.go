@@ -304,4 +304,26 @@ func TestEngineWithPi(t *testing.T) {
 	if kinds[0] != "started" || kinds[len(kinds)-1] != "completed" {
 		t.Fatalf("run events %v", kinds)
 	}
+
+	// 5. AUD, ERR: a turn the provider rejects is in the audit with the class of the error and its message, so
+	// an administrator sees what the model answered (FTR.NAB.CMN-0001 R28).
+	bad, err := ms.Create(ctx, models.Input{Type: models.TypeOpenAICompatible, Name: "Refusing", BaseURL: lsrv.URL, APIKey: "sk-fake-0001", Models: models.Refs("e400")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ms.PutPersonal(ctx, models.PersonalModels{Default: &models.Choice{ConnectionID: bad.ID, Model: "e400"}}); err != nil {
+		t.Fatal(err)
+	}
+	rejected := turn("this one the model rejects")
+	if rejected.Status != "failed" || rejected.ErrorClass == nil || *rejected.ErrorClass != "bad_request" {
+		t.Fatalf("rejected turn %+v", rejected)
+	}
+	var class, text string
+	if err := pool.QueryRow(ctx, `SELECT coalesce(args_summary,''), coalesce(error,'') FROM audit
+		WHERE user_id = $1 AND tool = 'model' AND result = 'error' ORDER BY at DESC LIMIT 1`, uid).Scan(&class, &text); err != nil {
+		t.Fatal(err)
+	}
+	if class != "bad_request" || !strings.Contains(text, "Invalid request") {
+		t.Fatalf("audit row %q %q", class, text)
+	}
 }
