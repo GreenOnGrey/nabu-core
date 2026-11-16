@@ -41,6 +41,7 @@ var texts = map[string]map[string]string{
 		"cmd.no_skills":         "No skills are available to you. Connect skills in Nabu → Connections.",
 		"cmd.skill_unavailable": "The skill %s is not available.",
 		"cmd.model":             "— Model: %s —",
+		"cmd.help":              "Commands:",
 		"voice.failed":          "The voice message could not be recognized — send it as text.",
 		// FTR.NAB.CHAT-0004 R4, R11: the queue and the stop of an answer
 		"queue_full":         "The queue is full: I am still answering your earlier messages. Write again when I answer.",
@@ -80,6 +81,7 @@ var texts = map[string]map[string]string{
 		"cmd.no_skills":         "Вам не доступен ни один скилл. Подключите скиллы в Nabu → «Подключения».",
 		"cmd.skill_unavailable": "Скилл %s недоступен.",
 		"cmd.model":             "— Модель: %s —",
+		"cmd.help":              "Команды:",
 		"voice.failed":          "Не удалось распознать голосовое — отправьте текстом.",
 		"queue_full":            "Очередь заполнена: я ещё отвечаю на прошлые сообщения. Напишите, когда я отвечу.",
 		"cmd.stopped":           "Остановил.",
@@ -91,13 +93,17 @@ var texts = map[string]map[string]string{
 	},
 }
 
+// language is the key of the text tables: "ru" for Russian, "en" otherwise.
+func language(lang string) string {
+	if strings.HasPrefix(strings.ToLower(lang), "ru") {
+		return "ru"
+	}
+	return "en"
+}
+
 // T returns a service text in the language (ru for ru, en otherwise).
 func T(lang, key string, args ...any) string {
-	m := texts["en"]
-	if strings.HasPrefix(strings.ToLower(lang), "ru") {
-		m = texts["ru"]
-	}
-	t, ok := m[key]
+	t, ok := texts[language(lang)][key]
 	if !ok {
 		t = texts["en"][key]
 	}
@@ -105,6 +111,35 @@ func T(lang, key string, args ...any) string {
 		return fmt.Sprintf(t, args...)
 	}
 	return t
+}
+
+// command is a command of the conversation in a messenger (FTR.NAB.CHAT-0001 R6):
+// a row of the menu of the Telegram bot and of the answer of /help.
+type command struct{ name, description string }
+
+// commands are the commands of the conversation by language (every language of
+// the text tables): the one list of the menu of the bot and of the answer of
+// /help. It does not depend on the access of a user: /skills tells a user
+// without skills where to connect them.
+var commands = map[string][]command{
+	"en": {{"new", "Start with a clean context"}, {"compact", "Compact the context"}, {"skills", "My skills"},
+		{"skill", "Call a skill: /skill <name> <task>"}, {"stop", "Stop the answer"}, {"help", "The list of commands"}},
+	"ru": {{"new", "Начать с чистого контекста"}, {"compact", "Сжать контекст"}, {"skills", "Мои скиллы"},
+		{"skill", "Вызвать скилл: /skill <имя> <задача>"}, {"stop", "Остановить ответ"}, {"help", "Список команд"}},
+}
+
+// commandList returns the commands of the conversation in the language.
+func commandList(lang string) []command { return commands[language(lang)] }
+
+// Help is the answer of /start and /help: every command available to the user,
+// each on its line (FTR.NAB.CHAT-0001 R6).
+func Help(lang string) string {
+	var b strings.Builder
+	b.WriteString(T(lang, "cmd.help"))
+	for _, c := range commandList(lang) {
+		b.WriteString("\n/" + c.name + " — " + c.description)
+	}
+	return b.String()
 }
 
 // ─── group agents (R16–R17) ─────────────────────────────────────────

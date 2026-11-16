@@ -170,26 +170,21 @@ func (t *Telegram) Setup(ctx context.Context, publicAPIURL string) error {
 	return nil
 }
 
-// botCommands are the commands of the conversation in the menu of the bot
-// (FTR.NAB.CHAT-0001 R6, SKL-10), by language; "" is the default.
-var botCommands = map[string][][2]string{
-	"":   {{"new", "Start with a clean context"}, {"compact", "Compact the context"}, {"skills", "My skills"}, {"skill", "Call a skill: /skill <name> <task>"}, {"stop", "Stop the answer"}},
-	"ru": {{"new", "Начать с чистого контекста"}, {"compact", "Сжать контекст"}, {"skills", "Мои скиллы"}, {"skill", "Вызвать скилл: /skill <имя> <задача>"}, {"stop", "Остановить ответ"}},
-}
-
-// setCommands registers the commands; a failure only costs the menu.
+// setCommands registers the commands in the menu of the bot (R6, SKL-10): the
+// same list the answer of /help gives; a failure only costs the menu.
 func (t *Telegram) setCommands(ctx context.Context) {
-	for lang, cmds := range botCommands {
-		list := make([]map[string]string, 0, len(cmds))
-		for _, c := range cmds {
-			list = append(list, map[string]string{"command": c[0], "description": c[1]})
+	// "" is the set of every language, "ru" the Russian one
+	for _, l := range []struct{ lang, code string }{{"en", ""}, {"ru", "ru"}} {
+		list := make([]map[string]string, 0, len(commandList(l.lang)))
+		for _, c := range commandList(l.lang) {
+			list = append(list, map[string]string{"command": c.name, "description": c.description})
 		}
 		body := map[string]any{"commands": list}
-		if lang != "" {
-			body["language_code"] = lang
+		if l.code != "" {
+			body["language_code"] = l.code
 		}
 		if err := t.call(ctx, "setMyCommands", body, nil); err != nil {
-			slog.WarnContext(ctx, "telegram commands", "language", lang, "err", err)
+			slog.WarnContext(ctx, "telegram commands", "language", l.code, "err", err)
 		}
 	}
 }
@@ -606,8 +601,9 @@ func (h *Webhook) private(ctx context.Context, m *TGMessage) {
 		h.say(ctx, chat, lang, "channel.unavailable")
 		return
 	}
-	if text == "/start" {
-		h.say(ctx, chat, lang, "tg.ready")
+	if text == "/start" || text == "/help" {
+		// the standard entry of a bot: the greeting and every command available (R6)
+		_ = h.Bot.SendText(ctx, chat, T(lang, "tg.ready")+"\n\n"+Help(lang))
 		return
 	}
 	if text == "" {

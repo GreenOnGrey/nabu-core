@@ -126,9 +126,9 @@ func (a *API) say(ctx context.Context, uid uuid.UUID, ch, text string) {
 	}
 }
 
-// command takes the commands of a messenger (R6): /new, /compact [text],
-// /skills, /skill <name> [task], /stop (FTR.NAB.CHAT-0004 R11). done reports
-// that the message was a command.
+// command takes the commands of a messenger (R6): /start and /help — the list
+// of the commands, /new, /compact [text], /skills, /skill <name> [task], /stop
+// (FTR.NAB.CHAT-0004 R11). done reports that the message was a command.
 func (a *API) command(ctx context.Context, in channels.Inbound) (bool, error) {
 	text := strings.TrimSpace(in.Text)
 	if !strings.HasPrefix(text, "/") {
@@ -153,6 +153,10 @@ func (a *API) command(ctx context.Context, in channels.Inbound) (bool, error) {
 		a.say(ctx, in.UserID, in.Channel, channels.T(lang, "tg.not_delivered"))
 	}
 	switch word {
+	case "/start", "/help":
+		// the standard entry of a bot: every command available to the user
+		a.say(ctx, in.UserID, in.Channel, channels.Help(lang))
+		return true, nil
 	case "/new":
 		if _, err := a.Reset(ctx, in.UserID, nil, in.Channel); err != nil {
 			fail(err)
