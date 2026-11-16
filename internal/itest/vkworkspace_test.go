@@ -437,10 +437,11 @@ func TestVKWorkSpaceCollect(t *testing.T) {
 
 // fakeOAuthMCP is an MCP server with the OAuth of MCP, like VK WorkSpace.
 type fakeOAuthMCP struct {
-	srv   *httptest.Server
-	mu    sync.Mutex
-	forms []url.Values
-	regs  int
+	srv      *httptest.Server
+	mu       sync.Mutex
+	forms    []url.Values
+	regs     int
+	redirect string // the redirect URI of the last registration; a token request names it
 }
 
 func newFakeOAuthMCP(t *testing.T) *fakeOAuthMCP {
@@ -459,9 +460,16 @@ func newFakeOAuthMCP(t *testing.T) *fakeOAuthMCP {
 			"code_challenge_methods_supported": []string{"S256"}, "token_endpoint_auth_methods_supported": []string{"none"}})
 	})
 	mux.HandleFunc("POST /oauth/register", func(w http.ResponseWriter, r *http.Request) {
+		var reg struct {
+			RedirectURIs []string `json:"redirect_uris"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&reg)
 		f.mu.Lock()
 		f.regs++
 		n := f.regs
+		if len(reg.RedirectURIs) > 0 {
+			f.redirect = reg.RedirectURIs[0]
+		}
 		f.mu.Unlock()
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{"client_id": fmt.Sprintf("client-%d", n)})
@@ -470,7 +478,14 @@ func newFakeOAuthMCP(t *testing.T) *fakeOAuthMCP {
 		_ = r.ParseForm()
 		f.mu.Lock()
 		f.forms = append(f.forms, r.PostForm)
+		want := f.redirect
 		f.mu.Unlock()
+		// like VK WorkSpace: a redirect URI the client did not register is refused
+		if r.PostForm.Get("grant_type") == "authorization_code" && want != "" && r.PostForm.Get("redirect_uri") != want {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid_request", "error_description": "redirect_uri is not one of the registered ones"})
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "at-" + r.PostForm.Get("grant_type"), "refresh_token": "rt", "expires_in": 60})
 	})
 	f.srv = httptest.NewTLSServer(mux)
@@ -478,7 +493,7 @@ func newFakeOAuthMCP(t *testing.T) *fakeOAuthMCP {
 	return f
 }
 
-// OAUTH-01 (stored), OAUTH-06, OAUTH-07, OAUTH-08
+// OAUTH-01 (stored), OAUTH-06, OAUTH-07, OAUTH-08, OAUTH-09, OAUTH-10, OAUTH-11
 func TestMCPOAuthCatalog(t *testing.T) {
 	ctx := context.Background()
 	box, _ := crypto.NewBox(key)
@@ -507,19 +522,39 @@ func TestMCPOAuthCatalog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// OAUTH-09, OAUTH-10: the return goes to the shared address, and the
+	// server, like VK WorkSpace, accepts only a redirect_uri it registered.
 	au, _ := url.Parse(res.AuthorizeURL)
 	q := au.Query()
-	if q.Get("client_id") != "client-1" || q.Get("code_challenge_method") != "S256" || q.Get("resource") != f.srv.URL+"/mcp" {
+	if q.Get("client_id") != "client-1" || q.Get("code_challenge_method") != "S256" || q.Get("resource") != f.srv.URL+"/mcp" ||
+		q.Get("redirect_uri") != "https://nabu.test/api/v1/oauth/mcp/callback" {
 		t.Fatalf("OAUTH-06: %s", res.AuthorizeURL)
 	}
-	back := cat.Callback(ctx, item.ID, q.Get("state"), "code-1", "")
+	// OAUTH-11: a state of an MCP item does not complete the flow of a manual
+	// OAuth item.
+	manual, err := cat.Connect(ctx, uid, item.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manualURL, _ := url.Parse(manual.AuthorizeURL)
+	if back := cat.Callback(ctx, item.ID, manualURL.Query().Get("state"), "code-1", ""); !strings.Contains(back, "oauth=invalid_state") {
+		t.Fatalf("a state of the MCP flow completed the manual one: %s", back)
+	}
+	f.mu.Lock()
+	calls := len(f.forms)
+	f.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("OAUTH-11: the token endpoint was called for a state of another flow: %d", calls)
+	}
+	back := cat.CallbackMCP(ctx, q.Get("state"), "code-1", "")
 	if !strings.Contains(back, "oauth=connected") {
 		t.Fatalf("OAUTH-06: callback %s", back)
 	}
 	f.mu.Lock()
 	form := f.forms[0]
 	f.mu.Unlock()
-	if form.Get("resource") != f.srv.URL+"/mcp" || form.Get("code_verifier") == "" || form.Get("client_id") != "client-1" {
+	if form.Get("resource") != f.srv.URL+"/mcp" || form.Get("code_verifier") == "" || form.Get("client_id") != "client-1" ||
+		form.Get("redirect_uri") != "https://nabu.test/api/v1/oauth/mcp/callback" {
 		t.Fatalf("OAUTH-06: token request %v", form)
 	}
 

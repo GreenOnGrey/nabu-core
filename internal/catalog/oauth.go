@@ -28,9 +28,30 @@ func randHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
-// CallbackURL is the redirect URI to register at the provider.
-func (s *Service) CallbackURL(id uuid.UUID) string {
+// callbackURL is the redirect URI to register at the provider for a personal
+// connection of the manual OAuth kind: one address per item, because the
+// administrator names it in the console of the provider.
+func (s *Service) callbackURL(id uuid.UUID) string {
 	return s.PublicAPIURL + "/api/v1/oauth/callback/" + id.String()
+}
+
+// MCPCallbackURL is the redirect URI of every item of the MCP OAuth kind: one
+// static address per deployment rather than per item (FTR.NAB.ADM-0001 tech
+// §4.1). A provider that checks its allowlist — VK WorkSpace allows only a
+// loopback address, the callback of the Claude app and what its deployment
+// lists — cannot know the id of an item, so the item is named by the state.
+func (s *Service) MCPCallbackURL() string {
+	return s.PublicAPIURL + "/api/v1/oauth/mcp/callback"
+}
+
+// redirectURI is the only place the redirect URI comes from: the authorize
+// request, the registration of the client and the exchange of the code must
+// name the same string.
+func (s *Service) redirectURI(kind string, id uuid.UUID) string {
+	if kind == KindMCPOAuth {
+		return s.MCPCallbackURL()
+	}
+	return s.callbackURL(id)
 }
 
 func (s *Service) startOAuth(ctx context.Context, uid uuid.UUID, it *Item) (*ConnectResult, error) {
@@ -41,7 +62,7 @@ func (s *Service) startOAuth(ctx context.Context, uid uuid.UUID, it *Item) (*Con
 		return nil, err
 	}
 	h := sha256.Sum256([]byte(verifier))
-	q := url.Values{"response_type": {"code"}, "client_id": {pa.ClientID}, "redirect_uri": {s.CallbackURL(it.ID)},
+	q := url.Values{"response_type": {"code"}, "client_id": {pa.ClientID}, "redirect_uri": {s.redirectURI(pa.Kind, it.ID)},
 		"state": {state}, "code_challenge": {base64.RawURLEncoding.EncodeToString(h[:])}, "code_challenge_method": {"S256"}}
 	if len(pa.Scopes) > 0 {
 		q.Set("scope", strings.Join(pa.Scopes, " "))
@@ -120,14 +141,33 @@ func (s *Service) storeToken(ctx context.Context, uid, id uuid.UUID, t *oauthTok
 	return s.saveConnection(ctx, uid, id, acc, ref, exp)
 }
 
-// Callback completes a personal OAuth connection and returns where the
-// browser goes (the Connections page with the result).
+// Callback completes a personal OAuth connection of the manual kind and
+// returns where the browser goes (the Connections page with the result).
 func (s *Service) Callback(ctx context.Context, id uuid.UUID, state, code, oauthErr string) string {
+	return s.completeOAuth(ctx, &id, "oauth", state, code, oauthErr)
+}
+
+// CallbackMCP completes the connection of an item of the MCP OAuth kind. The
+// address is shared by every such item, so the state alone names the item
+// (FTR.NAB.ADM-0001 tech §4.1, step 4).
+func (s *Service) CallbackMCP(ctx context.Context, state, code, oauthErr string) string {
+	return s.completeOAuth(ctx, nil, KindMCPOAuth, state, code, oauthErr)
+}
+
+// completeOAuth exchanges the code and stores the tokens. A state issued by
+// one flow does not complete the other one: the kind of the item it names
+// must be the kind of the route.
+func (s *Service) completeOAuth(ctx context.Context, itemID *uuid.UUID, kind, state, code, oauthErr string) string {
 	back := strings.TrimRight(s.WebURL, "/") + "/connections"
-	var uid uuid.UUID
+	q := `DELETE FROM oauth_states WHERE state = $1 AND expires_at > now()`
+	args := []any{state}
+	if itemID != nil {
+		q += ` AND item_id = $2`
+		args = append(args, *itemID)
+	}
+	var uid, id uuid.UUID
 	var verifier string
-	err := s.Pool.QueryRow(ctx, `DELETE FROM oauth_states WHERE state = $1 AND item_id = $2 AND expires_at > now() RETURNING user_id, verifier`, state, id).
-		Scan(&uid, &verifier)
+	err := s.Pool.QueryRow(ctx, q+` RETURNING user_id, item_id, verifier`, args...).Scan(&uid, &id, &verifier)
 	if err != nil {
 		return back + "?oauth=invalid_state"
 	}
@@ -135,11 +175,15 @@ func (s *Service) Callback(ctx context.Context, id uuid.UUID, state, code, oauth
 		return back + "?oauth=denied"
 	}
 	it, err := s.Get(ctx, id)
-	if err != nil || it.PersonalAuth == nil {
+	if err != nil {
 		return back + "?oauth=failed"
 	}
+	if it.PersonalAuth == nil || it.PersonalAuth.Kind != kind {
+		// a state of one flow does not complete the other one
+		return back + "?oauth=invalid_state"
+	}
 	t, err := s.tokenRequest(ctx, id, it.PersonalAuth, url.Values{"grant_type": {"authorization_code"}, "code": {code},
-		"redirect_uri": {s.CallbackURL(id)}, "code_verifier": {verifier}})
+		"redirect_uri": {s.redirectURI(kind, id)}, "code_verifier": {verifier}})
 	if err != nil {
 		return back + "?oauth=failed"
 	}

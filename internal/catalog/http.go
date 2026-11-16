@@ -69,8 +69,11 @@ func (s *Service) Routes(r chi.Router) {
 	}))
 }
 
-// CallbackRoute mounts GET /api/v1/oauth/callback/{id}: the provider
-// redirects the browser here; the state ties it to the user.
+// CallbackRoute mounts the two public addresses a provider redirects the
+// browser to. They differ because the kinds register differently: a manual
+// OAuth item has its own address (the administrator names it in the console of
+// the provider), while every MCP OAuth item shares one static address and the
+// state names the item (FTR.NAB.ADM-0001 R1, tech §4.1).
 func (s *Service) CallbackRoute(r chi.Router) {
 	r.Get("/oauth/callback/{id}", func(w http.ResponseWriter, r *http.Request) {
 		id, err := uuid.Parse(chi.URLParam(r, "id"))
@@ -80,6 +83,10 @@ func (s *Service) CallbackRoute(r chi.Router) {
 		}
 		q := r.URL.Query()
 		http.Redirect(w, r, s.Callback(r.Context(), id, q.Get("state"), q.Get("code"), q.Get("error")), http.StatusFound)
+	})
+	r.Get("/oauth/mcp/callback", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		http.Redirect(w, r, s.CallbackMCP(r.Context(), q.Get("state"), q.Get("code"), q.Get("error")), http.StatusFound)
 	})
 }
 
@@ -100,7 +107,7 @@ func (s *Service) AdminRoutes(r chi.Router, hookKey []byte) {
 		for _, it := range items {
 			a := adminItem{Item: it}
 			if it.PersonalAuth != nil && oauthKind(it.PersonalAuth.Kind) {
-				a.CallbackURL = s.CallbackURL(it.ID)
+				a.CallbackURL = s.redirectURI(it.PersonalAuth.Kind, it.ID)
 			}
 			if it.Type == "skill" && it.Source.Kind == "git" {
 				a.HookURL = s.PublicAPIURL + "/hooks/v1/skills/" + it.ID.String()
