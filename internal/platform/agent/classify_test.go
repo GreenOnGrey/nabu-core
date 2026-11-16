@@ -20,6 +20,10 @@ func TestClassify(t *testing.T) {
 		{`400: {"error":{"message":"Invalid request"}}`, ErrBadRequest, 400, "Invalid request"},
 		{`422: unprocessable`, ErrBadRequest, 422, "unprocessable"},
 		{`Request timed out after 300000 ms`, ErrUnavailable, 0, ""},
+		// A connect timeout names the address with its port: the port is not a status (ERR-01…06).
+		{`Request timed out.: Connect Timeout Error (attempted address: model.example:443, timeout: 10000ms) (UND_ERR_CONNECT_TIMEOUT)`, ErrUnavailable, 0, ""},
+		{`connect ECONNREFUSED 10.0.0.1:8080`, ErrUnavailable, 0, ""},
+		{`Error 500: upstream is down`, ErrUnavailable, 500, ""},
 		{`fetch failed`, ErrUnavailable, 0, ""},
 		{`Your account has insufficient balance`, ErrInsufficientBalance, 0, ""},
 		{`something odd`, ErrBadRequest, 0, "something odd"},

@@ -9,9 +9,12 @@ import (
 
 var (
 	leadingStatus = regexp.MustCompile(`^\s*(\d{3})\b`)
-	anyStatus     = regexp.MustCompile(`\b([45]\d\d)\b`)
-	contextText   = []string{"context length", "maximum context", "too many tokens", "context window", "context_length_exceeded", "prompt is too long"}
-	timeoutText   = []string{"timeout", "timed out", "econnreset", "econnrefused", "socket hang up", "terminated", "network error", "fetch failed", "connection reset", "eof"}
+	// A status in the middle of a message, as providers print it ("Error 500: …"). A port of an address
+	// (":443") is not a status: the colon before it rules it out, so a connect timeout to "host:443" stays
+	// a connection problem instead of reading as a rejected request.
+	anyStatus   = regexp.MustCompile(`(?:^|[^:0-9])([45]\d\d)\b`)
+	contextText = []string{"context length", "maximum context", "too many tokens", "context window", "context_length_exceeded", "prompt is too long"}
+	timeoutText = []string{"timeout", "timed out", "econnreset", "econnrefused", "socket hang up", "terminated", "network error", "fetch failed", "connection reset", "eof"}
 )
 
 // Classified is a provider error after classification (arch §8).
