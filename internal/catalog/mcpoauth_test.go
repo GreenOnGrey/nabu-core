@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 // FTR.NAB.ADM-0001 qa
@@ -76,15 +78,33 @@ func TestOAUTH01DiscoverAndRegister(t *testing.T) {
 	if meta.Issuer != f.srv.URL || meta.AuthorizeURL != f.srv.URL+"/oauth/authorize" || meta.TokenURL != f.srv.URL+"/oauth/token" || meta.Resource != f.srv.URL+"/mcp" {
 		t.Fatalf("meta = %+v", meta)
 	}
-	id, secret, err := s.registerClient(context.Background(), meta, "https://nabu.example/api/v1/oauth/callback/x")
+	id, secret, err := s.registerClient(context.Background(), meta, s.MCPCallbackURL())
 	if err != nil || id != "client-1" || secret != "" {
 		t.Fatalf("register = %q %q %v", id, secret, err)
 	}
 	if f.registered["token_endpoint_auth_method"] != "none" || f.registered["client_name"] != "Nabu" {
 		t.Fatalf("registered = %v", f.registered)
 	}
-	if uris, _ := f.registered["redirect_uris"].([]any); len(uris) != 1 || uris[0] != "https://nabu.example/api/v1/oauth/callback/x" {
+	if uris, _ := f.registered["redirect_uris"].([]any); len(uris) != 1 || uris[0] != "https://nabu.example/api/v1/oauth/mcp/callback" {
 		t.Fatalf("redirect_uris = %v", f.registered["redirect_uris"])
+	}
+}
+
+// TestOAUTH01CallbackURI: the address of an MCP item is one per deployment
+// and does not depend on the item, while a manual OAuth item names its own
+// (FTR.NAB.ADM-0001 tech §4.1; OAUTH-01, OAUTH-06, OAUTH-10).
+func TestOAUTH01CallbackURI(t *testing.T) {
+	s := &Service{PublicAPIURL: "https://nabu.example"}
+	if got := s.MCPCallbackURL(); got != "https://nabu.example/api/v1/oauth/mcp/callback" {
+		t.Fatalf("MCP callback = %s", got)
+	}
+	for _, id := range []uuid.UUID{uuid.New(), uuid.New()} {
+		if got := s.redirectURI(KindMCPOAuth, id); got != s.MCPCallbackURL() {
+			t.Fatalf("redirect URI of MCP = %s", got)
+		}
+		if got, want := s.redirectURI("oauth", id), "https://nabu.example/api/v1/oauth/callback/"+id.String(); got != want {
+			t.Fatalf("redirect URI of a manual item = %s, want %s", got, want)
+		}
 	}
 }
 

@@ -284,7 +284,7 @@ func (s *Service) setupMCPOAuth(ctx context.Context, id uuid.UUID, mcpURL string
 	meta, err := s.discoverMCPOAuth(ctx, mcpURL)
 	if err == nil {
 		var clientID, secret string
-		if clientID, secret, err = s.registerClient(ctx, meta, s.CallbackURL(id)); err == nil {
+		if clientID, secret, err = s.registerClient(ctx, meta, s.MCPCallbackURL()); err == nil {
 			now := time.Now().UTC()
 			pa.Issuer, pa.AuthorizeURL, pa.TokenURL, pa.Resource = meta.Issuer, meta.AuthorizeURL, meta.TokenURL, meta.Resource
 			pa.ClientID, pa.Scopes, pa.RegisteredAt = clientID, meta.Scopes, &now
@@ -339,7 +339,7 @@ func (s *Service) Reregister(ctx context.Context, id uuid.UUID) (*ReregisterResu
 	meta, err := s.discoverMCPOAuth(ctx, it.Source.URL)
 	var clientID, secret string
 	if err == nil {
-		clientID, secret, err = s.registerClient(ctx, meta, s.CallbackURL(id))
+		clientID, secret, err = s.registerClient(ctx, meta, s.MCPCallbackURL())
 	}
 	var de *discoveryError
 	if errors.As(err, &de) {
