@@ -23,6 +23,7 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/apperr"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/agent"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/httpx"
+	"github.com/GreenOnGrey/nabu-core/internal/platform/postgres"
 )
 
 // ArgsMax bounds the stored arguments (tech §10).
@@ -193,7 +194,7 @@ func (f Filter) where(args *[]any) string {
 		conds = append(conds, "a.client_id = "+add(*f.Client))
 	}
 	if f.Tool != "" {
-		conds = append(conds, "a.tool ILIKE '%' || "+add(f.Tool)+" || '%'")
+		conds = append(conds, postgres.Fold("a.tool")+" ILIKE '%' || "+add(f.Tool)+" || '%'")
 	}
 	if f.Result != "" {
 		conds = append(conds, "a.result = "+add(f.Result))

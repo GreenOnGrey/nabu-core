@@ -21,6 +21,7 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/platform/events"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/httpx"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/mcp"
+	"github.com/GreenOnGrey/nabu-core/internal/platform/postgres"
 )
 
 // MaxText bounds a record.
@@ -60,7 +61,7 @@ func (s *Service) List(ctx context.Context, uid uuid.UUID, q string, page httpx.
 		args = append(args, page.Cursor.T, page.Cursor.ID)
 	}
 	rows, err := s.Pool.Query(ctx, `SELECT id, text, source, pinned, created_at, updated_at FROM memories
-		WHERE user_id = $1 AND ($2 = '' OR search_vector @@ plainto_tsquery('simple', $2) OR text ILIKE '%' || $2 || '%')`+cond+`
+		WHERE user_id = $1 AND ($2 = '' OR search_vector @@ plainto_tsquery('simple', $2) OR `+postgres.Fold("text")+` ILIKE '%' || $2 || '%')`+cond+`
 		ORDER BY updated_at DESC, id DESC LIMIT $3`, args...)
 	if err != nil {
 		return httpx.List[Record]{}, err

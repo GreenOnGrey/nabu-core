@@ -1086,3 +1086,43 @@ func TestChatAgentFiles(t *testing.T) {
 		t.Fatalf("FL-05: %d %s", w.Code, w.Body)
 	}
 }
+
+// FTR.NAB.CHAT-0001 qa LIVE-01, R11, tech §4: an answer is saved while it is being written. A page opened again during a turn —
+// the user visited another section and came back — has the text and the steps of the turn so far, and a finished
+// answer is not touched by a late save.
+func TestChatProgress(t *testing.T) {
+	ctx := context.Background()
+	u := newUser(t, "progress-"+uuid.NewString()[:6]+"@x.org")
+	var conv uuid.UUID
+	if err := pool.QueryRow(ctx, `SELECT id FROM conversations WHERE user_id = $1 AND kind = 'main'`, u).Scan(&conv); err != nil {
+		t.Fatal(err)
+	}
+	var id uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO messages (conversation_id, role, text, channel, status)
+		VALUES ($1, 'assistant', '', 'web', 'streaming') RETURNING id`, conv).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	st := &chat.Store{Pool: pool}
+	steps := []chat.ToolStep{{ID: "s1", Server: "mcp", Tool: "search", Summary: "mcp: search", Status: "done"}}
+	st.Progress(ctx, id, "Проверяю почту", steps)
+	l, err := st.Messages(ctx, conv, httpx.Page{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(l.Items) != 1 || l.Items[0].Text != "Проверяю почту" || len(l.Items[0].ToolSteps) != 1 ||
+		l.Items[0].ToolSteps[0].ID != "s1" || l.Items[0].Status != "streaming" {
+		t.Fatalf("the answer as it stands: %+v", l.Items)
+	}
+	// the turn ends; a save that arrives after it does not bring the answer back to its middle
+	if _, err := st.Finish(ctx, id, "Готово", "done", steps, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	st.Progress(ctx, id, "Проверяю", nil)
+	m, err := st.Message(ctx, u, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Text != "Готово" || m.Status != "done" {
+		t.Fatalf("the finished answer changed: %+v", m)
+	}
+}

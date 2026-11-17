@@ -56,8 +56,10 @@ func TestMain(m *testing.M) {
 			fmt.Println("docker unavailable:", err)
 			os.Exit(1)
 		}
+		// the locale C is the one the stand is created with: ILIKE folds only ASCII there, and the
+		// tests see the same (FTR.NAB.CMN-0001 tech §12, решение 26)
 		res, err := dp.Run(ctx, "postgres", dockertest.WithTag("16"), dockertest.WithoutReuse(),
-			dockertest.WithEnv([]string{"POSTGRES_PASSWORD=pw", "POSTGRES_DB=nabu"}))
+			dockertest.WithEnv([]string{"POSTGRES_PASSWORD=pw", "POSTGRES_DB=nabu", "POSTGRES_INITDB_ARGS=--locale=C --encoding=UTF8"}))
 		if err != nil {
 			fmt.Println("start postgres:", err)
 			os.Exit(1)

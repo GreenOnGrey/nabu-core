@@ -268,7 +268,7 @@ func (s *Service) searchHybrid(ctx context.Context, tx pgx.Tx, uid uuid.UUID, f 
 		w AS (
 			SELECT n.id, row_number() OVER (ORDER BY ts_rank(n.search_vector, tq) DESC, n.last_at DESC) AS r
 			FROM comm_notes n, plainto_tsquery('simple', $%[3]d) tq
-			WHERE n.user_id = $1%[5]s AND (n.search_vector @@ tq OR n.title ILIKE '%%' || $%[3]d || '%%' OR n.summary ILIKE '%%' || $%[3]d || '%%')
+			WHERE n.user_id = $1%[5]s AND (n.search_vector @@ tq OR `+postgres.Fold("n.title")+` ILIKE '%%' || $%[3]d || '%%' OR `+postgres.Fold("n.summary")+` ILIKE '%%' || $%[3]d || '%%')
 			LIMIT 50)
 		SELECT id FROM (SELECT * FROM v UNION ALL SELECT * FROM w) u
 		GROUP BY id ORDER BY sum(1.0 / (60 + r)) DESC, id LIMIT $%[4]d`, vi, mi, qi, li, cond), args...)

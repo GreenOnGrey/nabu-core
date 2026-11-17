@@ -27,6 +27,16 @@ type Querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
+// SearchCollation folds the letters of a search whatever the locale of the
+// database is (migration 0022, FTR.NAB.CMN-0001 tech §12, решение 26): the stand is created
+// with the locale C, where ILIKE and lower() fold only ASCII.
+const SearchCollation = "nabu_ci"
+
+// Fold marks an expression of a search to be compared without case: the
+// collation decides the fold of its letters, not the locale of the database.
+// A search over a name or a title reads `postgres.Fold("u.name") + " ILIKE ..."`.
+func Fold(expr string) string { return expr + " COLLATE " + SearchCollation }
+
 // minPoolConns is the least size of the pool unless DATABASE_URL sets
 // pool_max_conns. The default of pgx is the number of CPUs, at least 4, and a
 // worker keeps several connections for as long as it runs: the listener of

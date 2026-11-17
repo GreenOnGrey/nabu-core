@@ -386,19 +386,31 @@ func (r *Repo) ClearModel(ctx context.Context, userID uuid.UUID) error {
 
 // ─── administration ─────────────────────────────────────────────────
 
+// GroupRef is a group of a user, as the list of users shows it
+// (FTR.NAB.CMN-0007 R7). The built-in groups come without a membership of
+// their own: «all» belongs to everyone and «admins» follows the role.
+type GroupRef struct {
+	ID      uuid.UUID `json:"id"`
+	Name    string    `json:"name"`
+	Builtin *string   `json:"builtin"`
+}
+
 // AdminUser is a row of Administration → Users.
 type AdminUser struct {
 	User
-	Channels []string `json:"channels"`
+	Channels []string   `json:"channels"`
+	Groups   []GroupRef `json:"groups"`
 }
 
 // List lists users with search and status filter; purgeWithinDays > 0
 // keeps archived accounts deleted within that many days (R20, AR-10).
+// The search does not depend on the case (FTR.NAB.CMN-0001 tech §12, решение 26), and the
+// groups of a user come with the row (FTR.NAB.CMN-0007 R7).
 func (r *Repo) List(ctx context.Context, q, status string, purgeWithinDays, limit int) ([]AdminUser, error) {
 	rows, err := r.Pool.Query(ctx, `SELECT `+prefixed("u.")+`, CASE WHEN EXISTS (SELECT 1 FROM telegram_bindings t WHERE t.user_id = u.id)
-		THEN '{telegram}'::text[] ELSE '{}'::text[] END
+		THEN '{telegram}'::text[] ELSE '{}'::text[] END, `+userGroups+`
 		FROM users u
-		WHERE u.created_via <> 'group' AND ($1 = '' OR u.email ILIKE '%' || $1 || '%' OR u.name ILIKE '%' || $1 || '%') AND ($2 = '' OR u.status = $2)
+		WHERE u.created_via <> 'group' AND ($1 = '' OR `+postgres.Fold("u.email")+` ILIKE '%' || $1 || '%' OR `+postgres.Fold("u.name")+` ILIKE '%' || $1 || '%') AND ($2 = '' OR u.status = $2)
 		AND ($4 <= 0 OR (u.status = 'archived' AND u.purge_after < now() + make_interval(days => $4::int)))
 		ORDER BY CASE WHEN $2 = 'archived' THEN u.purge_after END ASC NULLS LAST, u.last_seen_at DESC NULLS LAST, u.created_at DESC LIMIT $3`,
 		q, status, limit, purgeWithinDays)
@@ -410,13 +422,19 @@ func (r *Repo) List(ctx context.Context, q, status string, purgeWithinDays, limi
 	for rows.Next() {
 		var a AdminUser
 		if err := rows.Scan(&a.ID, &a.Email, &a.Name, &a.AvatarURL, &a.IsAdmin, &a.Status, &a.Language, &a.Theme, &a.Timezone,
-			&a.CreatedVia, &a.LastSeenAt, &a.CreatedAt, &a.ArchivedAt, &a.ArchivedBy, &a.PurgeAfter, &a.Channels); err != nil {
+			&a.CreatedVia, &a.LastSeenAt, &a.CreatedAt, &a.ArchivedAt, &a.ArchivedBy, &a.PurgeAfter, &a.Channels, &a.Groups); err != nil {
 			return nil, err
 		}
 		out = append(out, a)
 	}
 	return out, rows.Err()
 }
+
+// userGroups is the memberships of the user of the row, in the order of the
+// groups (FTR.NAB.CMN-0007 R7, design §3.1).
+var userGroups = `COALESCE((SELECT json_agg(json_build_object('id', g.id, 'name', g.name, 'builtin', g.builtin)
+		ORDER BY g.position, lower(` + postgres.Fold("g.name") + `))
+	FROM user_group_members m JOIN user_groups g ON g.id = m.group_id WHERE m.user_id = u.id), '[]'::json)`
 
 func prefixed(p string) string {
 	return p + `id, ` + p + `email, COALESCE(` + p + `name,''), COALESCE(` + p + `avatar_url,''), ` + p + `is_admin, ` + p + `status, ` +

@@ -263,7 +263,7 @@ func (s *Service) Search(ctx context.Context, uid uuid.UUID, f Filter, limit int
 		args = append(args, q, limit)
 		qi, li := len(args)-1, len(args)
 		rows, err := tx.Query(ctx, `SELECT `+noteCols+` FROM comm_notes n, plainto_tsquery('simple', `+fmt.Sprintf("$%d", qi)+`) tq
-			WHERE n.user_id = $1`+cond+fmt.Sprintf(` AND (n.search_vector @@ tq OR n.title ILIKE '%%' || $%d || '%%' OR n.summary ILIKE '%%' || $%d || '%%')
+			WHERE n.user_id = $1`+cond+fmt.Sprintf(` AND (n.search_vector @@ tq OR `+postgres.Fold("n.title")+` ILIKE '%%' || $%d || '%%' OR `+postgres.Fold("n.summary")+` ILIKE '%%' || $%d || '%%')
 			ORDER BY ts_rank(n.search_vector, tq) DESC, n.last_at DESC, n.id DESC LIMIT $%d`, qi, qi, li), args...)
 		if err != nil {
 			return err
@@ -738,11 +738,11 @@ func (s *Service) Tags(ctx context.Context, uid uuid.UUID, kind, q string, limit
 	err := s.as(ctx, uid, func(tx pgx.Tx) error {
 		sql := `SELECT p.id, COALESCE(NULLIF(p.name,''), p.email), p.email,
 				(SELECT count(*) FROM comm_note_tags t WHERE t.user_id = p.user_id AND t.kind = 'person' AND t.tag_id = p.id)
-			FROM comm_people p WHERE p.user_id = $1 AND ($2 = '' OR p.email ILIKE '%' || $2 || '%' OR p.name ILIKE '%' || $2 || '%')`
+			FROM comm_people p WHERE p.user_id = $1 AND ($2 = '' OR ` + postgres.Fold("p.email") + ` ILIKE '%' || $2 || '%' OR ` + postgres.Fold("p.name") + ` ILIKE '%' || $2 || '%')`
 		if kind == KindTopic {
 			sql = `SELECT p.id, p.name, '',
 				(SELECT count(*) FROM comm_note_tags t WHERE t.user_id = p.user_id AND t.kind = 'topic' AND t.tag_id = p.id)
-			FROM comm_topics p WHERE p.user_id = $1 AND ($2 = '' OR p.name ILIKE '%' || $2 || '%')`
+			FROM comm_topics p WHERE p.user_id = $1 AND ($2 = '' OR ` + postgres.Fold("p.name") + ` ILIKE '%' || $2 || '%')`
 		}
 		rows, err := tx.Query(ctx, sql+` ORDER BY 4 DESC, 2 LIMIT $3`, uid, strings.TrimSpace(q), limit)
 		if err != nil {

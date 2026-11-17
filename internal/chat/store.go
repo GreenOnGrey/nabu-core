@@ -452,6 +452,18 @@ func (s *Store) DeleteAttachment(ctx context.Context, uid, id uuid.UUID) (string
 	return key, err
 }
 
+// Progress stores an answer while it is being written (FTR.NAB.CHAT-0001 R11, tech §4): the history read in the
+// middle of a turn — a page opened again, a visit to another section of the site and back — has the text and the
+// steps of the turn so far. A finished answer is not touched.
+func (s *Store) Progress(ctx context.Context, id uuid.UUID, text string, steps []ToolStep) {
+	if id == uuid.Nil {
+		return
+	}
+	sb, _ := json.Marshal(steps)
+	_, _ = s.Pool.Exec(ctx, `UPDATE messages SET text = $2, tool_steps = $3
+		WHERE id = $1 AND role = 'assistant' AND status IN ('streaming','pending')`, id, text, sb)
+}
+
 // Finish stores the final state of an answer.
 func (s *Store) Finish(ctx context.Context, id uuid.UUID, text, status string, steps []ToolStep, errClass, errText string) (*Message, error) {
 	sb, _ := json.Marshal(steps)

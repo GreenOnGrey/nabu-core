@@ -105,7 +105,7 @@ func (s *Service) grants(ctx context.Context, q Querier, gid uuid.UUID) (*Grants
 // Groups lists the groups: «admins» first, the ordinary ones by position,
 // «all» last (R4).
 func (s *Service) Groups(ctx context.Context) ([]Group, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT `+groupCols+` FROM user_groups g ORDER BY g.position, lower(g.name)`)
+	rows, err := s.Pool.Query(ctx, `SELECT `+groupCols+` FROM user_groups g ORDER BY g.position, lower(`+postgres.Fold("g.name")+`)`)
 	if err != nil {
 		return nil, err
 	}
@@ -331,9 +331,10 @@ func (s *Service) Members(ctx context.Context, id uuid.UUID, q string, page http
 	case g.Builtin != nil && *g.Builtin == BuiltinAdmins:
 		cond = `u.is_admin AND $1::uuid IS NOT NULL`
 	}
-	const sortKey = `lower(COALESCE(NULLIF(u.name,''), u.email))`
+	// the search and the order of the names do not depend on the case (FTR.NAB.CMN-0001 tech §12, решение 26)
+	sortKey := `lower(` + postgres.Fold(`COALESCE(NULLIF(u.name,''), u.email)`) + `)`
 	rows, err := s.Pool.Query(ctx, `SELECT u.id, u.email, COALESCE(u.name,'') FROM users u WHERE `+cond+`
-		AND u.created_via <> 'group' AND u.status <> 'archived' AND ($2 = '' OR u.email ILIKE '%' || $2 || '%' OR u.name ILIKE '%' || $2 || '%')
+		AND u.created_via <> 'group' AND u.status <> 'archived' AND ($2 = '' OR `+postgres.Fold("u.email")+` ILIKE '%' || $2 || '%' OR `+postgres.Fold("u.name")+` ILIKE '%' || $2 || '%')
 		AND ($4::uuid IS NULL OR (`+sortKey+`, u.id) > (SELECT `+sortKey+`, u.id FROM users u WHERE u.id = $4))
 		ORDER BY `+sortKey+`, u.id LIMIT $3`, id, strings.TrimSpace(q), page.Limit+1, after)
 	if err != nil {
