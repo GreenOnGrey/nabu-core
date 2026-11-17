@@ -231,7 +231,7 @@ func effective(ctx context.Context, q Querier, uid uuid.UUID) (*Access, error) {
 	// the groups of the user: «all», «admins» for an administrator, the memberships
 	rows, err := q.Query(ctx, `SELECT g.id, g.name, g.builtin, g.position FROM user_groups g
 		WHERE g.builtin = 'all' OR (g.builtin = 'admins' AND $2) OR g.id IN (SELECT group_id FROM user_group_members WHERE user_id = $1)
-		ORDER BY g.position, lower(g.name)`, uid, a.Admin)
+		ORDER BY g.position, lower(`+postgres.Fold("g.name")+`)`, uid, a.Admin)
 	if err != nil {
 		return nil, err
 	}

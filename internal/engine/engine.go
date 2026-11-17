@@ -344,6 +344,7 @@ type collector struct {
 	text     strings.Builder
 	pending  strings.Builder
 	lastPush time.Time
+	lastSave time.Time
 	steps    []chat.ToolStep
 	args     map[string]string
 	failure  *agent.Event
@@ -381,6 +382,21 @@ func (c *collector) flush() {
 	c.e.publish(c.ctx, events.MessageDelta, c.uid, map[string]any{"messageId": c.msgID, "conversationId": c.conv, "delta": c.pending.String()})
 	c.pending.Reset()
 	c.lastPush = time.Now()
+	// a page opened again in the middle of the turn shows the answer as it stands; the saved copy follows it
+	// once a second, the events keep the open pages (FTR.NAB.CHAT-0001 R11, tech §4)
+	if time.Since(c.lastSave) > time.Second {
+		c.save()
+	}
+}
+
+// save stores the answer as it is being written: the history of a conversation read in the middle of a turn, or after
+// a visit to another section of the site, has the text and the steps of the turn so far, not an empty message.
+func (c *collector) save() {
+	if !c.stream || c.msgID == uuid.Nil {
+		return
+	}
+	c.e.Chat.Progress(c.ctx, c.msgID, c.text.String(), c.steps)
+	c.lastSave = time.Now()
 }
 
 func (c *collector) handle(ev agent.Event) {
@@ -418,6 +434,7 @@ func (c *collector) handle(ev agent.Event) {
 		c.args[ev.ID] = string(ev.Args)
 		st := chat.ToolStep{ID: ev.ID, Server: server, Tool: tool, Summary: stepTitle(server, tool), Status: "running"}
 		c.steps = append(c.steps, st)
+		c.save()
 		if c.stream {
 			c.e.publish(c.ctx, events.ToolStep, c.uid, map[string]any{"messageId": c.msgID, "conversationId": c.conv, "step": st})
 		}
@@ -436,6 +453,7 @@ func (c *collector) handle(ev agent.Event) {
 				if s := firstLine(ev.Summary); s != "" {
 					c.steps[i].Summary = stepTitle(server, tool) + " — " + clip(s, 140)
 				}
+				c.save()
 				if c.stream {
 					c.e.publish(c.ctx, events.ToolStep, c.uid, map[string]any{"messageId": c.msgID, "conversationId": c.conv, "step": c.steps[i]})
 				}

@@ -133,7 +133,7 @@ func (s *Service) Table(ctx context.Context, f Filter) ([]Row, error) {
 		coalesce(st.status, 'new'), coalesce(st.profile, ''), coalesce(st.version, ''), coalesce(st.note, '')
 	FROM s LEFT JOIN package_status st ON st.package_ecosystem = s.eco AND st.package_name = s.pkg
 	WHERE ($4 = '' OR s.eco = $4 OR ($4 = 'python-module' AND s.ecosystem = 'python-module') OR ($4 = 'command' AND s.ecosystem = 'command'))
-	  AND ($5 = '' OR coalesce(st.status, 'new') = $5) AND ($6 = '' OR s.pkg ILIKE '%' || $6 || '%')
+	  AND ($5 = '' OR coalesce(st.status, 'new') = $5) AND ($6 = '' OR `+postgres.Fold("s.pkg")+` ILIKE '%' || $6 || '%')
 	GROUP BY s.eco, s.pkg, st.status, st.profile, st.version, st.note
 	ORDER BY count(DISTINCT s.subject) DESC, count(*) DESC, s.pkg LIMIT 500`,
 		f.Days, 0, f.Source, f.Ecosystem, f.Status, f.Query)

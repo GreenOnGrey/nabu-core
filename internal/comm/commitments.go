@@ -244,7 +244,7 @@ func (s *Service) SaveCommitment(ctx context.Context, uid uuid.UUID, in SaveComm
 		if err != nil {
 			return err
 		}
-		err = tx.QueryRow(ctx, `SELECT id FROM commitments WHERE user_id = $1 AND note_id = $2 AND lower(text) = lower($3)
+		err = tx.QueryRow(ctx, `SELECT id FROM commitments WHERE user_id = $1 AND note_id = $2 AND lower(`+postgres.Fold("text")+`) = lower(`+postgres.Fold("$3")+`)
 			AND COALESCE(basis_message_id,'') = $4`, uid, note, in.Text, in.BasisMessageID).Scan(&id)
 		if err == nil {
 			return nil // already there, in any state: a closed one is not reopened by a repeated batch

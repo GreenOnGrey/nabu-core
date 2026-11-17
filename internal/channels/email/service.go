@@ -788,7 +788,7 @@ func (m *Mail) LogRoute(r chi.Router) {
 			args = append(args, page.Cursor.T, page.Cursor.ID)
 		}
 		rows, err := m.Pool.Query(r.Context(), `SELECT id, at, COALESCE(from_addr,''), COALESCE(subject,''), result, reason, conversation_id FROM email_log
-			WHERE ($1 = '' OR result = $1) AND ($2 = '' OR from_addr ILIKE '%' || $2 || '%')`+cond+` ORDER BY at DESC, id DESC LIMIT $3`, args...)
+			WHERE ($1 = '' OR result = $1) AND ($2 = '' OR `+postgres.Fold("from_addr")+` ILIKE '%' || $2 || '%')`+cond+` ORDER BY at DESC, id DESC LIMIT $3`, args...)
 		if err != nil {
 			return err
 		}

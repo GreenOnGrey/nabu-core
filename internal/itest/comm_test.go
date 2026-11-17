@@ -547,7 +547,7 @@ func TestCommSettings(t *testing.T) {
 	}
 }
 
-// SRC-01, SRC-02, TASK-01, TASK-02, TASK-05…TASK-09, TASK-14…TASK-17, LIFE-08
+// SRC-01, SRC-02, TASK-01, TASK-02, TASK-05…TASK-09, TASK-14…TASK-17, TASK-21, LIFE-08
 func TestMemoryTasks(t *testing.T) {
 	ctx := context.Background()
 	s := commStore(t)
@@ -673,8 +673,18 @@ func TestMemoryTasks(t *testing.T) {
 	if _, err := enable("digest_day", `{"days":[]}`); !isCode(err, "invalid_day") {
 		t.Fatalf("%v", err)
 	}
-	if _, err := enable("digest_week", `{"channel":"telegram"}`); err != nil { // no Deliverable in the test: accepted
-		t.Fatal(err)
+	// TASK-21: a digest goes to the site or to a channel the user may use — the registry answers for the rest
+	ts.Deliverable = func(ctx context.Context, uid uuid.UUID, channel string) (bool, string) {
+		if channel == "vkteams" {
+			return false, "channel_disabled"
+		}
+		return true, ""
+	}
+	if _, err := enable("digest_week", `{"channel":"telegram"}`); err != nil { // Deliverable allows it
+		t.Fatalf("TASK-21: %v", err)
+	}
+	if _, err := enable("digest_week", `{"channel":"vkteams"}`); !isCode(err, "channel_unavailable") {
+		t.Fatalf("TASK-21: an unavailable channel: %v", err)
 	}
 	week, _ := enable("digest_week", `{"weekday":5,"time":"10:00","channel":"web"}`)
 	if week.Schedule.Cron != "0 10 * * 5" {
