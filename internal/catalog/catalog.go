@@ -991,7 +991,9 @@ func (s *Service) StarterCatalog(ctx context.Context) error {
 		{"backstage", "Backstage", "platform", "", true},
 		{"kubernetes", "Kubernetes", "platform", "", true},
 		{"postgresql", "PostgreSQL", "platform", "", true},
-		{"clickhouse", "ClickHouse", "platform", "", true},
+		// FTR.INFRA.MCPS-0001 R9: the ClickHouse server of the stand is personal and read-only, the login and
+		// password of the user (FTR.NAB.CMN-0001 R13).
+		{"clickhouse", "ClickHouse", "personal", "token", true},
 		{"greenplum", "Greenplum", "platform", "", true},
 		{"web-search", "Web search", "platform", "", false},
 	}
