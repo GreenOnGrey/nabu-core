@@ -55,7 +55,9 @@ type Config struct {
 	GitHubBaseURL      string // https://github.com (OAuth) — fakes in tests
 	GitHubAPIURL       string // https://api.github.com
 	BootstrapAdmins    []string
-	// BootstrapClients are the first service clients (FTR.NAB.CMN-0001 R17a).
+	// BootstrapClients are the first service clients (FTR.NAB.CMN-0001 R17a): api creates them at
+	// the start and keeps the secret of a client it created in step with the configuration until the
+	// secret is reissued in the administration.
 	BootstrapClients []BootstrapClient
 
 	SecretsKey []byte

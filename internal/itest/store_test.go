@@ -443,8 +443,8 @@ func TestClientsAndRuns(t *testing.T) {
 	// and the agents set by an administrator survive the next start with the same configuration
 	boot := []config.BootstrapClient{{Name: "installed", SecretSHA256: fmt.Sprintf("%x", sha256.Sum256([]byte("boot-secret"))),
 		URL: "https://installed.example.org"}}
-	if created, err := cs.Bootstrap(ctx, boot); err != nil || len(created) != 1 {
-		t.Fatalf("bootstrap: %v %v", created, err)
+	if created, repaired, err := cs.Bootstrap(ctx, boot); err != nil || len(created) != 1 || len(repaired) != 0 {
+		t.Fatalf("bootstrap: %v %v %v", created, repaired, err)
 	}
 	if _, err := cs.Authenticate(ctx, "installed", "boot-secret"); err != nil {
 		t.Fatal("the secret of a bootstrap client is refused")
@@ -459,6 +459,28 @@ func TestClientsAndRuns(t *testing.T) {
 	if bc == nil || !bc.CanDelegate || bc.CanImport || bc.URL != "https://installed.example.org" {
 		t.Fatalf("bootstrap client %+v", bc)
 	}
+	// SVC-14 (R17a): a client the configuration created keeps the secret of the configuration even when the
+	// row was left with the hash of an older secret (a stand installed before the trailing line end was fixed)
+	legacy := fmt.Sprintf("%x", sha256.Sum256([]byte("boot-secret\n")))
+	if _, err := pool.Exec(ctx, `UPDATE service_clients SET secret_hash = $1 WHERE name = $2`, legacy, "installed"); err != nil {
+		t.Fatal(err)
+	}
+	if created, repaired, err := cs.Bootstrap(ctx, boot); err != nil || len(created) != 0 ||
+		len(repaired) != 1 || repaired[0] != "installed" {
+		t.Fatalf("bootstrap after a divergence: %v %v %v", created, repaired, err)
+	}
+	if _, err := cs.Authenticate(ctx, "installed", "boot-secret"); err != nil {
+		t.Fatalf("the secret of the configuration is refused after a divergence: %v", err)
+	}
+	if _, err := cs.Authenticate(ctx, "installed", "boot-secret\n"); err == nil {
+		t.Fatal("the hash of the older secret still works")
+	}
+	// the repair changes the secret and nothing else
+	if kept, err := cs.Get(ctx, bc.ID); err != nil || kept.URL != "https://installed.example.org" || len(kept.Agents) != 0 ||
+		!kept.CanDelegate || kept.CanImport || kept.CanArchive || kept.CanRestore {
+		t.Fatalf("the client changed by the repair: %+v %v", kept, err)
+	}
+	// the previous secret works for 24 hours after a reissue (SVC-09): the next start is inside the overlap
 	reissued, err := cs.Reissue(ctx, bc.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -466,8 +488,8 @@ func TestClientsAndRuns(t *testing.T) {
 	if _, err := cs.Update(ctx, bc.ID, clients.Input{Agents: &[]string{"analysis"}}); err != nil {
 		t.Fatal(err)
 	}
-	if created, err := cs.Bootstrap(ctx, boot); err != nil || len(created) != 0 {
-		t.Fatalf("second bootstrap: %v %v", created, err)
+	if created, repaired, err := cs.Bootstrap(ctx, boot); err != nil || len(created) != 0 || len(repaired) != 0 {
+		t.Fatalf("second bootstrap: %v %v %v", created, repaired, err)
 	}
 	if kept, err := cs.Get(ctx, bc.ID); err != nil || len(kept.Agents) != 1 || kept.Agents[0] != "analysis" {
 		t.Fatalf("agents after a restart: %+v %v", kept, err)
@@ -475,15 +497,39 @@ func TestClientsAndRuns(t *testing.T) {
 	if _, err := cs.Authenticate(ctx, "installed", reissued.Secret); err != nil {
 		t.Fatal("the reissued secret is refused after a restart")
 	}
+	// a reissued secret is not rolled back to the configuration
+	other := []config.BootstrapClient{{Name: "installed", SecretSHA256: fmt.Sprintf("%x", sha256.Sum256([]byte("other-secret"))),
+		URL: "https://installed.example.org"}}
+	if created, repaired, err := cs.Bootstrap(ctx, other); err != nil || len(created) != 0 || len(repaired) != 0 {
+		t.Fatalf("bootstrap of a reissued client: %v %v %v", created, repaired, err)
+	}
+	if _, err := cs.Authenticate(ctx, "installed", "other-secret"); err == nil {
+		t.Fatal("the configuration overrode a reissued secret")
+	}
 	// a client the administrator deleted does not come back with the configured secret
 	if err := cs.Delete(ctx, bc.ID); err != nil {
 		t.Fatal(err)
 	}
-	if created, err := cs.Bootstrap(ctx, boot); err != nil || len(created) != 0 {
-		t.Fatalf("bootstrap after a delete: %v %v", created, err)
+	if created, repaired, err := cs.Bootstrap(ctx, boot); err != nil || len(created) != 0 || len(repaired) != 0 {
+		t.Fatalf("bootstrap after a delete: %v %v %v", created, repaired, err)
 	}
 	if _, err := cs.Authenticate(ctx, "installed", "boot-secret"); err == nil {
 		t.Fatal("a deleted bootstrap client is back")
+	}
+	// a client an administrator creates under the name of a deleted bootstrapped one is not bootstrapped:
+	// the next start does not take its secret from the configuration
+	admin, err := cs.Create(ctx, clients.Input{Name: "installed", URL: ptr("https://admin.example.org")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created, repaired, err := cs.Bootstrap(ctx, boot); err != nil || len(created) != 0 || len(repaired) != 0 {
+		t.Fatalf("bootstrap over an administrator's client: %v %v %v", created, repaired, err)
+	}
+	if _, err := cs.Authenticate(ctx, "installed", admin.Secret); err != nil {
+		t.Fatalf("the configuration overwrote the secret of an administrator's client: %v", err)
+	}
+	if _, err := cs.Authenticate(ctx, "installed", "boot-secret"); err == nil {
+		t.Fatal("the configured secret works for an administrator's client")
 	}
 	// catalog
 	cat := &catalog.Service{Pool: pool, Box: box, Signer: signer, InternalURL: "http://api:8081"}

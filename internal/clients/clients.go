@@ -226,35 +226,49 @@ func (s *Service) Create(ctx context.Context, in Input) (*Created, error) {
 }
 
 // Bootstrap creates the clients of the configuration (checked by ValidateBootstrap) that it never
-// created before, with delegation (FTR.NAB.CMN-0001 R17a). An existing client belongs to the
-// administrators and stays as it is; a deleted one does not come back. It returns the created names.
-func (s *Service) Bootstrap(ctx context.Context, list []config.BootstrapClient) ([]string, error) {
-	var created []string
+// created before, with delegation, and keeps the secret of a client it created in step with the
+// configuration until an administrator reissues it (FTR.NAB.CMN-0001 R17a). The address, the agents
+// and the rights belong to the administrators; a deleted one does not come back. It returns the
+// created and the repaired names.
+func (s *Service) Bootstrap(ctx context.Context, list []config.BootstrapClient) ([]string, []string, error) {
+	var created, repaired []string
 	for _, c := range list {
 		h, _ := hex.DecodeString(c.SecretSHA256)
 		agents := c.Agents
 		if agents == nil {
 			agents = []string{}
 		}
-		made := false
+		made, fixed := false, false
 		err := pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
 			tag, err := tx.Exec(ctx, `INSERT INTO bootstrap_clients (name) VALUES ($1) ON CONFLICT (name) DO NOTHING`, c.Name)
-			if err != nil || tag.RowsAffected() == 0 {
+			if err != nil {
 				return err
 			}
-			tag, err = tx.Exec(ctx, `INSERT INTO service_clients (name, url, client_id, secret_hash, agents, can_delegate)
-				VALUES ($1, $2, $1, $3, $4, true) ON CONFLICT (name) DO NOTHING`, c.Name, c.URL, h, agents)
+			if tag.RowsAffected() == 0 {
+				// R17a: the secret of a client this configuration created follows the configuration until an
+				// administrator reissues it — Reissue fills prev_secret_hash, and such a client is left alone.
+				// A client an administrator created under the same name is not bootstrapped and stays untouched.
+				tag, err = tx.Exec(ctx, `UPDATE service_clients SET secret_hash = $2
+					WHERE name = $1 AND bootstrapped AND secret_hash <> $2 AND prev_secret_hash IS NULL`, c.Name, h)
+				fixed = err == nil && tag.RowsAffected() > 0
+				return err
+			}
+			tag, err = tx.Exec(ctx, `INSERT INTO service_clients (name, url, client_id, secret_hash, agents, can_delegate, bootstrapped)
+				VALUES ($1, $2, $1, $3, $4, true, true) ON CONFLICT (name) DO NOTHING`, c.Name, c.URL, h, agents)
 			made = err == nil && tag.RowsAffected() > 0
 			return err
 		})
 		if err != nil {
-			return created, fmt.Errorf("client %s: %w", c.Name, err)
+			return created, repaired, fmt.Errorf("client %s: %w", c.Name, err)
 		}
 		if made {
 			created = append(created, c.Name)
 		}
+		if fixed {
+			repaired = append(repaired, c.Name)
+		}
 	}
-	return created, nil
+	return created, repaired, nil
 }
 
 func deref(s *string) string {

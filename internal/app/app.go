@@ -472,10 +472,10 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 	if err := clients.ValidateBootstrap(cfg.BootstrapClients); err != nil {
 		return err
 	}
-	if created, err := c.clients.Bootstrap(ctx, cfg.BootstrapClients); err != nil {
+	if created, repaired, err := c.clients.Bootstrap(ctx, cfg.BootstrapClients); err != nil {
 		slog.Error("bootstrap service clients", "err", err)
-	} else if len(created) > 0 {
-		slog.Info("bootstrap service clients", "created", created)
+	} else if len(created) > 0 || len(repaired) > 0 {
+		slog.Info("bootstrap service clients", "created", created, "repaired", repaired)
 	}
 	// FTR.NAB.CMN-0008 tech §5.2: the built-in profiles of this version.
 	c.profiles.Cfg.Version = version
