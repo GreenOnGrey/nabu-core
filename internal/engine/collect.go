@@ -9,6 +9,7 @@ import (
 	"maps"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 
@@ -41,6 +42,53 @@ func auditToolError(class agent.ErrorClass) *string {
 		reason = "tool_error"
 	}
 	return &reason
+}
+
+// collectorArgSummary keeps the identifiers of a call of the collector and drops every other argument (R30, tech
+// §6.4): the id of a thread or a chat names the object an administrator looks for and carries no text, while the
+// rest of the arguments of the source tools carry the text of messages and of queries. A call that Pi clipped
+// names no identifiers, and its row stays without arguments.
+func collectorArgSummary(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var in map[string]json.RawMessage
+	if json.Unmarshal(raw, &in) != nil {
+		return ""
+	}
+	out := map[string]string{}
+	for key, v := range in {
+		if !identifierArg(key) {
+			continue
+		}
+		var s string
+		if json.Unmarshal(v, &s) != nil {
+			continue
+		}
+		if s == "" || len([]rune(s)) > 200 || strings.ContainsFunc(s, unicode.IsControl) {
+			continue
+		}
+		out[key] = s
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	b, _ := json.Marshal(out)
+	if len(b) > collectorArgsMax {
+		// the ledger clips a longer value with an ellipsis, which is no longer JSON: a row that an administrator
+		// cannot read is worse than no row
+		return ""
+	}
+	return string(b)
+}
+
+// collectorArgsMax stays below ledger.ArgsMax, so the row holds the whole object of identifiers.
+const collectorArgsMax = 400
+
+// identifierArg reports whether an argument names an object rather than carries text: the id of Gmail, the id of
+// the VK mail thread or the chat number of VK Teams (FTR.NAB.CMN-0003 tech §14, decision 47).
+func identifierArg(name string) bool {
+	return name == "id" || name == "chat_sn" || strings.HasSuffix(name, "Id") || strings.HasSuffix(name, "_id")
 }
 
 // collectorInstructions are shipped with the release: the administrator
@@ -470,8 +518,16 @@ func (e *Engine) collectTurn(ctx context.Context, u *users.User, b *comm.Batch, 
 	defer op.Close(context.WithoutCancel(ctx), resp.SessionID) //nolint:errcheck // the session is over anyway
 	var failure *agent.Event
 	audit := ledger.Entry{AgentKind: "service", Agent: CollectorAgent, UserID: &u.ID, Channel: "task:collect"}
+	// the identifiers of the calls by their id, until the result of the call comes (R30)
+	args := map[string]string{}
+	secrets := []string{key, builtinTok, proxyTok}
 	handle := func(ev agent.Event) {
 		switch ev.Type {
+		case agent.EventToolCall:
+			// without an id the result cannot be matched to its call: two calls would share one summary
+			if s := collectorArgSummary(ev.Args); s != "" && ev.ID != "" {
+				args[ev.ID] = s
+			}
 		case agent.EventToolResult:
 			server, tool := ledger.SplitTool(ev.Name)
 			a := audit
@@ -483,9 +539,10 @@ func (e *Engine) collectTurn(ctx context.Context, u *users.User, b *comm.Batch, 
 			if server != "" {
 				a.Server = &server
 			}
-			// R30, tech §6.4: neither the arguments nor the results of the tools —
-			// they carry the text of messages and of notes
-			e.Ledger.Audit(ctx, a, "", nil)
+			// R30, tech §6.4: neither the text of the arguments nor the results of the tools — they carry the
+			// text of messages and of notes; the identifiers of the read calls stay.
+			e.Ledger.Audit(ctx, a, args[ev.ID], secrets)
+			delete(args, ev.ID)
 			e.Services.AppendEvent(ctx, runID, "tool", map[string]any{"tool": ev.Name, "isError": ev.IsError})
 		case agent.EventUsage:
 			total.Add(ev.Usage)
