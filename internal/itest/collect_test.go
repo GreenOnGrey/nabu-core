@@ -160,6 +160,8 @@ type fakeCollector struct {
 	// script is what the "model" does with the tools of a session.
 	script func(call func(server, tool string, args any) (string, bool))
 	fail   bool
+	// stall makes the "model" answer nothing until the run's time limit is over: a batch that did not fit.
+	stall bool
 }
 
 func (f *fakeCollector) Open(_ context.Context, req agent.SessionRequest, _ func(ctx context.Context) ([]byte, error)) (agent.SessionResponse, error) {
@@ -176,8 +178,12 @@ func (f *fakeCollector) Open(_ context.Context, req agent.SessionRequest, _ func
 
 func (f *fakeCollector) Prompt(ctx context.Context, id string, _ agent.PromptRequest, onEvent func(agent.Event)) error {
 	f.mu.Lock()
-	req, fail := f.sessions[id], f.fail
+	req, fail, stall := f.sessions[id], f.fail, f.stall
 	f.mu.Unlock()
+	if stall {
+		<-ctx.Done() // the run is over before the model answered: MEMORY_RUN_TIMEOUT
+		return ctx.Err()
+	}
 	if fail {
 		onEvent(agent.Event{Type: agent.EventError, ErrorClass: agent.ErrUnavailable, Message: "the model is down"})
 		return nil
@@ -905,6 +911,45 @@ func TestCollect(t *testing.T) {
 	}
 	if failures != 1 {
 		t.Fatalf("notices of the three failures: %d", failures)
+	}
+
+	// TIMEOUT-01 (FTR.NAB.CMN-0003 tech §6.4, FTR.NAB.CMN-0001 R28): a batch that does not fit the run's time
+	// limit has a class of its own, and the row of the tick in the audit says why. Before, the class was
+	// «unavailable» and an administrator read a slow batch as a model that was down; the tick left no row at all.
+	if _, err := ts.Resume(ctx, a, *mt.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	gmail.mu.Lock()
+	gmail.threads["t8"] = []gmailMsg{{ID: "m11", Sender: "lee@x.org", To: []string{"col-a@x.org"}, Date: "2026-10-19", Body: "Созвон в среду?"}}
+	gmail.mu.Unlock()
+	op.mu.Lock()
+	op.stall = true
+	op.mu.Unlock()
+	eng.CollectCfg.RunTimeout = 200 * time.Millisecond
+	o = tick()
+	eng.CollectCfg.RunTimeout = time.Minute
+	op.mu.Lock()
+	op.stall = false
+	op.mu.Unlock()
+	if o.status != "failed" || o.class != string(agent.ErrTimeout) {
+		t.Fatalf("TIMEOUT-01: the run %+v", o)
+	}
+	var bclass, rclass, rtext string
+	_ = pool.QueryRow(ctx, `SELECT COALESCE(error_class,'') FROM comm_batches
+		WHERE status = 'failed' ORDER BY created_at DESC LIMIT 1`).Scan(&bclass)
+	_ = pool.QueryRow(ctx, `SELECT COALESCE(error_class,''), COALESCE(error_text,'') FROM runs
+		WHERE agent = 'memory-collector' ORDER BY started_at DESC LIMIT 1`).Scan(&rclass, &rtext)
+	if bclass != string(agent.ErrTimeout) || rclass != string(agent.ErrTimeout) {
+		t.Fatalf("TIMEOUT-01: the batch %q, the run %q", bclass, rclass)
+	}
+	if !strings.Contains(rtext, "did not finish within the time limit") {
+		t.Fatalf("TIMEOUT-01: the text of the run %q", rtext)
+	}
+	var tickReason string
+	_ = pool.QueryRow(ctx, `SELECT COALESCE(error,'') FROM audit WHERE tool = 'memory.collect' AND result = 'error'
+		ORDER BY at DESC LIMIT 1`).Scan(&tickReason)
+	if tickReason != string(agent.ErrTimeout) {
+		t.Fatalf("TIMEOUT-01: the audit of the tick %q", tickReason)
 	}
 }
 

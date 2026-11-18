@@ -51,6 +51,10 @@ type fakeVK struct {
 	calls    map[string]int
 	read     []string // chat_sn read with messenger-list-messages
 	limited  bool     // HTTP 429 on every call
+	// limitAnswer is the answer of the source that names a rate limit in the result of a tool (VK WorkSpace):
+	// it answers every call with this text while limitLeft is not 0; -1 — until the test changes it.
+	limitAnswer string
+	limitLeft   int
 }
 
 func (f *fakeVK) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -102,6 +106,13 @@ func (f *fakeVK) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "tools/call":
 		a := req.Params.Arguments
 		f.calls[req.Params.Name]++
+		if f.limitLeft != 0 {
+			if f.limitLeft > 0 {
+				f.limitLeft--
+			}
+			answer(map[string]any{"content": []map[string]string{{"type": "text", "text": f.limitAnswer}}, "isError": true})
+			return
+		}
 		switch req.Params.Name {
 		case "messenger-get-current-user":
 			text(map[string]any{"email": f.self, "name": "Me"})
@@ -410,6 +421,44 @@ func TestVKWorkSpaceCollect(t *testing.T) {
 	vk.mu.Lock()
 	vk.limited = false
 	vk.mu.Unlock()
+
+	// RATE-02: the limit comes in the result of the tool, with the wait of the server: the tick waits and calls
+	// the source again — the limit of the source is not a failure (FTR.NAB.ADM-0001 tech §4.3)
+	vk.mu.Lock()
+	before := vk.calls["messenger-get-current-user"]
+	vk.limitAnswer = `Rate limit exceeded for budget "short" (5m0s). Retry in 1 seconds.`
+	vk.limitLeft = 1
+	vk.mu.Unlock()
+	if status, summary, failures := tick(); status != "succeeded" || summary == "rate_limited" || failures != 0 {
+		t.Fatalf("RATE-02: %s %q failures %d", status, summary, failures)
+	}
+	vk.mu.Lock()
+	asked := vk.calls["messenger-get-current-user"] - before
+	vk.limitAnswer, vk.limitLeft = "", 0
+	vk.mu.Unlock()
+	if asked != 2 {
+		t.Fatalf("RATE-02: the source was called %d times around the limit, want 2 (the limited one and the retry)", asked)
+	}
+
+	// RATE-03: the source keeps the limit — the tick is not a failure and leaves a row in the audit
+	vk.mu.Lock()
+	vk.limitAnswer = `Rate limit exceeded for budget "short" (5m0s). Retry in 1 seconds.`
+	vk.limitLeft = -1
+	vk.mu.Unlock()
+	if status, summary, failures := tick(); status != "succeeded" || summary != "rate_limited" || failures != 0 {
+		t.Fatalf("RATE-03: %s %q failures %d", status, summary, failures)
+	}
+	vk.mu.Lock()
+	vk.limitAnswer, vk.limitLeft = "", 0
+	vk.mu.Unlock()
+	var limitedRows int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit WHERE agent = 'memory-collector' AND tool = 'memory.collect'
+		AND result = 'ok' AND args_summary = '{"rateLimited":1}'`).Scan(&limitedRows); err != nil {
+		t.Fatal(err)
+	}
+	if limitedRows == 0 {
+		t.Fatal("RATE-03: no row of the tick in the audit")
+	}
 
 	// TEAMS-12: the muted groups of the user for the settings
 	r := chi.NewRouter()

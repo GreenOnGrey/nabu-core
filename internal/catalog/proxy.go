@@ -10,6 +10,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -568,6 +570,58 @@ var ErrSourceAccess = errors.New("no access to the source")
 // ErrSourceRateLimited: the server of the source answered HTTP 429 (FTR.NAB.ADM-0001 tech §4.3).
 var ErrSourceRateLimited = errors.New("the source limits the rate of requests")
 
+// RateLimited is the answer of a source that names a rate limit in the result of a tool instead of HTTP 429: the
+// text of the server and the wait it asks for. servers of the company (VK WorkSpace) do so with «Rate limit
+// exceeded for budget "short" (5m0s). Retry in 276 seconds.» (FTR.NAB.ADM-0001 tech §4.3).
+type RateLimited struct {
+	// After is the wait the server asked for; 0 — the answer named no time.
+	After time.Duration
+}
+
+func (e *RateLimited) Error() string {
+	if e.After <= 0 {
+		return ErrSourceRateLimited.Error()
+	}
+	return ErrSourceRateLimited.Error() + ", retry in " + e.After.String()
+}
+
+// Unwrap keeps errors.Is(err, ErrSourceRateLimited) true for the callers that map the error to collect.ErrRateLimited.
+func (e *RateLimited) Unwrap() error { return ErrSourceRateLimited }
+
+// rateLimitAnswer reads the text of a failed tool of a source: did the server name a rate limit, and after how long
+// does it let the run in again. The words are the ones servers of company systems use, in English and in Russian.
+func rateLimitAnswer(text string) (time.Duration, bool) {
+	low := strings.ToLower(text)
+	if !strings.Contains(low, "rate limit") && !strings.Contains(low, "too many requests") &&
+		!strings.Contains(low, "лимит запросов") && !strings.Contains(low, "слишком много запросов") {
+		return 0, false
+	}
+	return retryAfter(low), true
+}
+
+// retryAfter reads the wait of the answer: «Retry in 276 seconds.», «retry after 5m». The servers of the company
+// systems answer in English; the phrase of the limit itself is read in Russian too.
+var retryAfterRE = regexp.MustCompile(`(?:retry|повтор\w*)\s*(?:in|after|через)?\s*(\d+)\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|h)`)
+
+func retryAfter(low string) time.Duration {
+	m := retryAfterRE.FindStringSubmatch(low)
+	if m == nil {
+		return 0
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n <= 0 {
+		return 0
+	}
+	switch unit := m[2]; {
+	case strings.HasPrefix(unit, "h"):
+		return time.Duration(n) * time.Hour
+	case strings.HasPrefix(unit, "m"):
+		return time.Duration(n) * time.Minute
+	default:
+		return time.Duration(n) * time.Second
+	}
+}
+
 // CallSource calls a tool of a personal MCP server with the access of the
 // user, outside a session of an agent: the adapters of the sources of
 // communications learn what changed with it (FTR.NAB.CMN-0003 arch §3.1).
@@ -605,6 +659,11 @@ func (s *Service) CallSource(ctx context.Context, uid, itemID uuid.UUID, tool st
 		return "", err
 	}
 	if isErr {
+		// a server of a company system answers the limit of its own budget in the result of the tool, not as
+		// HTTP 429 (FTR.NAB.ADM-0001 tech §4.3): the tick is not a failure, and it waits as the server says
+		if after, ok := rateLimitAnswer(text); ok {
+			return "", &RateLimited{After: after}
+		}
 		return "", fmt.Errorf("the tool %s failed: %s", tool, text)
 	}
 	return text, nil

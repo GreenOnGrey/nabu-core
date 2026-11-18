@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -49,6 +50,7 @@ func auditToolError(class agent.ErrorClass) *string {
 // rest of the arguments of the source tools carry the text of messages and of queries. A call that Pi clipped
 // names no identifiers, and its row stays without arguments.
 func collectorArgSummary(raw json.RawMessage) string {
+	raw = unwrapJSON(raw)
 	if len(raw) == 0 {
 		return ""
 	}
@@ -85,10 +87,95 @@ func collectorArgSummary(raw json.RawMessage) string {
 // collectorArgsMax stays below ledger.ArgsMax, so the row holds the whole object of identifiers.
 const collectorArgsMax = 400
 
+// rateLimitWait is how long the tick waits for a source that named the wait of its limit (FTR.NAB.ADM-0001
+// tech §4.3): at most maxRateLimitWaits times in one call, and only while the run has more time than the wait and
+// a margin for the work itself. A source that keeps the limit makes the tick repeat later, not fail.
+func (e *Engine) rateLimitWait(ctx context.Context, err error, waits int) (time.Duration, bool) {
+	var rl *catalog.RateLimited
+	if !errors.As(err, &rl) || rl.After <= 0 || waits >= maxRateLimitWaits {
+		return 0, false
+	}
+	wait := min(rl.After, maxRateLimitWait)
+	if dl, ok := ctx.Deadline(); ok && time.Until(dl) < wait+rateLimitMargin {
+		return 0, false
+	}
+	return wait, true
+}
+
+const (
+	// maxRateLimitWaits bounds the waits of one call: two answers of a limit in a row end the tick, and the
+	// next one repeats it.
+	maxRateLimitWaits = 2
+	// maxRateLimitWait is the longest wait the tick takes: a server that asks for more gets the next tick.
+	maxRateLimitWait = 5 * time.Minute
+	// rateLimitMargin is the time the run keeps for its work after a wait.
+	rateLimitMargin = time.Minute
+)
+
 // identifierArg reports whether an argument names an object rather than carries text: the id of Gmail, the id of
 // the VK mail thread or the chat number of VK Teams (FTR.NAB.CMN-0003 tech §14, decision 47).
 func identifierArg(name string) bool {
 	return name == "id" || name == "chat_sn" || strings.HasSuffix(name, "Id") || strings.HasSuffix(name, "_id")
+}
+
+// unwrapJSON reads the arguments of a call that came wrapped in a JSON string: an object inside a string named no
+// identifiers at all, and the row of the call stayed empty although the server gave the id of the thread.
+func unwrapJSON(raw json.RawMessage) json.RawMessage {
+	t := bytes.TrimSpace(raw)
+	if len(t) == 0 || t[0] != '"' {
+		return raw
+	}
+	var s string
+	if json.Unmarshal(t, &s) != nil {
+		return raw
+	}
+	return json.RawMessage(s)
+}
+
+// callArgs stages the identifiers of a call until its result comes (R30). Pi names a call with an id, and the
+// result carries the same one; a stream that comes without ids is paired by the name of the tool while exactly
+// one call of that name is outstanding. Several id-less calls of one tool cannot be told apart, and their rows
+// keep no identifiers: the id of another chat is worse than none in the audit.
+type callArgs struct {
+	byID   map[string]string
+	byName map[string][]string
+}
+
+func (c *callArgs) add(ev agent.Event) {
+	s := collectorArgSummary(ev.Args)
+	if s == "" {
+		return
+	}
+	if ev.ID != "" {
+		if c.byID == nil {
+			c.byID = map[string]string{}
+		}
+		c.byID[ev.ID] = s
+		return
+	}
+	if c.byName == nil {
+		c.byName = map[string][]string{}
+	}
+	c.byName[ev.Name] = append(c.byName[ev.Name], s)
+}
+
+func (c *callArgs) take(ev agent.Event) string {
+	if ev.ID != "" {
+		s := c.byID[ev.ID]
+		delete(c.byID, ev.ID)
+		return s
+	}
+	q := c.byName[ev.Name]
+	switch len(q) {
+	case 0:
+		return ""
+	case 1:
+		delete(c.byName, ev.Name)
+		return q[0]
+	default:
+		delete(c.byName, ev.Name)
+		return ""
+	}
 }
 
 // collectorInstructions are shipped with the release: the administrator
@@ -194,6 +281,7 @@ func (e *Engine) Collect(ctx context.Context, u *users.User, ri *tasks.RunInfo) 
 			if wait <= 0 {
 				wait = 2 * time.Second
 			}
+			waits := 0
 			for attempt := 0; ; attempt++ {
 				text, err := e.Catalog.CallSource(ctx, u.ID, item, tool, raw)
 				if errors.Is(err, catalog.ErrSourceAccess) {
@@ -202,7 +290,19 @@ func (e *Engine) Collect(ctx context.Context, u *users.User, ri *tasks.RunInfo) 
 				e.Ledger.Audit(ctx, ledger.Entry{AgentKind: "service", Agent: CollectorAgent, UserID: &u.ID, Channel: "task:" + ri.TaskID.String(),
 					Server: &src.Source, Tool: tool, Result: resultOf(err), Error: sourceError(err)}, "", nil) // R30: no arguments, no text
 				if errors.Is(err, catalog.ErrSourceRateLimited) {
-					return nil, collect.ErrRateLimited // not tried again: the next tick repeats (FTR.NAB.ADM-0001 tech §4.3)
+					// The server named the wait ("Retry in 276 seconds"): the run waits as it says and reads on,
+					// while its own time limits allow (FTR.NAB.ADM-0001 tech §4.3). A limit that stays is not a
+					// failure of the tick: the cursor stays and the next tick repeats.
+					if d, ok := e.rateLimitWait(ctx, err, waits); ok {
+						waits++
+						select {
+						case <-ctx.Done():
+							return nil, ctx.Err()
+						case <-time.After(d):
+							continue
+						}
+					}
+					return nil, collect.ErrRateLimited
 				}
 				if err == nil || attempt == 2 || ctx.Err() != nil {
 					return json.RawMessage(text), err
@@ -230,6 +330,9 @@ func (e *Engine) Collect(ctx context.Context, u *users.User, ri *tasks.RunInfo) 
 			slog.WarnContext(ctx, "collect: changes", "user", u.ID, "source", src.Source, "err", err)
 			_ = e.Comm.CommitCursors(ctx, u.ID, false)
 			metrics.MemoryCollect.WithLabelValues("failed").Inc()
+			// the audit says why the tick did not even start to work: without the row an administrator saw an
+			// empty hour and a task paused by three failures (R28)
+			e.auditTick(ctx, u, ri, "error", "source_unavailable", nil)
 			return e.Tasks.Finish(ctx, ri.RunID, false, "", "source_unavailable", "the source "+src.Source+" did not answer", nil)
 		}
 		threads, err := e.Comm.NewThreads(ctx, u.ID, src.ItemID, src.Source, cs.Threads)
@@ -274,6 +377,9 @@ func (e *Engine) Collect(ctx context.Context, u *users.User, ri *tasks.RunInfo) 
 		}
 		if rateLimited {
 			summary = "rate_limited"
+			// the tick read nothing because a source asked to slow down: the row names the reason, the task
+			// stays successful and its failure counter does not move (FTR.NAB.ADM-0001 tech §4.3)
+			e.auditTick(ctx, u, ri, "ok", "", map[string]int{"rateLimited": 1})
 		}
 		all := map[string]int{}
 		for _, t := range truncated {
@@ -329,13 +435,6 @@ func withTruncated(summary string, truncated map[string]int) string {
 	return summary + "\ntruncated:" + string(b)
 }
 
-func failedErr(failed bool) error {
-	if failed {
-		return errors.New("failed")
-	}
-	return nil
-}
-
 // sourceError is the error of a source call for the audit: the error of the
 // server, never the mail it read, cut to 300 characters.
 func sourceError(err error) *string {
@@ -354,6 +453,23 @@ func resultOf(err error) string {
 		return "error"
 	}
 	return "ok"
+}
+
+// auditTick writes the row of a tick as a whole (R28, R30): the numbers of what it did and, when it did not do its
+// work, the class of the failure. A tick that stopped before it queued a batch had no row at all, and an
+// administrator saw a silent hour and a task paused by three failures.
+func (e *Engine) auditTick(ctx context.Context, u *users.User, ri *tasks.RunInfo, result string, class agent.ErrorClass, counts map[string]int) {
+	a := ledger.Entry{AgentKind: "service", Agent: CollectorAgent, UserID: &u.ID, Channel: "task:" + ri.TaskID.String(),
+		Tool: "memory.collect", Result: result}
+	if class != "" {
+		a.Error = auditToolError(class)
+	}
+	args := ""
+	if counts != nil {
+		b, _ := json.Marshal(counts)
+		args = string(b)
+	}
+	e.Ledger.Audit(ctx, a, args, nil)
 }
 
 // pauseCollect pauses the collection for a reason that is not a failure
@@ -519,15 +635,12 @@ func (e *Engine) collectTurn(ctx context.Context, u *users.User, b *comm.Batch, 
 	var failure *agent.Event
 	audit := ledger.Entry{AgentKind: "service", Agent: CollectorAgent, UserID: &u.ID, Channel: "task:collect"}
 	// the identifiers of the calls by their id, until the result of the call comes (R30)
-	args := map[string]string{}
+	args := &callArgs{}
 	secrets := []string{key, builtinTok, proxyTok}
 	handle := func(ev agent.Event) {
 		switch ev.Type {
 		case agent.EventToolCall:
-			// without an id the result cannot be matched to its call: two calls would share one summary
-			if s := collectorArgSummary(ev.Args); s != "" && ev.ID != "" {
-				args[ev.ID] = s
-			}
+			args.add(ev)
 		case agent.EventToolResult:
 			server, tool := ledger.SplitTool(ev.Name)
 			a := audit
@@ -541,8 +654,7 @@ func (e *Engine) collectTurn(ctx context.Context, u *users.User, b *comm.Batch, 
 			}
 			// R30, tech §6.4: neither the text of the arguments nor the results of the tools — they carry the
 			// text of messages and of notes; the identifiers of the read calls stay.
-			e.Ledger.Audit(ctx, a, args[ev.ID], secrets)
-			delete(args, ev.ID)
+			e.Ledger.Audit(ctx, a, args.take(ev), secrets)
 			e.Services.AppendEvent(ctx, runID, "tool", map[string]any{"tool": ev.Name, "isError": ev.IsError})
 		case agent.EventUsage:
 			total.Add(ev.Usage)
@@ -564,7 +676,9 @@ func (e *Engine) collectTurn(ctx context.Context, u *users.User, b *comm.Batch, 
 		return string(failure.ErrorClass), failure.Message, total
 	case errors.Is(err, context.DeadlineExceeded):
 		_ = op.Abort(context.WithoutCancel(ctx), resp.SessionID)
-		return string(agent.ErrUnavailable), "the run did not finish within the time limit", total
+		// the run did not fit its time limit: a class of its own, so that an administrator does not read a slow
+		// batch as a model that was down (FTR.NAB.CMN-0003 tech §6.4)
+		return string(agent.ErrTimeout), "the run did not finish within the time limit", total
 	case err != nil:
 		return operatorClass(err), operatorText(err), total
 	}
@@ -590,18 +704,23 @@ func (e *Engine) finishTick(ctx context.Context, u *users.User, taskRun uuid.UUI
 		slog.ErrorContext(ctx, "collect: cursors", "user", u.ID, "err", err)
 	}
 	summary := withTruncated(fmt.Sprintf("messages:%d notes:%d", tick.Messages, tick.Notes), tick.Truncated)
-	counts, _ := json.Marshal(map[string]int{"messages": tick.Messages, "notes": tick.Notes, "failedBatches": tick.Failed, "overBudgetBatches": tick.OverBudget})
-	e.Ledger.Audit(ctx, ledger.Entry{AgentKind: "service", Agent: CollectorAgent, UserID: &u.ID, Channel: "task:" + ri.TaskID.String(),
-		Tool: "memory.collect", Result: resultOf(failedErr(!ok))}, string(counts), nil) // R30
+	counts := map[string]int{"messages": tick.Messages, "notes": tick.Notes, "failedBatches": tick.Failed, "overBudgetBatches": tick.OverBudget}
+	class := ""
+	result := "ok"
+	if !ok {
+		class = tick.ErrorClass
+		if class == "" {
+			class = string(agent.ErrUnavailable)
+		}
+		result = "error"
+	}
+	// R30: counts, never the text of the sources; the class of the failure tells an administrator what to fix (R28)
+	e.auditTick(ctx, u, ri, result, agent.ErrorClass(class), counts)
 	if ok {
 		metrics.MemoryCollect.WithLabelValues("ok").Inc()
 		_ = e.Tasks.Finish(ctx, taskRun, true, summary, "", "", nil)
 	} else {
 		metrics.MemoryCollect.WithLabelValues("failed").Inc()
-		class := tick.ErrorClass
-		if class == "" {
-			class = "unavailable"
-		}
 		_ = e.Tasks.Finish(ctx, taskRun, false, summary, class, fmt.Sprintf("%d batches of the collection failed", tick.Failed), nil)
 		if paused, reason := e.Tasks.PausedNow(ctx, ri.TaskID); paused {
 			note := "The collection of communications failed three times in a row and was paused. Reason: " + reason + ". Resume it in the Tasks section after fixing the cause."
