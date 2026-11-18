@@ -33,6 +33,16 @@ const CollectorAgent = "memory-collector"
 // CollectorInstructionsVersion names the instructions a run worked with.
 const CollectorInstructionsVersion = "3"
 
+// auditToolError names the class of a failed tool of the collector (FTR.NAB.CMN-0001 R28): R30 keeps the text of
+// the source out of the audit, but a row with an empty error told an administrator nothing at all.
+func auditToolError(class agent.ErrorClass) *string {
+	reason := string(class)
+	if reason == "" {
+		reason = "tool_error"
+	}
+	return &reason
+}
+
 // collectorInstructions are shipped with the release: the administrator
 // changes only the model (arch §3.3). The run has no tools that change
 // anything outside the memory of the user, whatever a letter says.
@@ -468,6 +478,7 @@ func (e *Engine) collectTurn(ctx context.Context, u *users.User, b *comm.Batch, 
 			a.Tool, a.Result = tool, "ok"
 			if ev.IsError {
 				a.Result = "error"
+				a.Error = auditToolError(ev.ErrorClass)
 			}
 			if server != "" {
 				a.Server = &server
