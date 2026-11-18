@@ -36,12 +36,16 @@ const (
 	ErrBadRequest          ErrorClass = "bad_request"
 	ErrContextOverflow     ErrorClass = "context_overflow"
 	ErrAgentCrashed        ErrorClass = "agent_crashed"
+	// ErrTimeout is the run that did not finish within its time limit (MEMORY_RUN_TIMEOUT of the collector,
+	// FTR.NAB.CMN-0003 tech §6.4): the class told «unavailable» before, and an administrator read it as a model
+	// that was down instead of a batch that did not fit.
+	ErrTimeout ErrorClass = "timeout"
 )
 
 // Retryable reports whether the user may retry later without an
 // administrator fixing the connection.
 func (c ErrorClass) Retryable() bool {
-	return c == ErrRateLimit || c == ErrUnavailable || c == ErrAgentCrashed || c == ErrContextOverflow
+	return c == ErrRateLimit || c == ErrUnavailable || c == ErrAgentCrashed || c == ErrContextOverflow || c == ErrTimeout
 }
 
 // Cost is a price in US dollars per million tokens.
