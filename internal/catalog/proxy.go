@@ -268,6 +268,28 @@ func observe(it *Item, tool, result string, d time.Duration) {
 	}
 }
 
+// setUpstreamHeaders passes the headers of the MCP protocol of the call to the server of the item and adds the
+// access of the item.
+func setUpstreamHeaders(up, r *http.Request, headers map[string]string) {
+	for _, h := range []string{"Content-Type", "Accept", "Mcp-Session-Id", "Mcp-Protocol-Version", "Last-Event-Id"} {
+		if v := r.Header.Get(h); v != "" {
+			up.Header.Set(h, v)
+		}
+	}
+	for k, v := range headers {
+		up.Header.Set(k, v)
+	}
+}
+
+// copyAnswerHeaders passes the headers of the answer of the server that the client of the MCP protocol reads.
+func copyAnswerHeaders(w http.ResponseWriter, h http.Header) {
+	for _, k := range []string{"Content-Type", "Mcp-Session-Id", "Cache-Control"} {
+		if v := h.Get(k); v != "" {
+			w.Header().Set(k, v)
+		}
+	}
+}
+
 // toolError answers a tools/call with a result the agent reads as an error
 // of the tool.
 func toolError(w http.ResponseWriter, id json.RawMessage, text string) {
@@ -339,8 +361,9 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 	// reaches only the item of its batch, only the read tools of the adapter
 	// and only the threads of the batch.
 	var only []string
+	var run uuid.UUID
 	if c.HasScope(mcp.ScopeMemoryRun) {
-		run, _ := uuid.Parse(c.Run)
+		run, _ = uuid.Parse(c.Run)
 		if s.MemoryRun == nil {
 			rpcError(w, http.StatusForbidden, "collector runs are not enabled")
 			return
@@ -378,7 +401,8 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 		body = withArguments(body, args)
 	}
 	var plans []resultPlan
-	if isCall && len(it.resultArgsOf(call.Params.Name)) > 0 {
+	// a run of the collector has no space to put a result into (FTR.NAB.CMN-0003 arch §3.3): its calls go as they are
+	if isCall && run == uuid.Nil && len(it.resultArgsOf(call.Params.Name)) > 0 {
 		var fr *fileRefusal
 		var args json.RawMessage
 		args, plans, fr = s.rewriteResultArgs(r.Context(), it, uid, call.Params.Name, mustArgs(body))
@@ -389,19 +413,17 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 		}
 		body = withArguments(body, args)
 	}
+	if isCall && run != uuid.Nil {
+		// the token of the run lives as long as the run plus a minute (tech §6.4): the run ends a minute earlier
+		s.memoryRunCall(w, r, it, headers, body, call.ID, call.Params.Name, uid, run, time.Unix(c.ExpiresAt, 0).Add(-time.Minute))
+		return
+	}
 	up, err := http.NewRequestWithContext(r.Context(), r.Method, it.Source.URL, bytes.NewReader(body))
 	if err != nil {
 		rpcError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	for _, h := range []string{"Content-Type", "Accept", "Mcp-Session-Id", "Mcp-Protocol-Version", "Last-Event-Id"} {
-		if v := r.Header.Get(h); v != "" {
-			up.Header.Set(h, v)
-		}
-	}
-	for k, v := range headers {
-		up.Header.Set(k, v)
-	}
+	setUpstreamHeaders(up, r, headers)
 	start := time.Now()
 	resp, err := http.DefaultClient.Do(up)
 	if err != nil {
@@ -419,11 +441,7 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 	if len(plans) > 0 {
 		// the answer is read whole: the result is moved before the agent learns of it (tech §4.4)
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
-		for _, h := range []string{"Content-Type", "Mcp-Session-Id", "Cache-Control"} {
-			if v := resp.Header.Get(h); v != "" {
-				w.Header().Set(h, v)
-			}
-		}
+		copyAnswerHeaders(w, resp.Header)
 		var seen resultSniffer
 		seen.write(raw)
 		failed := seen.isError() || resp.StatusCode >= 300
@@ -441,11 +459,7 @@ func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
 		_, _ = w.Write(withResultNote(raw, note, fr))
 		return
 	}
-	for _, h := range []string{"Content-Type", "Mcp-Session-Id", "Cache-Control"} {
-		if v := resp.Header.Get(h); v != "" {
-			w.Header().Set(h, v)
-		}
-	}
+	copyAnswerHeaders(w, resp.Header)
 	filter := call.Method == "tools/list" && (it.AllowedTools != nil || it.ReadOnly || only != nil || len(it.FileArgs) > 0 || len(it.ResultArgs) > 0)
 	filterTools := func(raw []byte) []byte { return filterToolsList(raw, it, only) }
 	w.WriteHeader(resp.StatusCode)

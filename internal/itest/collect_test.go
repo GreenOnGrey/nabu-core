@@ -17,8 +17,10 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/GreenOnGrey/nabu-core/internal/apperr"
 	"github.com/GreenOnGrey/nabu-core/internal/catalog"
 	"github.com/GreenOnGrey/nabu-core/internal/chat"
+	"github.com/GreenOnGrey/nabu-core/internal/collect"
 	"github.com/GreenOnGrey/nabu-core/internal/comm"
 	"github.com/GreenOnGrey/nabu-core/internal/engine"
 	"github.com/GreenOnGrey/nabu-core/internal/ledger"
@@ -44,6 +46,9 @@ type fakeGmail struct {
 	read    []string // threads read with get_thread
 	// failSearch: how many next search_threads calls answer with an error
 	failSearch int
+	// limitRead: how many next get_thread calls answer the rate limit of the server with limitText
+	limitRead int
+	limitText string
 }
 
 type gmailMsg struct {
@@ -127,6 +132,11 @@ func (f *fakeGmail) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			text(map[string]any{"threads": out})
 		case "get_thread":
+			if f.limitRead > 0 {
+				f.limitRead--
+				answer(map[string]any{"content": []map[string]string{{"type": "text", "text": f.limitText}}, "isError": true})
+				return
+			}
 			var a struct {
 				ThreadID string `json:"threadId"`
 			}
@@ -162,6 +172,8 @@ type fakeCollector struct {
 	fail   bool
 	// stall makes the "model" answer nothing until the run's time limit is over: a batch that did not fit.
 	stall bool
+	// deadline is the time limit of the last run the "model" got.
+	deadline time.Time
 }
 
 func (f *fakeCollector) Open(_ context.Context, req agent.SessionRequest, _ func(ctx context.Context) ([]byte, error)) (agent.SessionResponse, error) {
@@ -179,6 +191,7 @@ func (f *fakeCollector) Open(_ context.Context, req agent.SessionRequest, _ func
 func (f *fakeCollector) Prompt(ctx context.Context, id string, _ agent.PromptRequest, onEvent func(agent.Event)) error {
 	f.mu.Lock()
 	req, fail, stall := f.sessions[id], f.fail, f.stall
+	f.deadline, _ = ctx.Deadline()
 	f.mu.Unlock()
 	if stall {
 		<-ctx.Done() // the run is over before the model answered: MEMORY_RUN_TIMEOUT
@@ -305,6 +318,7 @@ func TestCollect(t *testing.T) {
 	// api: the built-in MCP and the proxy, as in the application
 	cat := &catalog.Service{Pool: pool, Box: box, Signer: signer}
 	cat.MemoryRun = s.ProxyGuard
+	cat.MemoryRateLimited = s.MarkRateLimited
 	userEmail := func(ctx context.Context, uid uuid.UUID) (string, bool) {
 		u, err := repo().Get(ctx, uid)
 		if err != nil || u == nil {
@@ -766,6 +780,16 @@ func TestCollect(t *testing.T) {
 	if len(orphans) != 1 {
 		t.Fatalf("batches of the interrupted tick: %d", len(orphans))
 	}
+	// QUEUE-02 (decision 53): a tick over batches still queued reads nothing and queues nothing; it is not a failure
+	searches := gmail.count("search_threads")
+	if o = tick(); o.status != "succeeded" || o.summary != "busy" || o.batches != 0 || gmail.count("search_threads") != searches {
+		t.Fatalf("QUEUE-02: a tick over a queue: %+v, searches %d → %d", o, searches, gmail.count("search_threads"))
+	}
+	var busyRow string
+	_ = pool.QueryRow(ctx, `SELECT COALESCE(args_summary,'') FROM audit WHERE tool = 'memory.collect' AND user_id = $1 ORDER BY at DESC LIMIT 1`, a).Scan(&busyRow)
+	if !strings.Contains(busyRow, `"pendingBatches":1`) {
+		t.Fatalf("QUEUE-02: the audit of the busy tick %q", busyRow)
+	}
 	eng.MemoryHousekeeping(ctx) // too early: the batch is fresh
 	var st string
 	_ = pool.QueryRow(ctx, `SELECT status FROM task_runs WHERE id = $1`, lostRun).Scan(&st)
@@ -773,6 +797,16 @@ func TestCollect(t *testing.T) {
 		t.Fatalf("a fresh run was closed: %s", st)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE comm_batches SET created_at = now() - interval '2 hours' WHERE task_run_id = $1`, lostRun); err != nil {
+		t.Fatal(err)
+	}
+	// QUEUE-01 (decision 55): an old queued batch of a user whose batches still end is a long queue that moves
+	eng.MemoryHousekeeping(ctx)
+	_ = pool.QueryRow(ctx, `SELECT status FROM task_runs WHERE id = $1`, lostRun).Scan(&st)
+	if st != "running" {
+		t.Fatalf("QUEUE-01: a queue that moves was closed: %s", st)
+	}
+	// … and stale when no batch of the user started for longer than a run
+	if _, err := pool.Exec(ctx, `UPDATE comm_batches SET started_at = now() - interval '2 hours' WHERE user_id = $1 AND started_at IS NOT NULL`, a); err != nil {
 		t.Fatal(err)
 	}
 	eng.MemoryHousekeeping(ctx)
@@ -950,6 +984,207 @@ func TestCollect(t *testing.T) {
 		ORDER BY at DESC LIMIT 1`).Scan(&tickReason)
 	if tickReason != string(agent.ErrTimeout) {
 		t.Fatalf("TIMEOUT-01: the audit of the tick %q", tickReason)
+	}
+
+	// saveAll is a "model" that saves a note for every thread of the batch, after it read the thread with the
+	// tool of the batch when read is set; it returns what the reads answered.
+	var runReads []string
+	var runReadErrs int
+	saveAll := func(read bool) func(call func(server, tool string, args any) (string, bool)) {
+		return func(call func(server, tool string, args any) (string, bool)) {
+			out, isErr := call("nabu", "comm_batch", map[string]any{})
+			if isErr {
+				t.Errorf("comm_batch: %s", out)
+				return
+			}
+			var batch struct {
+				Threads []struct {
+					ThreadKey string `json:"threadKey"`
+					ReadWith  struct {
+						Tool string         `json:"tool"`
+						Args map[string]any `json:"args"`
+					} `json:"readWith"`
+				} `json:"threads"`
+			}
+			_ = json.Unmarshal([]byte(out), &batch)
+			for _, th := range batch.Threads {
+				if read {
+					res, isErr := call(item.Name, th.ReadWith.Tool, th.ReadWith.Args)
+					runReads = append(runReads, res)
+					if isErr {
+						runReadErrs++
+						continue // the proxy said to stop reading: no note for a thread that was not read
+					}
+				}
+				call("nabu", "comm_note_save", map[string]any{"threadKey": th.ThreadKey, "title": "Заметка " + th.ThreadKey, "summary": "Короткая выжимка.", "topics": []string{}})
+			}
+		}
+	}
+	failuresOf := func() int {
+		cur, err := ts.Get(ctx, a, *mt.TaskID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cur.Failures
+	}
+
+	// SET-01 (decision 52): the administrator sets the time limit of a run and the threads of a batch; the next
+	// tick and the next run use them without a restart, and null returns the values of the environment.
+	for _, bad := range []comm.SettingsPatch{{BatchThreads: []byte("0")}, {BatchThreads: []byte("101")}, {RunTimeoutMinutes: []byte("121")}, {RunTimeoutMinutes: []byte(`"5"`)}} {
+		if _, err := s.SaveSettings(ctx, bad); err == nil {
+			t.Fatalf("SET-01: an invalid limit saved: %+v", bad)
+		} else if e, ok := apperr.As(err); !ok || e.Code != "invalid_collect_limit" {
+			t.Fatalf("SET-01: %v", err)
+		}
+	}
+	if _, err := s.SaveSettings(ctx, comm.SettingsPatch{RunTimeoutMinutes: []byte("7"), BatchThreads: []byte("1")}); err != nil {
+		t.Fatal(err)
+	}
+	gmail.mu.Lock()
+	gmail.threads["t9"] = []gmailMsg{{ID: "m12", Sender: "lee@x.org", To: []string{"col-a@x.org"}, Date: "2026-10-20", Body: "Повестка готова."}}
+	gmail.threads["t10"] = []gmailMsg{{ID: "m13", Sender: "kim@x.org", To: []string{"col-a@x.org"}, Date: "2026-10-20", Body: "Стенд поднят."}}
+	gmail.mu.Unlock()
+	op.script = saveAll(false)
+	if o = tick(); o.status != "succeeded" || o.batches < 2 {
+		t.Fatalf("SET-01: one thread a batch: %+v", o)
+	}
+	op.mu.Lock()
+	left := time.Until(op.deadline)
+	last := op.requests[len(op.requests)-1]
+	op.mu.Unlock()
+	if left < 6*time.Minute || left > 7*time.Minute {
+		t.Fatalf("SET-01: the time limit of the run %s, want 7 minutes", left)
+	}
+	for _, m := range last.MCP {
+		// decision 54: Pi waits for the source longer than the proxy holds a call over its rate limit
+		if m.Name == item.Name && m.Timeout != 7*60 {
+			t.Fatalf("SET-01: Pi waits for the source %d s", m.Timeout)
+		}
+	}
+	cs, err := s.SaveSettings(ctx, comm.SettingsPatch{RunTimeoutMinutes: []byte("null"), BatchThreads: []byte("null")})
+	if err != nil || cs.RunTimeoutMinutes != nil || cs.BatchThreads != nil {
+		t.Fatalf("SET-01: null returns the environment: %+v %v", cs, err)
+	}
+	if got := cs.Limits(comm.Limits{RunTimeout: time.Minute, BatchThreads: 20}); got.RunTimeout != time.Minute || got.BatchThreads != 20 {
+		t.Fatalf("SET-01: the limits in force %+v", got)
+	}
+
+	// RATE-04 (decision 54): a read of the run meets the rate limit of the source that names its wait: the proxy
+	// waits it out and calls again, and the model gets the thread, not the limit.
+	eng.CollectCfg.RunTimeout = 3 * time.Minute
+	gmail.mu.Lock()
+	gmail.threads["t11"] = []gmailMsg{{ID: "m14", Sender: "lee@x.org", To: []string{"col-a@x.org"}, Date: "2026-10-21", Body: "Билеты куплены."}}
+	gmail.limitRead, gmail.limitText = 1, `Rate limit exceeded for budget "short" (5m0s). Retry in 1 seconds.`
+	gmail.mu.Unlock()
+	op.script = saveAll(true)
+	runReads, runReadErrs = nil, 0
+	gets := gmail.count("get_thread")
+	if o = tick(); o.status != "succeeded" || o.summary != "messages:1 notes:1" || runReadErrs != 0 {
+		t.Fatalf("RATE-04: %+v, runReads %q", o, runReads)
+	}
+	if n := gmail.count("get_thread") - gets; n != 2 || !strings.Contains(strings.Join(runReads, ""), "Билеты куплены") {
+		t.Fatalf("RATE-04: the source was read %d times, the model got %q", n, runReads)
+	}
+
+	// RATE-05 (decision 54): the source keeps the limit and names no wait: the proxy tells the model to stop, the
+	// batch fails as rate_limited without remembering its unread messages, the tick is not a failure, and the next
+	// tick reads the thread again.
+	gmail.mu.Lock()
+	gmail.threads["t12"] = []gmailMsg{{ID: "m15", Sender: "kim@x.org", To: []string{"col-a@x.org"}, Date: "2026-10-22", Body: "Отчёт принят."}}
+	gmail.limitRead, gmail.limitText = 100, "Rate limit exceeded."
+	gmail.mu.Unlock()
+	runReads, runReadErrs = nil, 0
+	before := failuresOf()
+	if o = tick(); o.status != "succeeded" || o.summary != "rate_limited" || o.class != "" || runReadErrs != 1 {
+		t.Fatalf("RATE-05: %+v, runReads %q", o, runReads)
+	}
+	if !strings.Contains(runReads[0], "Do not call the source again") {
+		t.Fatalf("RATE-05: the model read %q", runReads[0])
+	}
+	if after := failuresOf(); after != before {
+		t.Fatalf("RATE-05: failures %d → %d", before, after)
+	}
+	var bstatus string
+	_ = pool.QueryRow(ctx, `SELECT status, COALESCE(error_class,'') FROM comm_batches WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`, a).Scan(&bstatus, &bclass)
+	var skipped int
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM comm_skipped WHERE user_id = $1 AND message_id = 'm15'`, a).Scan(&skipped)
+	if bstatus != "failed" || bclass != comm.ClassRateLimited || skipped != 0 {
+		t.Fatalf("RATE-05: the batch %s %s, skipped %d", bstatus, bclass, skipped)
+	}
+	var rateRow, rateResult string
+	_ = pool.QueryRow(ctx, `SELECT result, COALESCE(args_summary,'') FROM audit WHERE tool = 'memory.collect' AND user_id = $1 ORDER BY at DESC LIMIT 1`, a).Scan(&rateResult, &rateRow)
+	if rateResult != "ok" || !strings.Contains(rateRow, `"rateLimitedBatches":1`) {
+		t.Fatalf("RATE-05: the audit of the tick %s %q", rateResult, rateRow)
+	}
+	gmail.mu.Lock()
+	gmail.limitRead = 0
+	gmail.mu.Unlock()
+	if o = tick(); o.status != "succeeded" || o.summary != "messages:1 notes:1" {
+		t.Fatalf("RATE-05: the next tick reads the thread again: %+v", o)
+	}
+	eng.CollectCfg.RunTimeout = time.Minute
+
+	// CUR-01 (decision 56): a source whose batches of the tick are all done moves its cursor, a source with a
+	// failed batch keeps the old one.
+	var curRun uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO task_runs (task_id, scheduled_for, status) VALUES ($1, now(), 'running') RETURNING id`, *mt.TaskID).Scan(&curRun); err != nil {
+		t.Fatal(err)
+	}
+	gmailBefore, _ := s.Cursor(ctx, a, item.ID, "gmail")
+	one := []collect.Thread{{Key: "c1", Messages: []collect.Msg{{ID: "cm1"}}}}
+	for _, src := range []struct {
+		source, cursor string
+		ok             bool
+	}{{"gmail", "cursor-of-gmail", true}, {"other", "cursor-of-other", false}} {
+		ids, err := s.CreateBatches(ctx, a, &curRun, item.ID, src.source, one, false, 20, src.cursor)
+		if err != nil || len(ids) != 1 {
+			t.Fatal(ids, err)
+		}
+		if ok, err := s.StartBatch(ctx, a, ids[0], uuid.New(), time.Minute); !ok || err != nil {
+			t.Fatal(ok, err)
+		}
+		class := ""
+		if !src.ok {
+			class = "unavailable"
+		}
+		if _, err := s.FinishBatch(ctx, a, ids[0], src.ok, class); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.CommitTickCursors(ctx, a, curRun); err != nil {
+		t.Fatal(err)
+	}
+	if g, _ := s.Cursor(ctx, a, item.ID, "gmail"); g != "cursor-of-gmail" || g == gmailBefore {
+		t.Fatalf("CUR-01: the done source keeps its cursor %q", g)
+	}
+	if o, _ := s.Cursor(ctx, a, item.ID, "other"); o != "" {
+		t.Fatalf("CUR-01: the source with a failed batch moved its cursor to %q", o)
+	}
+
+	// QUEUE-01 (decision 52): a batch started with a long time limit lives to its own end, though the limit in force
+	// is shorter now; after its end and the grace it is stale.
+	var longRun uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO task_runs (task_id, scheduled_for, status) VALUES ($1, now(), 'running') RETURNING id`, *mt.TaskID).Scan(&longRun); err != nil {
+		t.Fatal(err)
+	}
+	ids, err := s.CreateBatches(ctx, a, &longRun, item.ID, "gmail", []collect.Thread{{Key: "l1", Messages: []collect.Msg{{ID: "lm1"}}}}, false, 20, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.StartBatch(ctx, a, ids[0], uuid.New(), time.Hour); !ok || err != nil {
+		t.Fatal(ok, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE comm_batches SET started_at = now() - interval '30 minutes' WHERE id = $1`, ids[0]); err != nil {
+		t.Fatal(err)
+	}
+	if stale, err := s.StaleBatches(ctx, 12*time.Minute, 2*time.Minute, time.Hour); err != nil || stale[longRun] != uuid.Nil {
+		t.Fatalf("QUEUE-01: a batch within its own time limit is stale: %v %v", stale, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE comm_batches SET deadline_at = now() - interval '3 minutes' WHERE id = $1`, ids[0]); err != nil {
+		t.Fatal(err)
+	}
+	if stale, err := s.StaleBatches(ctx, 12*time.Minute, 2*time.Minute, time.Hour); err != nil || stale[longRun] != a {
+		t.Fatalf("QUEUE-01: a batch past its time limit is not stale: %v %v", stale, err)
 	}
 }
 

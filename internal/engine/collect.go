@@ -228,6 +228,23 @@ type CollectConfig struct {
 	RetryWait time.Duration
 }
 
+// collectLimits are the time limit of a run of the collector and the threads of a batch in force: the values of
+// the administration, else MEMORY_RUN_TIMEOUT and MEMORY_BATCH_THREADS (FTR.NAB.CMN-0003 decision 52). They are
+// read at every tick and every batch, so a change applies without a restart.
+func (e *Engine) collectLimits(ctx context.Context) comm.Limits {
+	def := comm.Limits{RunTimeout: e.CollectCfg.RunTimeout, BatchThreads: e.CollectCfg.BatchThreads}
+	st, err := e.Comm.LoadSettings(ctx)
+	if err != nil {
+		return def
+	}
+	return st.Limits(def)
+}
+
+// collectorSourceTimeout is how long Pi waits for an answer of the source to a run of the collector, in seconds:
+// the MCP proxy holds a call that met the rate limit of the source for the wait the server names, up to five
+// minutes (FTR.NAB.CMN-0003 decision 54), and the call itself takes its time after it.
+const collectorSourceTimeout = 7 * 60
+
 // CollectMessage is the payload of nabu.memory.collect: a batch to process.
 type CollectMessage struct {
 	BatchID uuid.UUID `json:"batchId"`
@@ -246,6 +263,17 @@ func (e *Engine) Collect(ctx context.Context, u *users.User, ri *tasks.RunInfo) 
 	} else if over {
 		return e.pauseCollect(ctx, u, ri, tasks.PauseBudget)
 	}
+	// FTR.NAB.CMN-0003 decision 53: the batches of an earlier tick are still queued or running. A tick over them
+	// would read the source while they read it too (one rate limit for both) and queue the same threads again; the
+	// running tick moves the cursors when it ends, and the next one reads on from there.
+	if n, err := e.Comm.PendingBatches(ctx, u.ID); err != nil {
+		return err
+	} else if n > 0 {
+		metrics.MemoryCollect.WithLabelValues("busy").Inc()
+		e.auditTick(ctx, u, ri, "ok", "", map[string]int{"pendingBatches": n})
+		return e.Tasks.Finish(ctx, ri.RunID, true, "busy", "", "", nil)
+	}
+	limits := e.collectLimits(ctx)
 	var set tasks.CollectSettings
 	_ = json.Unmarshal(ri.Settings, &set)
 	ex := collect.Exclusions{Senders: set.Exclusions.Senders, Folders: set.Exclusions.Folders, Chats: set.Exclusions.Chats,
@@ -351,7 +379,7 @@ func (e *Engine) Collect(ctx context.Context, u *users.User, ri *tasks.RunInfo) 
 		}
 		e.Ledger.Audit(ctx, ledger.Entry{AgentKind: "service", Agent: CollectorAgent, UserID: &u.ID, Channel: "task:" + ri.TaskID.String(),
 			Server: &src.Source, Tool: "memory.collect.changes", Result: "ok"}, string(counts), nil)
-		ids, err := e.Comm.CreateBatches(ctx, u.ID, &ri.RunID, src.ItemID, src.Source, threads, cursor == "", e.CollectCfg.BatchThreads, cs.Cursor)
+		ids, err := e.Comm.CreateBatches(ctx, u.ID, &ri.RunID, src.ItemID, src.Source, threads, cursor == "", limits.BatchThreads, cs.Cursor)
 		if err != nil {
 			return err
 		}
@@ -548,29 +576,39 @@ func (e *Engine) HandleCollectBatch(ctx context.Context, _, value []byte) error 
 		CollectorAgent, u.ID, input).Scan(&runID); err != nil {
 		return err
 	}
-	if ok, err := e.Comm.StartBatch(ctx, u.ID, b.ID, runID); err != nil || !ok {
+	// the settings of the run are read once: the permission, the model and the time limit (decision 52)
+	st, stErr := e.Comm.LoadSettings(ctx)
+	limits := st.Limits(comm.Limits{RunTimeout: e.CollectCfg.RunTimeout, BatchThreads: e.CollectCfg.BatchThreads})
+	if ok, err := e.Comm.StartBatch(ctx, u.ID, b.ID, runID, limits.RunTimeout); err != nil || !ok {
 		_, _ = e.Pool.Exec(ctx, `DELETE FROM runs WHERE id = $1`, runID)
 		return err
 	}
 	start := time.Now()
-	rctx, cancel := context.WithTimeout(ctx, e.CollectCfg.RunTimeout)
+	rctx, cancel := context.WithTimeout(ctx, limits.RunTimeout)
 	class, errText, usage := "", "", agent.Usage{}
-	if u.Status == "blocked" || u.Status == "archived" {
+	switch {
+	case u.Status == "blocked" || u.Status == "archived":
 		class, errText = "user_blocked", "the user is blocked"
-	} else if _, err := e.Comm.Allowed(ctx); err != nil {
+	case stErr != nil:
+		class, errText = "unavailable", "the settings could not be read"
+	case !st.Enabled:
 		class, errText = "comm_disabled", "the memory of communications is switched off"
-	} else {
-		class, errText, usage = e.collectTurn(rctx, u, b, runID)
+	default:
+		class, errText, usage = e.collectTurn(rctx, u, b, runID, st, limits.RunTimeout)
 	}
 	cancel()
 	ctx = context.WithoutCancel(ctx)
+	// the batch closes first: from now on the tools and the proxy refuse the token of the run
+	closed, err := e.Comm.FinishBatch(ctx, u.ID, b.ID, class == "", class)
+	if err != nil {
+		slog.ErrorContext(ctx, "collect: finish the batch", "batch", b.ID, "err", err)
+	} else if class == "" && closed != "" {
+		// the proxy marked the batch: the source kept its rate limit past the wait (decision 54)
+		class, errText = closed, "the source limits the rate of requests"
+	}
 	status := "succeeded"
 	if class != "" {
 		status = "failed"
-	}
-	// the batch closes first: from now on the tools and the proxy refuse the token of the run
-	if err := e.Comm.FinishBatch(ctx, u.ID, b.ID, class == "", class); err != nil {
-		slog.ErrorContext(ctx, "collect: finish the batch", "batch", b.ID, "err", err)
 	}
 	ub, _ := json.Marshal(usage)
 	_, _ = e.Pool.Exec(ctx, `UPDATE runs SET status = $2, error_class = NULLIF($3,''), error_text = NULLIF($4,''), usage = $5, finished_at = now() WHERE id = $1`,
@@ -588,11 +626,7 @@ func (e *Engine) HandleCollectBatch(ctx context.Context, _, value []byte) error 
 }
 
 // collectTurn runs the collector agent over one batch.
-func (e *Engine) collectTurn(ctx context.Context, u *users.User, b *comm.Batch, runID uuid.UUID) (class, errText string, total agent.Usage) {
-	st, err := e.Comm.LoadSettings(ctx)
-	if err != nil {
-		return "unavailable", "the settings could not be read", total
-	}
+func (e *Engine) collectTurn(ctx context.Context, u *users.User, b *comm.Batch, runID uuid.UUID, st comm.Settings, timeout time.Duration) (class, errText string, total agent.Usage) {
 	if st.Model == nil {
 		return "agent_not_configured", "the model of the collection is not chosen in the administration", total
 	}
@@ -611,7 +645,7 @@ func (e *Engine) collectTurn(ctx context.Context, u *users.User, b *comm.Batch, 
 	// The token of the run names the user and the run; the built-in MCP and the
 	// proxy take both from it. The personal access of the user to the source
 	// stays in api: the proxy adds it per call.
-	ttl := e.CollectCfg.RunTimeout + time.Minute
+	ttl := timeout + time.Minute
 	scope := []string{mcp.ScopeMemoryRun}
 	builtinTok := e.Signer.Issue(jwt.Claims{Audience: jwt.AudMCP, Subject: "builtin", User: u.ID.String(), Run: runID.String(), Scope: scope}, ttl)
 	proxyTok := e.Signer.Issue(jwt.Claims{Audience: jwt.AudMCP, Subject: "proxy:" + item.ID.String(), User: u.ID.String(), Run: runID.String(), Scope: scope}, ttl)
@@ -621,7 +655,8 @@ func (e *Engine) collectTurn(ctx context.Context, u *users.User, b *comm.Batch, 
 			item.Name: {"Authorization": "Bearer " + proxyTok}}},
 		MCP: []agent.MCPServer{
 			{Name: "nabu", URL: e.Cfg.InternalURL + "/internal/v1/mcp", HeaderNames: []string{"Authorization"}, Exposure: "direct", Description: "The batch of this run and the user's memory of communications"},
-			{Name: item.Name, URL: e.Cfg.InternalURL + "/internal/v1/mcp-proxy/" + item.ID.String(), HeaderNames: []string{"Authorization"}, Exposure: "direct", Description: "The source: read the threads of the batch"}}}
+			{Name: item.Name, URL: e.Cfg.InternalURL + "/internal/v1/mcp-proxy/" + item.ID.String(), HeaderNames: []string{"Authorization"}, Exposure: "direct", Description: "The source: read the threads of the batch",
+				Timeout: collectorSourceTimeout}}}
 	// no workspace: the file and command tools are off (arch §3.3)
 	op := e.MemoryOp
 	if op == nil {
@@ -698,13 +733,23 @@ func (e *Engine) finishTick(ctx context.Context, u *users.User, taskRun uuid.UUI
 	if err != nil || ri == nil || ri.Status != "running" {
 		return
 	}
-	// the cursors move only when every batch was processed: neither failed nor skipped for the limit
-	ok := tick.Failed == 0
-	if err := e.Comm.CommitCursors(ctx, u.ID, ok && tick.OverBudget == 0); err != nil {
+	// the cursor of a source moves when every batch of the source was processed: neither failed nor skipped for
+	// the limit; the other sources move theirs (decision 56)
+	if err := e.Comm.CommitTickCursors(ctx, u.ID, taskRun); err != nil {
 		slog.ErrorContext(ctx, "collect: cursors", "user", u.ID, "err", err)
 	}
+	// decision 54: batches that failed only for the rate limit of the source are not a failure of the task: their
+	// threads stay for the next tick, and the counter of failures does not move (as decision 48 for the changes)
+	limited := tick.Failed > 0 && tick.Failed == tick.RateLimited
+	ok := tick.Failed == 0 || limited
 	summary := withTruncated(fmt.Sprintf("messages:%d notes:%d", tick.Messages, tick.Notes), tick.Truncated)
+	if limited && tick.Messages == 0 && tick.Notes == 0 {
+		summary = withTruncated("rate_limited", tick.Truncated)
+	}
 	counts := map[string]int{"messages": tick.Messages, "notes": tick.Notes, "failedBatches": tick.Failed, "overBudgetBatches": tick.OverBudget}
+	if tick.RateLimited > 0 {
+		counts["rateLimitedBatches"] = tick.RateLimited
+	}
 	class := ""
 	result := "ok"
 	if !ok {
@@ -716,7 +761,10 @@ func (e *Engine) finishTick(ctx context.Context, u *users.User, taskRun uuid.UUI
 	}
 	// R30: counts, never the text of the sources; the class of the failure tells an administrator what to fix (R28)
 	e.auditTick(ctx, u, ri, result, agent.ErrorClass(class), counts)
-	if ok {
+	if limited {
+		metrics.MemoryCollect.WithLabelValues("rate_limited").Inc()
+		_ = e.Tasks.Finish(ctx, taskRun, true, summary, "", "", nil)
+	} else if ok {
 		metrics.MemoryCollect.WithLabelValues("ok").Inc()
 		_ = e.Tasks.Finish(ctx, taskRun, true, summary, "", "", nil)
 	} else {
@@ -755,7 +803,8 @@ func (e *Engine) MemoryHousekeeping(ctx context.Context) {
 	// A worker stopped in the middle of a tick leaves batches and the run of
 	// the task unfinished: they are failed, the cursor stays, the next tick
 	// repeats (tech §6.3).
-	if stale, err := e.Comm.StaleBatches(ctx, e.CollectCfg.RunTimeout+2*time.Minute, time.Hour); err == nil {
+	runTimeout := st.Limits(comm.Limits{RunTimeout: e.CollectCfg.RunTimeout}).RunTimeout // decision 52
+	if stale, err := e.Comm.StaleBatches(ctx, runTimeout+2*time.Minute, 2*time.Minute, time.Hour); err == nil {
 		for run, uid := range stale {
 			if u, err := e.Users.Get(ctx, uid); err == nil && u != nil {
 				e.finishTick(ctx, u, run)

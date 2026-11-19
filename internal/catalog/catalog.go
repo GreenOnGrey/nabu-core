@@ -152,6 +152,9 @@ type Service struct {
 	// (FTR.NAB.CMN-0003 tech §6.4): it returns the tools the run may see, or
 	// the reason the call is refused.
 	MemoryRun func(ctx context.Context, uid, run, item uuid.UUID, method, tool string, args json.RawMessage) (tools []string, refusal string)
+	// MemoryRateLimited marks the batch of a run of the collector that the source kept refusing for its rate limit
+	// after the proxy waited (FTR.NAB.CMN-0003 decision 54); nil — the batch is not marked.
+	MemoryRateLimited func(ctx context.Context, uid, run uuid.UUID) error
 	// Access is the access of users by groups (FTR.NAB.CMN-0007 R10, R11);
 	// nil — every published item is open to every user.
 	Access Access
