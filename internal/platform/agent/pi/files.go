@@ -143,7 +143,11 @@ func MCPJSON(req agent.SessionRequest) map[string]any {
 		for _, name := range s.HeaderNames {
 			h[name] = "${" + HeaderEnv(i+1, name) + "}"
 		}
-		e := map[string]any{"url": s.URL, "exposure": exposure(s.Exposure), "timeout": MCPCallTimeout}
+		timeout := MCPCallTimeout
+		if s.Timeout > 0 {
+			timeout = s.Timeout
+		}
+		e := map[string]any{"url": s.URL, "exposure": exposure(s.Exposure), "timeout": timeout}
 		if len(h) > 0 {
 			e["headers"] = h
 		}

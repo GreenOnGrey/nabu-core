@@ -153,6 +153,8 @@ type MCPServer struct {
 	HeaderNames []string `json:"headerNames,omitempty"`
 	Exposure    string   `json:"exposure"` // direct | deferred
 	Description string   `json:"description,omitempty"`
+	// Timeout is how long Pi waits for an answer of the server, in seconds; 0 — pi.MCPCallTimeout.
+	Timeout int `json:"timeout,omitempty"`
 }
 
 // Skills names the skills snapshot and the skills of the session.

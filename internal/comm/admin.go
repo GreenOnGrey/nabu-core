@@ -19,6 +19,20 @@ type adminSettings struct {
 	Settings
 	VectorsAvailable bool `json:"vectorsAvailable"`
 	Semantic         bool `json:"semantic"`
+	// Defaults are the values of the environment that runTimeoutMinutes and batchThreads override (decision 52).
+	Defaults collectDefaults `json:"defaults"`
+}
+
+type collectDefaults struct {
+	RunTimeoutMinutes int `json:"runTimeoutMinutes"`
+	BatchThreads      int `json:"batchThreads"`
+}
+
+func (s *Service) adminSettings(r *http.Request, st Settings) adminSettings {
+	return adminSettings{Settings: st, VectorsAvailable: s.vectors.Load(), Semantic: s.Semantic(r.Context()),
+		Defaults: collectDefaults{
+			// a limit of the environment shorter than a whole minute is shown as the minute it starts (30s → 1)
+			RunTimeoutMinutes: int((s.CollectDefaults.RunTimeout + time.Minute - 1) / time.Minute), BatchThreads: s.CollectDefaults.BatchThreads}}
 }
 
 // AdminRoutes mounts the administration of the memory of communications
@@ -31,7 +45,7 @@ func (s *Service) AdminRoutes(r chi.Router) {
 		if err != nil {
 			return err
 		}
-		httpx.JSON(w, 200, adminSettings{Settings: st, VectorsAvailable: s.vectors.Load(), Semantic: s.Semantic(r.Context())})
+		httpx.JSON(w, 200, s.adminSettings(r, st))
 		return nil
 	}))
 	r.Patch("/settings/comm", httpx.Handler(func(w http.ResponseWriter, r *http.Request) error {
@@ -43,7 +57,7 @@ func (s *Service) AdminRoutes(r chi.Router) {
 		if err != nil {
 			return err
 		}
-		httpx.JSON(w, 200, adminSettings{Settings: st, VectorsAvailable: s.vectors.Load(), Semantic: s.Semantic(r.Context())})
+		httpx.JSON(w, 200, s.adminSettings(r, st))
 		return nil
 	}))
 	r.Get("/comm/sources", httpx.Handler(func(w http.ResponseWriter, r *http.Request) error {

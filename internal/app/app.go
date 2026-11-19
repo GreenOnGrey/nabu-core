@@ -152,7 +152,8 @@ func newCore(ctx context.Context, cfg *config.Config) (*core, error) {
 			return &r, err
 		}}
 	c.memory = &memory.Service{Pool: pool, Events: pub}
-	c.comm = &comm.Service{Pool: pool, Events: pub}
+	c.comm = &comm.Service{Pool: pool, Events: pub,
+		CollectDefaults: comm.Limits{RunTimeout: cfg.MemoryRunTimeout, BatchThreads: cfg.MemoryBatchThreads}} // decision 52
 	c.comm.Embedder = func(ctx context.Context) *comm.Embedder {
 		// FTR.NAB.CMN-0003 R20: the model of embeddings is a model of a connection
 		st, err := c.comm.LoadSettings(ctx)
@@ -175,7 +176,8 @@ func newCore(ctx context.Context, cfg *config.Config) (*core, error) {
 	}
 	c.comm.EnsureVectors(ctx)
 	c.catalog.SetUserEmail(c.userEmail)
-	c.catalog.MemoryRun = c.comm.ProxyGuard // FTR.NAB.CMN-0003 tech §6.4
+	c.catalog.MemoryRun = c.comm.ProxyGuard              // FTR.NAB.CMN-0003 tech §6.4
+	c.catalog.MemoryRateLimited = c.comm.MarkRateLimited // FTR.NAB.CMN-0003 decision 54
 	c.tasks = &tasks.Service{Pool: pool, Events: pub, Bus: producer, Rules: tasks.Rules{MinInterval: cfg.TaskMinInterval, MaxActive: cfg.TaskMaxActive},
 		Catchup: cfg.TaskCatchupWindow, Tick: cfg.TaskTick, MaxFailures: cfg.TaskMaxFailures, DefaultTimezone: cfg.DefaultTimezone}
 	// FTR.NAB.CMN-0003 R13, R21: the collection needs the consent and connected sources

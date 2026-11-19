@@ -9,6 +9,7 @@ package comm
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -49,6 +50,36 @@ type Settings struct {
 	Model           *Choice `json:"model"`
 	Embeddings      *Choice `json:"embeddings"`
 	MonthlyLimitUSD float64 `json:"monthlyLimitUsd"`
+	// RunTimeoutMinutes and BatchThreads override MEMORY_RUN_TIMEOUT and MEMORY_BATCH_THREADS from the
+	// administration, without a restart (FTR.NAB.CMN-0003 tech §4, decision 52); nil — the value of the
+	// environment.
+	RunTimeoutMinutes *int `json:"runTimeoutMinutes"`
+	BatchThreads      *int `json:"batchThreads"`
+}
+
+// The bounds of the settings of the collection the administrator changes (decision 52).
+const (
+	MaxRunTimeoutMinutes = 120
+	MaxBatchThreads      = 100
+)
+
+// Limits are the time limit of a run of the collector and the threads of a batch in force.
+type Limits struct {
+	RunTimeout   time.Duration
+	BatchThreads int
+}
+
+// Limits resolves the settings of the collection: the value of the administration, else the one of the
+// environment (def).
+func (st Settings) Limits(def Limits) Limits {
+	out := def
+	if st.RunTimeoutMinutes != nil && *st.RunTimeoutMinutes > 0 {
+		out.RunTimeout = time.Duration(*st.RunTimeoutMinutes) * time.Minute
+	}
+	if st.BatchThreads != nil && *st.BatchThreads > 0 {
+		out.BatchThreads = *st.BatchThreads
+	}
+	return out
 }
 
 // Choice is a model of a connection.
@@ -67,8 +98,11 @@ type Service struct {
 	// Embedder gives the model of the search by meaning the administrator
 	// chose; nil or a nil result — the search is by words (R20).
 	Embedder func(ctx context.Context) *Embedder
-	vectors  atomic.Bool // the table of vectors exists (EnsureVectors)
-	now      func() time.Time
+	// CollectDefaults are MEMORY_RUN_TIMEOUT and MEMORY_BATCH_THREADS: the limits of the collection when the
+	// administrator did not set them (decision 52).
+	CollectDefaults Limits
+	vectors         atomic.Bool // the table of vectors exists (EnsureVectors)
+	now             func() time.Time
 }
 
 func (s *Service) clock() time.Time {
@@ -115,6 +149,9 @@ type SettingsPatch struct {
 	Model           json.RawMessage `json:"model"`
 	Embeddings      json.RawMessage `json:"embeddings"`
 	MonthlyLimitUSD *float64        `json:"monthlyLimitUsd"`
+	// RunTimeoutMinutes and BatchThreads: a number sets the value, null returns the one of the environment.
+	RunTimeoutMinutes json.RawMessage `json:"runTimeoutMinutes"`
+	BatchThreads      json.RawMessage `json:"batchThreads"`
 }
 
 // SaveSettings applies a patch of the instance settings (R29).
@@ -142,6 +179,22 @@ func (s *Service) SaveSettings(ctx context.Context, p SettingsPatch) (Settings, 
 				return apperr.Unprocessable("invalid_limit", "monthlyLimitUsd is not negative").With("field", "monthlyLimitUsd")
 			}
 			st.MonthlyLimitUSD = *p.MonthlyLimitUSD
+		}
+		for _, f := range []struct {
+			raw   json.RawMessage
+			dst   **int
+			field string
+			max   int
+		}{{p.RunTimeoutMinutes, &st.RunTimeoutMinutes, "runTimeoutMinutes", MaxRunTimeoutMinutes},
+			{p.BatchThreads, &st.BatchThreads, "batchThreads", MaxBatchThreads}} {
+			if len(f.raw) == 0 {
+				continue
+			}
+			var n *int
+			if err := json.Unmarshal(f.raw, &n); err != nil || (n != nil && (*n < 1 || *n > f.max)) {
+				return apperr.Unprocessable("invalid_collect_limit", fmt.Sprintf("%s is between 1 and %d", f.field, f.max)).With("field", f.field)
+			}
+			*f.dst = n
 		}
 		for _, f := range []struct {
 			raw json.RawMessage

@@ -119,10 +119,14 @@ func (s *Service) CreateBatches(ctx context.Context, uid uuid.UUID, taskRun *uui
 
 const batchCols = `id, user_id, task_run_id, item_id, source, backfill, threads, status, run_id`
 
-func scanBatch(row pgx.Row) (*Batch, error) {
+func scanBatch(row pgx.Row) (*Batch, error) { return scanBatchWith(row) }
+
+// scanBatchWith reads the columns before batchCols into before, then the batch.
+func scanBatchWith(row pgx.Row, before ...any) (*Batch, error) {
 	var b Batch
 	var threads []byte
-	if err := row.Scan(&b.ID, &b.UserID, &b.TaskRunID, &b.ItemID, &b.Source, &b.Backfill, &threads, &b.Status, &b.RunID); err != nil {
+	dst := append(before, &b.ID, &b.UserID, &b.TaskRunID, &b.ItemID, &b.Source, &b.Backfill, &threads, &b.Status, &b.RunID)
+	if err := row.Scan(dst...); err != nil {
 		return nil, err
 	}
 	return &b, json.Unmarshal(threads, &b.Threads)
@@ -159,33 +163,64 @@ func (s *Service) RunningBatch(ctx context.Context, uid, run uuid.UUID) (*Batch,
 	return b, err
 }
 
-// StartBatch takes a queued (or failed, on a repeat) batch for a run.
-func (s *Service) StartBatch(ctx context.Context, uid, id, run uuid.UUID) (bool, error) {
+// StartBatch takes a queued (or failed, on a repeat) batch for a run that lasts at most timeout: the batch keeps
+// the end of its run for the check of stale batches (decision 52).
+func (s *Service) StartBatch(ctx context.Context, uid, id, run uuid.UUID, timeout time.Duration) (bool, error) {
 	var ok bool
 	err := s.as(ctx, uid, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `UPDATE comm_batches SET status = 'running', run_id = $3, started_at = now(), error_class = NULL WHERE user_id = $1 AND id = $2 AND status = 'queued'`, uid, id, run)
+		tag, err := tx.Exec(ctx, `UPDATE comm_batches SET status = 'running', run_id = $3, started_at = now(),
+				deadline_at = now() + make_interval(secs => $4), error_class = NULL
+			WHERE user_id = $1 AND id = $2 AND status = 'queued'`, uid, id, run, timeout.Seconds())
 		ok = err == nil && tag.RowsAffected() == 1
 		return err
 	})
 	return ok, err
 }
 
-// FinishBatch closes a batch. The messages of a successful batch that did not
-// get into a note are remembered as read: the thread is not queued again
-// until it has a new message (tech §6.2).
-func (s *Service) FinishBatch(ctx context.Context, uid, id uuid.UUID, ok bool, errClass string) error {
+// ClassRateLimited marks a batch whose run met the rate limit of the source and could not wait it out
+// (decision 54): the batch fails without remembering its unread messages, the cursor of its source stays, and
+// the tick is not a failure of the task.
+const ClassRateLimited = "rate_limited"
+
+// MarkRateLimited notes on the running batch of a run that the source refused it for its rate limit and the
+// wait is over (decision 54): the run may still end its turn, but FinishBatch fails the batch.
+func (s *Service) MarkRateLimited(ctx context.Context, uid, run uuid.UUID) error {
+	return s.as(ctx, uid, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE comm_batches SET error_class = $3 WHERE user_id = $1 AND run_id = $2 AND status = 'running'`,
+			uid, run, ClassRateLimited)
+		return err
+	})
+}
+
+// FinishBatch closes a batch and returns the class it closed with. The messages of a successful batch that did
+// not get into a note are remembered as read: the thread is not queued again until it has a new message (tech
+// §6.2). A batch marked rate_limited by the proxy fails although its run ended (decision 54): its threads were
+// not read to the end.
+func (s *Service) FinishBatch(ctx context.Context, uid, id uuid.UUID, ok bool, errClass string) (string, error) {
 	status := "done"
 	if !ok {
 		status = "failed"
 	}
-	return s.as(ctx, uid, func(tx pgx.Tx) error {
-		b, err := scanBatch(tx.QueryRow(ctx, `UPDATE comm_batches SET status = $3, error_class = NULLIF($4,''), finished_at = now()
-			WHERE user_id = $1 AND id = $2 AND status = 'running' RETURNING `+batchCols, uid, id, status, errClass))
+	var class string
+	err := s.as(ctx, uid, func(tx pgx.Tx) error {
+		var final string
+		var closed *string
+		b, err := scanBatchWith(tx.QueryRow(ctx, `UPDATE comm_batches SET
+				status = CASE WHEN $3 = 'done' AND error_class = $5 THEN 'failed' ELSE $3 END,
+				error_class = COALESCE(NULLIF($4,''), error_class), finished_at = now()
+			WHERE user_id = $1 AND id = $2 AND status = 'running' RETURNING status, error_class, `+batchCols, uid, id, status, errClass, ClassRateLimited),
+			&final, &closed)
 		if postgres.IsNoRows(err) {
 			return nil
 		}
-		if err != nil || !ok {
+		if err != nil {
 			return err
+		}
+		if closed != nil {
+			class = *closed
+		}
+		if final != "done" {
+			return nil
 		}
 		for _, t := range b.Threads {
 			for _, m := range t.Messages {
@@ -200,18 +235,37 @@ func (s *Service) FinishBatch(ctx context.Context, uid, id uuid.UUID, ok bool, e
 		}
 		return nil
 	})
+	return class, err
+}
+
+// PendingBatches counts the batches of the user still queued or running: a tick does not start over them
+// (decision 53).
+func (s *Service) PendingBatches(ctx context.Context, uid uuid.UUID) (int, error) {
+	var n int
+	err := s.as(ctx, uid, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT count(*) FROM comm_batches WHERE user_id = $1 AND status IN ('queued','running')`, uid).Scan(&n)
+	})
+	return n, err
 }
 
 // StaleBatches fails the batches whose run did not finish: the worker was
-// stopped in the middle (tech §6.3). It returns the runs of the collection
-// task to close and their users.
-func (s *Service) StaleBatches(ctx context.Context, running, queued time.Duration) (map[uuid.UUID]uuid.UUID, error) {
+// stopped in the middle (tech §6.3). A running batch is stale grace after the
+// end of its run (deadline_at; a batch started before it had one — running
+// after its start); a queued one after queued, and only while the queue of its
+// user stands: no batch of the user started within running (decision 55). A
+// long queue that moves is not stale: the batches of a user go one by one, and
+// each starts before the time limit of the one before it is over. It returns
+// the runs of the collection task to close and their users.
+func (s *Service) StaleBatches(ctx context.Context, running, grace, queued time.Duration) (map[uuid.UUID]uuid.UUID, error) {
 	out := map[uuid.UUID]uuid.UUID{}
 	err := postgres.AsMaintenance(ctx, s.Pool, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `UPDATE comm_batches SET status = 'failed', error_class = 'unavailable', finished_at = now()
-			WHERE (status = 'running' AND COALESCE(started_at, created_at) < now() - make_interval(secs => $1))
-			   OR (status = 'queued' AND created_at < now() - make_interval(secs => $2))
-			RETURNING task_run_id, user_id`, running.Seconds(), queued.Seconds())
+			WHERE (status = 'running' AND COALESCE(deadline_at + make_interval(secs => $3),
+					COALESCE(started_at, created_at) + make_interval(secs => $1)) < now())
+			   OR (status = 'queued' AND created_at < now() - make_interval(secs => $2) AND NOT EXISTS (
+					SELECT 1 FROM comm_batches o WHERE o.user_id = comm_batches.user_id
+					  AND o.started_at > now() - make_interval(secs => $1)))
+			RETURNING task_run_id, user_id`, running.Seconds(), queued.Seconds(), grace.Seconds())
 		if err != nil {
 			return err
 		}
@@ -243,6 +297,8 @@ const ClassBudget = "budget"
 // Tick is the state of the batches of one run of the collection task.
 type Tick struct {
 	Pending, Failed int
+	// RateLimited counts the failed batches of the class rate_limited; they are in Failed (decision 54).
+	RateLimited int
 	// OverBudget counts the batches skipped for the monthly limit; they are
 	// not in Failed.
 	OverBudget      int
@@ -259,10 +315,12 @@ func (s *Service) TickState(ctx context.Context, uid, taskRun uuid.UUID) (Tick, 
 	err := s.as(ctx, uid, func(tx pgx.Tx) error {
 		if err := tx.QueryRow(ctx, `SELECT count(*) FILTER (WHERE status IN ('queued','running')),
 				count(*) FILTER (WHERE status = 'failed' AND error_class IS DISTINCT FROM 'budget'),
+				count(*) FILTER (WHERE status = 'failed' AND error_class = 'rate_limited'),
 				count(*) FILTER (WHERE status = 'failed' AND error_class = 'budget'),
 				COALESCE(sum(notes), 0), COALESCE(sum(messages), 0),
-				COALESCE(max(error_class) FILTER (WHERE status = 'failed' AND error_class IS DISTINCT FROM 'budget'), '')
-			FROM comm_batches WHERE user_id = $1 AND task_run_id = $2`, uid, taskRun).Scan(&t.Pending, &t.Failed, &t.OverBudget, &t.Notes, &t.Messages, &t.ErrorClass); err != nil {
+				COALESCE(max(error_class) FILTER (WHERE status = 'failed' AND error_class IS DISTINCT FROM 'budget' AND error_class IS DISTINCT FROM 'rate_limited'),
+					max(error_class) FILTER (WHERE status = 'failed' AND error_class = 'rate_limited'), '')
+			FROM comm_batches WHERE user_id = $1 AND task_run_id = $2`, uid, taskRun).Scan(&t.Pending, &t.Failed, &t.RateLimited, &t.OverBudget, &t.Notes, &t.Messages, &t.ErrorClass); err != nil {
 			return err
 		}
 		rows, err := tx.Query(ctx, `SELECT truncated FROM comm_batches WHERE user_id = $1 AND task_run_id = $2 AND truncated IS NOT NULL`, uid, taskRun)
@@ -299,6 +357,23 @@ func (s *Service) SetTruncated(ctx context.Context, uid, batch uuid.UUID, trunca
 	b, _ := json.Marshal(truncated)
 	return s.as(ctx, uid, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `UPDATE comm_batches SET truncated = $3 WHERE user_id = $1 AND id = $2`, uid, batch, b)
+		return err
+	})
+}
+
+// CommitTickCursors ends a tick source by source (decision 56): a source
+// whose batches of the tick are all done moves its cursor; a source with a
+// failed batch (any class, the monthly limit too) keeps the old one, and the
+// next tick repeats it. The threads of the other sources are not read again.
+func (s *Service) CommitTickCursors(ctx context.Context, uid, taskRun uuid.UUID) error {
+	return s.as(ctx, uid, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `UPDATE comm_cursors c SET cursor = pending_cursor, pending_cursor = NULL, last_success_at = now()
+			WHERE c.user_id = $1 AND c.pending_cursor IS NOT NULL AND NOT EXISTS (
+				SELECT 1 FROM comm_batches b WHERE b.user_id = c.user_id AND b.task_run_id = $2
+				  AND b.item_id = c.item_id AND b.source = c.source AND b.status <> 'done')`, uid, taskRun); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `UPDATE comm_cursors SET pending_cursor = NULL WHERE user_id = $1 AND pending_cursor IS NOT NULL`, uid)
 		return err
 	})
 }
