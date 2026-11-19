@@ -402,7 +402,9 @@ func TestVKWorkSpaceCollect(t *testing.T) {
 	}
 	// TEAMS-16: the overlap brings the same messages again: nothing new
 	vk.mu.Lock()
-	vk.messages[team] = append(vk.messages[team], vkMsg(team, self, time.Now().UTC().Add(-time.Minute)))
+	sent := time.Now().UTC().Add(-time.Minute)
+	vk.messages[team] = append(vk.messages[team], vkMsg(team, self, sent))
+	vk.chats[0]["last_message_at"] = sent.Format(time.RFC3339) // the server moves the chat up with its new message
 	vk.mu.Unlock()
 	if status, summary, _ := tick(); status != "succeeded" || !strings.HasPrefix(summary, "messages:1 ") {
 		t.Fatalf("TEAMS-16: %s %q", status, summary)
