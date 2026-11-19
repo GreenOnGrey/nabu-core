@@ -98,16 +98,26 @@ func TestExecReportsMissing(t *testing.T) {
 // The commands of a sandbox get the environment of the profile image but
 // never the tokens of the sandbox (FTR.NAB.CMN-0008 tech §6).
 func TestSandboxEnv(t *testing.T) {
-	t.Setenv("NABU_SANDBOX_TOKEN", "secret")
+	// The value is unique on purpose: the environment of the runner is not ours, and a value of it (a branch
+	// name in GITHUB_HEAD_REF, for one) may carry any ordinary word — the test looks for this token only.
+	const token = "nabu-sandbox-token-4f8a"
+	t.Setenv("NABU_SANDBOX_TOKEN", token)
 	t.Setenv("MPLCONFIGDIR", "/tmp/mpl")
 	t.Setenv("ORACLE_HOME", "/opt/oracle")
-	env := strings.Join(SandboxEnv("/work"), "\n")
-	if strings.Contains(env, "secret") || strings.Contains(env, "NABU_") {
-		t.Fatal("a token leaked into the environment of commands")
+	env := SandboxEnv("/work")
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		if strings.HasPrefix(k, "NABU_") {
+			t.Fatalf("a variable of the sandbox leaked into the environment of commands: %s", k)
+		}
+		if strings.Contains(v, token) {
+			t.Fatalf("the token leaked into %s", k)
+		}
 	}
+	joined := strings.Join(env, "\n")
 	for _, want := range []string{"HOME=/work", "MPLCONFIGDIR=/tmp/mpl", "ORACLE_HOME=/opt/oracle", "PATH=" + os.Getenv("PATH")} {
-		if !strings.Contains(env, want) {
-			t.Fatalf("missing %s in %s", want, env)
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %s in %s", want, joined)
 		}
 	}
 }
