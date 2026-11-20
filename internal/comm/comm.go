@@ -47,9 +47,14 @@ const ConsentVersion = "1"
 // Settings are the instance settings of the memory of communications
 // (R21, R23, R27, R29; settings key "comm").
 type Settings struct {
-	Enabled         bool    `json:"enabled"`
-	RetentionDays   int     `json:"retentionDays"`
+	Enabled bool `json:"enabled"`
+	// RetentionMonths keeps the monthly records and the mail threads (FTR.NAB.MEM-0001 R16); RetentionDays is
+	// what the version before stored and what an older client still reads: months × 30.
+	RetentionMonths int     `json:"retentionMonths"`
+	RetentionDays   int     `json:"retentionDays,omitempty"`
 	Model           *Choice `json:"model"`
+	// CompactModel compacts the records; nil — the model of the collection (FTR.NAB.MEM-0001 R14).
+	CompactModel    *Choice `json:"compactModel"`
 	Embeddings      *Choice `json:"embeddings"`
 	MonthlyLimitUSD float64 `json:"monthlyLimitUsd"`
 	// RunTimeoutMinutes and BatchThreads override MEMORY_RUN_TIMEOUT and MEMORY_BATCH_THREADS from the
@@ -94,8 +99,23 @@ type Choice struct {
 	Model        string `json:"model"`
 }
 
-// DefaultRetentionDays is the default retention of notes (R23).
-const DefaultRetentionDays = 180
+// DefaultRetentionMonths is the default retention of monthly records and mail threads (FTR.NAB.MEM-0001 R16);
+// MaxRetentionMonths its bound.
+const (
+	DefaultRetentionMonths = 12
+	MaxRetentionMonths     = 60
+)
+
+// monthsOf turns days of retention into months, rounding up: 180 → 6 (FTR.NAB.MEM-0001 R16).
+func monthsOf(days int) int { return min(MaxRetentionMonths, max(1, (days+29)/30)) }
+
+// CompactChoice is the model that compacts records: its own, else the one of the collection.
+func (st Settings) CompactChoice() *Choice {
+	if st.CompactModel != nil {
+		return st.CompactModel
+	}
+	return st.Model
+}
 
 // Service is the store of the memory of communications.
 type Service struct {
@@ -130,7 +150,7 @@ func (s *Service) publish(ctx context.Context, typ string, uid uuid.UUID) {
 
 // LoadSettings reads the instance settings.
 func (s *Service) LoadSettings(ctx context.Context) (Settings, error) {
-	st := Settings{RetentionDays: DefaultRetentionDays}
+	st := Settings{RetentionMonths: DefaultRetentionMonths}
 	var raw []byte
 	err := s.Pool.QueryRow(ctx, `SELECT value FROM settings WHERE key = 'comm'`).Scan(&raw)
 	if postgres.IsNoRows(err) {
@@ -142,17 +162,24 @@ func (s *Service) LoadSettings(ctx context.Context) (Settings, error) {
 	if err := json.Unmarshal(raw, &st); err != nil {
 		return st, err
 	}
-	if st.RetentionDays <= 0 {
-		st.RetentionDays = DefaultRetentionDays
+	if st.RetentionMonths <= 0 {
+		st.RetentionMonths = DefaultRetentionMonths
+		if st.RetentionDays > 0 { // a value stored before the months
+			st.RetentionMonths = monthsOf(st.RetentionDays)
+		}
 	}
+	st.RetentionMonths = min(st.RetentionMonths, MaxRetentionMonths)
+	st.RetentionDays = st.RetentionMonths * 30
 	return st, nil
 }
 
 // SettingsPatch changes the instance settings; nil keeps a value.
 type SettingsPatch struct {
 	Enabled         *bool           `json:"enabled"`
-	RetentionDays   *int            `json:"retentionDays"`
+	RetentionMonths *int            `json:"retentionMonths"`
+	RetentionDays   *int            `json:"retentionDays"` // the field of the version before: turned into months
 	Model           json.RawMessage `json:"model"`
+	CompactModel    json.RawMessage `json:"compactModel"`
 	Embeddings      json.RawMessage `json:"embeddings"`
 	MonthlyLimitUSD *float64        `json:"monthlyLimitUsd"`
 	// RunTimeoutMinutes and BatchThreads: a number sets the value, null returns the one of the environment.
@@ -176,11 +203,18 @@ func (s *Service) SaveSettings(ctx context.Context, p SettingsPatch) (Settings, 
 		if p.Enabled != nil {
 			st.Enabled = *p.Enabled
 		}
-		if p.RetentionDays != nil {
+		if p.RetentionDays != nil && p.RetentionMonths == nil {
+			// a client of the version before sent days, up to 3650 then: they become months, at most 60
 			if *p.RetentionDays < 1 || *p.RetentionDays > 3650 {
 				return apperr.Unprocessable("invalid_retention", "retentionDays is between 1 and 3650").With("field", "retentionDays")
 			}
-			st.RetentionDays = *p.RetentionDays
+			st.RetentionMonths = monthsOf(*p.RetentionDays)
+		}
+		if p.RetentionMonths != nil {
+			if *p.RetentionMonths < 1 || *p.RetentionMonths > MaxRetentionMonths {
+				return apperr.Unprocessable("invalid_retention", fmt.Sprintf("retentionMonths is between 1 and %d", MaxRetentionMonths)).With("field", "retentionMonths")
+			}
+			st.RetentionMonths = *p.RetentionMonths
 		}
 		if p.MonthlyLimitUSD != nil {
 			if *p.MonthlyLimitUSD < 0 {
@@ -214,7 +248,7 @@ func (s *Service) SaveSettings(ctx context.Context, p SettingsPatch) (Settings, 
 		for _, f := range []struct {
 			raw json.RawMessage
 			dst **Choice
-		}{{p.Model, &st.Model}, {p.Embeddings, &st.Embeddings}} {
+		}{{p.Model, &st.Model}, {p.Embeddings, &st.Embeddings}, {p.CompactModel, &st.CompactModel}} {
 			if len(f.raw) == 0 {
 				continue
 			}
@@ -227,7 +261,9 @@ func (s *Service) SaveSettings(ctx context.Context, p SettingsPatch) (Settings, 
 			}
 			*f.dst = c
 		}
+		st.RetentionDays = 0 // stored as months only
 		b, _ := json.Marshal(st)
+		st.RetentionDays = st.RetentionMonths * 30
 		if _, err := tx.Exec(ctx, `INSERT INTO settings (key, value) VALUES ('comm', $1)
 			ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, b); err != nil {
 			return err
@@ -308,6 +344,10 @@ func (s *Service) DeleteAll(ctx context.Context, uid uuid.UUID, confirm string) 
 			`DELETE FROM comm_skipped WHERE user_id = $1`,
 			`DELETE FROM comm_cursors WHERE user_id = $1`,
 			`DELETE FROM comm_batches WHERE user_id = $1`,
+			// the graph by day and the tags taken off go with the records (FTR.NAB.MEM-0001)
+			`DELETE FROM comm_tag_days WHERE user_id = $1`,
+			`DELETE FROM comm_pair_days WHERE user_id = $1`,
+			`DELETE FROM comm_tag_removals WHERE user_id = $1`,
 			`UPDATE comm_settings SET consent_at = NULL, notes_count = 0, updated_at = now() WHERE user_id = $1`,
 		} {
 			if _, err := tx.Exec(ctx, q, uid); err != nil {

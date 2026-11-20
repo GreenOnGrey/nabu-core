@@ -49,8 +49,8 @@ type API struct {
 	Semantic func(ctx context.Context) bool
 	// OnDeleteAll switches the memory tasks of the user off (R24).
 	OnDeleteAll func(ctx context.Context, uid uuid.UUID)
-	// GraphMaxNodes is MEMORY_GRAPH_MAX_NODES.
-	GraphMaxNodes int
+	// Graph are MEMORY_GRAPH_MAX_NODES, MEMORY_GRAPH_NODE_EDGES and MEMORY_GRAPH_MAX_EDGES.
+	Graph GraphLimits
 	// CallSource calls a tool of a source with the personal access of the
 	// user: the muted groups of VK Teams (FTR.NAB.ADM-0001 tech §3.2).
 	CallSource func(ctx context.Context, uid, item uuid.UUID, tool string, args json.RawMessage) (string, error)
@@ -154,7 +154,8 @@ func (a *API) Routes(r chi.Router) {
 		if err != nil {
 			return err
 		}
-		out := map[string]any{"allowed": st.Enabled, "available": st.Enabled, "retentionDays": st.RetentionDays, "semantic": false,
+		out := map[string]any{"allowed": st.Enabled, "available": st.Enabled, "retentionMonths": st.RetentionMonths, "retentionDays": st.RetentionDays, "semantic": false,
+			"compact": map[string]any{"lastAt": nil},
 			"sources": []SourceState{}, "collect": CollectState{Status: "off"}, "consentAt": nil, "counts": map[string]int{"notes": 0, "openCommitments": 0}}
 		us, err := a.Store.State(ctx, p.UserID)
 		if err != nil {
@@ -169,6 +170,12 @@ func (a *API) Routes(r chi.Router) {
 		}
 		out["consentAt"] = us.ConsentAt
 		out["counts"] = map[string]int{"notes": us.Notes, "openCommitments": us.OpenCommitments}
+		// FTR.NAB.MEM-0001 R17: «Last compaction» in the block «Collected»
+		if at, err := a.Store.LastCompaction(ctx, p.UserID); err != nil {
+			return err
+		} else if at != nil {
+			out["compact"] = map[string]any{"lastAt": at}
+		}
 		if !st.Enabled {
 			httpx.JSON(w, 200, out)
 			return nil
@@ -336,7 +343,7 @@ func (a *API) Routes(r chi.Router) {
 				return apperr.BadRequest("invalid_min_links", "minLinks is a non-negative integer")
 			}
 		}
-		g, err := a.Store.Graph(r.Context(), uid, f, min, a.GraphMaxNodes)
+		g, err := a.Store.Graph(r.Context(), uid, f, min, a.Graph)
 		if err != nil {
 			return err
 		}
@@ -345,7 +352,19 @@ func (a *API) Routes(r chi.Router) {
 	}))
 	tags := func(kind string) http.HandlerFunc {
 		return a.user(func(w http.ResponseWriter, r *http.Request, uid uuid.UUID) error {
-			l, err := a.Store.Tags(r.Context(), uid, kind, r.URL.Query().Get("q"), 0)
+			// FTR.NAB.MEM-0001 R22: the field of suggestions asks for a few by a part of the name; a chip opened by a
+			// link asks for one by id
+			limit := 0
+			if v := r.URL.Query().Get("limit"); v != "" {
+				if err := json.Unmarshal([]byte(v), &limit); err != nil || limit < 1 || limit > 50 {
+					return apperr.BadRequest("invalid_limit", "limit is between 1 and 50")
+				}
+			}
+			id, err := queryUUID(r, "id")
+			if err != nil {
+				return err
+			}
+			l, err := a.Store.Tags(r.Context(), uid, kind, r.URL.Query().Get("q"), limit, id)
 			if err != nil {
 				return err
 			}

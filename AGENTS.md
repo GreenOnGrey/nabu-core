@@ -98,9 +98,9 @@ at the pinned version. Name any job you could not run in your report, with the r
   except its comments. Every migration has a `Down`. Update the expected version in the itest.
 - **The tables of the memory of communications that have row policies** (`comm_notes`, `comm_note_messages`,
   `comm_note_tags`, `comm_note_vectors`, `comm_people`, `comm_topics`, `commitments`, `comm_tombstones`,
-  `comm_skipped`, `comm_cursors`, `comm_batches`) **are read and written only inside `postgres.AsUser`**
-  (FTR.NAB.CMN-0003 R22): a plain query sees no rows. `comm_settings` and `comm_usage` hold no content and have no
-  policy. `postgres.AsMaintenance` is for background work only, never for a handler of HTTP or of an MCP tool;
+  `comm_skipped`, `comm_cursors`, `comm_batches`, `comm_note_days`, `comm_tag_days`, `comm_pair_days`, `comm_tag_removals`) **are read and written only inside `postgres.AsUser`**
+  (FTR.NAB.CMN-0003 R22): a plain query sees no rows. `comm_settings`, `comm_usage` and the usage by day (`comm_usage_days`, `comm_usage_source_days`, `comm_level_days`,
+  `comm_compact_state`) hold no content and have no policy. `postgres.AsMaintenance` is for background work only, never for a handler of HTTP or of an MCP tool;
   its callers are listed in `TestMaintenanceCallers`. Integration tests of these tables use a role that is not a superuser (`appPool`).
 - **Do not run generic formatters over SQL, YAML or shell.** Go: `gofmt` only.
 - Every error returned to clients has a stable code (`apperr`); a new code needs a translation in

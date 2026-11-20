@@ -71,9 +71,11 @@ type Config struct {
 
 // Engine runs agents.
 type Engine struct {
-	Cfg  Config
-	Pool *pgxpool.Pool
-	Op   Operator
+	// levelsAt is when MemoryHousekeeping last wrote the snapshot of the records by level (FTR.NAB.MEM-0001 R26).
+	levelsAt time.Time
+	Cfg      Config
+	Pool     *pgxpool.Pool
+	Op       Operator
 	// Pods gives the pod of an owner for a turn of a conversation or a task
 	// (FTR.NAB.CMN-0004); nil runs everything in Op.
 	Pods    *agentpods.Manager

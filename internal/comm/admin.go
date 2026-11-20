@@ -120,59 +120,35 @@ func (s *Service) AdminRoutes(r chi.Router) {
 		return nil
 	}))
 	r.Get("/comm/usage", httpx.Handler(func(w http.ResponseWriter, r *http.Request) error {
-		ctx := r.Context()
-		month := time.Now().UTC()
-		if v := r.URL.Query().Get("month"); v != "" {
-			m, err := time.Parse("2006-01", v)
-			if err != nil {
-				return apperr.BadRequest("invalid_month", "month is YYYY-MM")
-			}
-			month = m
-		}
-		first := time.Date(month.Year(), month.Month(), 1, 0, 0, 0, 0, time.UTC)
-		st, err := s.LoadSettings(ctx)
+		first, err := usageMonth(r)
 		if err != nil {
 			return err
 		}
-		out := map[string]any{"month": first.Format("2006-01"), "monthlyLimitUsd": st.MonthlyLimitUSD}
-		var enabled, notes int
-		var cost float64
-		if err := s.Pool.QueryRow(ctx, `SELECT
-				(SELECT count(*) FROM scheduled_tasks WHERE kind = 'memory_collect' AND status IN ('active','paused')),
-				(SELECT COALESCE(sum(notes_count), 0) FROM comm_settings),
-				(SELECT COALESCE(sum(cost_usd), 0)::float8 FROM comm_usage WHERE month = $1)`, first).Scan(&enabled, &notes, &cost); err != nil {
-			return err
-		}
-		out["enabledUsers"], out["notes"], out["costUsd"] = enabled, notes, cost
-		rows, err := s.Pool.Query(ctx, `SELECT u.id, u.email, cs.notes_count, COALESCE(cu.runs, 0), COALESCE(cu.cost_usd, 0)::float8
-			FROM comm_settings cs JOIN users u ON u.id = cs.user_id
-			LEFT JOIN comm_usage cu ON cu.user_id = cs.user_id AND cu.month = $1
-			WHERE cs.notes_count > 0 OR cu.runs > 0 ORDER BY 5 DESC, 3 DESC, u.email LIMIT 500`, first)
+		out, err := s.Usage(r.Context(), first, r.URL.Query().Get("broken") == "true")
 		if err != nil {
 			return err
 		}
-		defer rows.Close()
-		type row struct {
-			UserID       uuid.UUID `json:"userId"`
-			Email        string    `json:"email"`
-			Notes        int       `json:"notes"`
-			Runs         int       `json:"runs"`
-			CostUSD      float64   `json:"costUsd"`
-			LimitUsedPct int       `json:"limitUsedPct"`
-		}
-		items := []row{}
-		for rows.Next() {
-			var x row
-			if err := rows.Scan(&x.UserID, &x.Email, &x.Notes, &x.Runs, &x.CostUSD); err != nil {
-				return err
-			}
-			if st.MonthlyLimitUSD > 0 {
-				x.LimitUsedPct = int(x.CostUSD / st.MonthlyLimitUSD * 100)
-			}
-			items = append(items, x)
-		}
-		out["items"] = items
 		httpx.JSON(w, 200, out)
-		return rows.Err()
+		return nil
+	}))
+	r.Get("/comm/usage/daily", httpx.Handler(func(w http.ResponseWriter, r *http.Request) error {
+		first, err := usageMonth(r)
+		if err != nil {
+			return err
+		}
+		var user *uuid.UUID
+		if v := r.URL.Query().Get("user"); v != "" {
+			id, err := uuid.Parse(v)
+			if err != nil {
+				return apperr.BadRequest("invalid_user", "user is a UUID")
+			}
+			user = &id
+		}
+		days, err := s.UsageDaily(r.Context(), first, user)
+		if err != nil {
+			return err
+		}
+		httpx.JSON(w, 200, map[string]any{"days": days})
+		return nil
 	}))
 }

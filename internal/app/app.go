@@ -1101,7 +1101,7 @@ func (c *core) userToday(ctx context.Context, uid uuid.UUID) time.Time {
 
 // commAPI is the API of the memory of communications (FTR.NAB.CMN-0003 tech §3).
 func (c *core) commAPI(cfg *config.Config) *comm.API {
-	return &comm.API{Store: c.comm, Sources: c.commSources, Timezone: c.userLocation, GraphMaxNodes: cfg.MemoryGraphMaxNodes, Semantic: c.comm.Semantic,
+	return &comm.API{Store: c.comm, Sources: c.commSources, Timezone: c.userLocation, Graph: comm.GraphLimits{MaxNodes: cfg.MemoryGraphMaxNodes, NodeEdges: cfg.MemoryGraphNodeEdges, MaxEdges: cfg.MemoryGraphMaxEdges}, Semantic: c.comm.Semantic,
 		CallSource: func(ctx context.Context, uid, item uuid.UUID, tool string, args json.RawMessage) (string, error) {
 			text, err := c.catalog.CallSource(ctx, uid, item, tool, args)
 			if errors.Is(err, catalog.ErrSourceAccess) {

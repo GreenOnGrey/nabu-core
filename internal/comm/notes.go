@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/GreenOnGrey/nabu-core/internal/apperr"
+	"github.com/GreenOnGrey/nabu-core/internal/collect"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/events"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/httpx"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/metrics"
@@ -24,7 +25,10 @@ type Tag struct {
 	Kind  string    `json:"kind"`
 	Label string    `json:"label"`
 	Email string    `json:"email,omitempty"`
-	Notes int       `json:"notes,omitempty"`
+	// Days are the days of communication with the person or on the topic (FTR.NAB.MEM-0001 R20); Notes repeats
+	// them for the clients of the version before and goes in the next one.
+	Days  int `json:"days,omitempty"`
+	Notes int `json:"notes,omitempty"`
 }
 
 // Appended is what the collector added to a note the user had edited (R10).
@@ -40,6 +44,8 @@ type Message struct {
 	SentAt *time.Time `json:"sentAt"`
 	Title  string     `json:"title"`
 	URL    string     `json:"url"`
+	// Key: the message is one of the key ones of a compacted record (FTR.NAB.MEM-0001 R6).
+	Key bool `json:"key"`
 }
 
 // Note is a note of a mail thread or of a chat for a day (R6).
@@ -57,6 +63,17 @@ type Note struct {
 	Topics          []Tag     `json:"topics"`
 	OpenCommitments int       `json:"openCommitments"`
 	UserEdited      bool      `json:"userEdited"`
+	// Level and period of the record, its days of communication, the link to its thread or chat or else to its
+	// last message (FTR.NAB.MEM-0001 R1, R17, R23).
+	Level         string     `json:"level"`
+	PeriodFrom    string     `json:"periodFrom"`
+	PeriodTo      string     `json:"periodTo"`
+	Days          int        `json:"days"`
+	SourceURL     string     `json:"sourceUrl"`
+	CompactedFrom *int       `json:"compactedFrom"`
+	CompactedAt   *time.Time `json:"compactedAt"`
+	threadKey     string
+	lastURL       string
 	// The fields of the full note (GET /comm/notes/{id}).
 	Summary     *string      `json:"summary,omitempty"`
 	Appended    []Appended   `json:"appended,omitempty"`
@@ -92,25 +109,62 @@ func (f Filter) where(args *[]any) string {
 	if f.Source != "" {
 		add(`n.source = ?`, f.Source)
 	}
+	// the period of a record that overlaps the filter (FTR.NAB.MEM-0001 R18): a month is found by a week inside it;
+	// the dates of the periods are in the time zone of the user, so are the bounds
 	if f.From != nil {
-		add(`n.last_at >= ?`, *f.From)
+		add(`n.period_to >= `+localDay("?::timestamptz"), *f.From)
 	}
 	if f.To != nil {
-		add(`n.last_at < ?`, *f.To)
+		add(`n.period_from <= `+localDay("(?::timestamptz - interval '1 microsecond')"), *f.To)
 	}
 	return b.String()
 }
 
 const noteCols = `n.id, n.title, left(n.summary, 240), n.source, n.item_id, n.first_at, n.last_at, n.time_precision, n.message_count, n.user_edited,
-	(SELECT count(*) FROM commitments c WHERE c.user_id = n.user_id AND c.note_id = n.id AND c.state = 'open')`
+	(SELECT count(*) FROM commitments c WHERE c.user_id = n.user_id AND c.note_id = n.id AND c.state = 'open'),
+	n.level, COALESCE(to_char(n.period_from, 'YYYY-MM-DD'), ''), COALESCE(to_char(n.period_to, 'YYYY-MM-DD'), ''), n.days,
+	n.compacted_from, n.compacted_at, n.thread_key,
+	COALESCE((SELECT m.url FROM comm_note_messages m WHERE m.user_id = n.user_id AND m.note_id = n.id AND m.url IS NOT NULL
+		ORDER BY m.sent_at DESC NULLS LAST LIMIT 1), '')`
 
 func scanNote(row pgx.Row) (*Note, error) {
 	var n Note
-	if err := row.Scan(&n.ID, &n.Title, &n.Excerpt, &n.Source, &n.ItemID, &n.FirstAt, &n.LastAt, &n.TimePrecision, &n.MessageCount, &n.UserEdited, &n.OpenCommitments); err != nil {
+	if err := row.Scan(&n.ID, &n.Title, &n.Excerpt, &n.Source, &n.ItemID, &n.FirstAt, &n.LastAt, &n.TimePrecision, &n.MessageCount, &n.UserEdited, &n.OpenCommitments,
+		&n.Level, &n.PeriodFrom, &n.PeriodTo, &n.Days, &n.CompactedFrom, &n.CompactedAt, &n.threadKey, &n.lastURL); err != nil {
 		return nil, err
 	}
 	n.People, n.Topics = []Tag{}, []Tag{}
+	n.SourceURL = n.lastURL
 	return &n, nil
+}
+
+// linkNotes is linkThreads over a list.
+func (s *Service) linkNotes(ctx context.Context, notes []Note) {
+	ptrs := make([]*Note, len(notes))
+	for i := range notes {
+		ptrs[i] = &notes[i]
+	}
+	s.linkThreads(ctx, ptrs)
+}
+
+// linkThreads gives the records the link to their thread or chat when the adapter of the source has one
+// (FTR.NAB.MEM-0001 R23); the others keep the link to their last message. It reads the catalog, so it runs after
+// the transaction of the user, not inside it.
+func (s *Service) linkThreads(ctx context.Context, notes []*Note) {
+	ads := map[uuid.UUID]collect.Adapter{}
+	for _, n := range notes {
+		ad, ok := ads[n.ItemID]
+		if !ok {
+			ad, _ = s.AdapterOf(ctx, n.ItemID)
+			ads[n.ItemID] = ad
+		}
+		if ad == nil {
+			continue
+		}
+		if link := ad.Link(n.Source, collect.Thread{Key: n.threadKey, DayKey: ""}, ""); link != "" {
+			n.SourceURL = link
+		}
+	}
 }
 
 // loadTags fills the people and the topics of notes.
@@ -190,6 +244,7 @@ func (s *Service) List(ctx context.Context, uid uuid.UUID, f Filter, page httpx.
 	if err != nil {
 		return httpx.List[Note]{}, err
 	}
+	s.linkNotes(ctx, out)
 	return httpx.NewList(out, page.Limit, func(n Note) (time.Time, string) { return n.LastAt, n.ID.String() }), nil
 }
 
@@ -280,6 +335,9 @@ func (s *Service) Search(ctx context.Context, uid uuid.UUID, f Filter, limit int
 		}
 		return nil
 	})
+	if err == nil {
+		s.linkNotes(ctx, out)
+	}
 	return out, err
 }
 
@@ -291,6 +349,9 @@ func (s *Service) Get(ctx context.Context, uid, id uuid.UUID) (*Note, error) {
 		n, err = getNote(ctx, tx, uid, id)
 		return err
 	})
+	if n != nil {
+		s.linkThreads(ctx, []*Note{n})
+	}
 	return n, err
 }
 
@@ -312,15 +373,16 @@ func getNote(ctx context.Context, tx pgx.Tx, uid, id uuid.UUID) (*Note, error) {
 	if err := loadTags(ctx, tx, uid, []*Note{n}); err != nil {
 		return nil, err
 	}
-	rows, err := tx.Query(ctx, `SELECT message_id, COALESCE(author,''), sent_at, COALESCE(title,''), COALESCE(url,'') FROM comm_note_messages
-		WHERE user_id = $1 AND note_id = $2 ORDER BY sent_at NULLS LAST, message_id`, uid, id)
+	// the key messages of a compacted record first, then the rest by time (FTR.NAB.MEM-0001 R6)
+	rows, err := tx.Query(ctx, `SELECT message_id, COALESCE(author,''), sent_at, COALESCE(title,''), COALESCE(url,''), key FROM comm_note_messages
+		WHERE user_id = $1 AND note_id = $2 ORDER BY key DESC, sent_at NULLS LAST, message_id`, uid, id)
 	if err != nil {
 		return nil, err
 	}
 	n.Messages = []Message{}
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.ID, &m.Author, &m.SentAt, &m.Title, &m.URL); err != nil {
+		if err := rows.Scan(&m.ID, &m.Author, &m.SentAt, &m.Title, &m.URL, &m.Key); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -406,8 +468,9 @@ func (s *Service) SaveNote(ctx context.Context, uid uuid.UUID, in SaveNote) (*Sa
 		switch {
 		case postgres.IsNoRows(err):
 			res.Created = true
-			if err := tx.QueryRow(ctx, `INSERT INTO comm_notes (user_id, item_id, source, thread_key, day_key, title, summary, first_at, last_at, time_precision)
-				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+			// a mail thread is one record of the level thread, a chat a record of a day (FTR.NAB.MEM-0001 R1)
+			if err := tx.QueryRow(ctx, `INSERT INTO comm_notes (user_id, item_id, source, thread_key, day_key, title, summary, first_at, last_at, time_precision, level, chars_in)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, CASE WHEN $5 = '' THEN 'thread' ELSE 'day' END, char_length($7)) RETURNING id`,
 				uid, in.ItemID, in.Source, in.ThreadKey, in.DayKey, in.Title, in.Summary, first, last, in.TimePrecision).Scan(&res.ID); err != nil {
 				return err
 			}
@@ -484,7 +547,7 @@ func (s *Service) SaveNote(ctx context.Context, uid uuid.UUID, in SaveNote) (*Sa
 				return err
 			}
 		}
-		return nil
+		return refreshNotes(ctx, tx, uid, res.ID)
 	})
 	if err != nil {
 		return nil, err
@@ -606,6 +669,11 @@ func (s *Service) Update(ctx context.Context, uid, id uuid.UUID, p NotePatch) (*
 			if _, err := tx.Exec(ctx, `DELETE FROM comm_note_tags WHERE user_id = $1 AND note_id = $2 AND kind = $3 AND tag_id = $4`, uid, id, r.Kind, *r.ID); err != nil {
 				return err
 			}
+			// a tag taken off a conversation stays off when its records are compacted (FTR.NAB.MEM-0001 R10)
+			if _, err := tx.Exec(ctx, `INSERT INTO comm_tag_removals (user_id, item_id, source, thread_key, kind, tag_id)
+				SELECT user_id, item_id, source, thread_key, $3, $4 FROM comm_notes WHERE user_id = $1 AND id = $2 ON CONFLICT DO NOTHING`, uid, id, r.Kind, *r.ID); err != nil {
+				return err
+			}
 		}
 		for _, a := range p.AddTags {
 			tag, err := resolveTag(ctx, tx, uid, a)
@@ -615,8 +683,16 @@ func (s *Service) Update(ctx context.Context, uid, id uuid.UUID, p NotePatch) (*
 			if err := tagNote(ctx, tx, uid, id, a.Kind, tag); err != nil {
 				return err
 			}
+			if _, err := tx.Exec(ctx, `DELETE FROM comm_tag_removals r USING comm_notes n WHERE n.user_id = $1 AND n.id = $2
+				AND r.user_id = n.user_id AND r.item_id = n.item_id AND r.source = n.source AND r.thread_key = n.thread_key AND r.kind = $3 AND r.tag_id = $4`,
+				uid, id, a.Kind, tag); err != nil {
+				return err
+			}
 		}
 		if len(p.AddTags)+len(p.RemoveTags) > 0 {
+			if err := refreshNotes(ctx, tx, uid, id); err != nil {
+				return err
+			}
 			// tags changed by hand stay: the collector only adds to this note
 			if _, err := tx.Exec(ctx, `UPDATE comm_notes SET user_edited = true, updated_at = now() WHERE user_id = $1 AND id = $2`, uid, id); err != nil {
 				return err
@@ -627,6 +703,7 @@ func (s *Service) Update(ctx context.Context, uid, id uuid.UUID, p NotePatch) (*
 		return err
 	})
 	if err == nil {
+		s.linkThreads(ctx, []*Note{n})
 		s.publish(ctx, events.CommChanged, uid)
 	}
 	return n, err
@@ -674,12 +751,19 @@ func resolveTag(ctx context.Context, tx pgx.Tx, uid uuid.UUID, r TagRef) (uuid.U
 // collected again (R10).
 func deleteNotes(ctx context.Context, tx pgx.Tx, uid uuid.UUID, cond string, args ...any) (int, error) {
 	all := append([]any{uid}, args...)
+	days, err := daysOf(ctx, tx, uid, cond, args...)
+	if err != nil {
+		return 0, err
+	}
 	if _, err := tx.Exec(ctx, `INSERT INTO comm_tombstones (user_id, item_id, source, thread_key, day_key)
 		SELECT n.user_id, n.item_id, n.source, n.thread_key, n.day_key FROM comm_notes n WHERE n.user_id = $1 AND `+cond+` ON CONFLICT DO NOTHING`, all...); err != nil {
 		return 0, err
 	}
 	tag, err := tx.Exec(ctx, `DELETE FROM comm_notes n WHERE n.user_id = $1 AND `+cond, all...)
 	if err != nil {
+		return 0, err
+	}
+	if err := refreshDays(ctx, tx, uid, days); err != nil {
 		return 0, err
 	}
 	n := int(tag.RowsAffected())
@@ -728,32 +812,34 @@ func (s *Service) DeleteByTag(ctx context.Context, uid uuid.UUID, kind string, t
 
 // ─── people and topics (R8, R9) ─────────────────────────────────────
 
-// Tags lists the people or the topics of the user with the number of notes,
-// the most used first; q narrows by name.
-func (s *Service) Tags(ctx context.Context, uid uuid.UUID, kind, q string, limit int) ([]Tag, error) {
+// Tags lists the people or the topics of the user with their days of communication, the most used first
+// (FTR.NAB.MEM-0001 R20, R22); q narrows by a part of the name or the email, regardless of case and «ё»; id gives one
+// tag.
+func (s *Service) Tags(ctx context.Context, uid uuid.UUID, kind, q string, limit int, id *uuid.UUID) ([]Tag, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 200
 	}
 	out := []Tag{}
 	err := s.as(ctx, uid, func(tx pgx.Tx) error {
-		sql := `SELECT p.id, COALESCE(NULLIF(p.name,''), p.email), p.email,
-				(SELECT count(*) FROM comm_note_tags t WHERE t.user_id = p.user_id AND t.kind = 'person' AND t.tag_id = p.id)
-			FROM comm_people p WHERE p.user_id = $1 AND ($2 = '' OR ` + postgres.Fold("p.email") + ` ILIKE '%' || $2 || '%' OR ` + postgres.Fold("p.name") + ` ILIKE '%' || $2 || '%')`
+		days := `(SELECT count(DISTINCT d.day) FROM comm_tag_days d WHERE d.user_id = p.user_id AND d.kind = '` + kind + `' AND d.tag_id = p.id)`
+		sql := `SELECT p.id, COALESCE(NULLIF(p.name,''), p.email), p.email, ` + days + `
+			FROM comm_people p WHERE p.user_id = $1 AND ($2 = '' OR ` + foldE("p.email") + ` LIKE '%' || ` + foldE("$2") + ` || '%' OR ` + foldE("p.name") + ` LIKE '%' || ` + foldE("$2") + ` || '%')`
 		if kind == KindTopic {
-			sql = `SELECT p.id, p.name, '',
-				(SELECT count(*) FROM comm_note_tags t WHERE t.user_id = p.user_id AND t.kind = 'topic' AND t.tag_id = p.id)
-			FROM comm_topics p WHERE p.user_id = $1 AND ($2 = '' OR ` + postgres.Fold("p.name") + ` ILIKE '%' || $2 || '%')`
+			sql = `SELECT p.id, p.name, '', ` + days + `
+			FROM comm_topics p WHERE p.user_id = $1 AND ($2 = '' OR ` + foldE("p.name") + ` LIKE '%' || ` + foldE("$2") + ` || '%')`
 		}
-		rows, err := tx.Query(ctx, sql+` ORDER BY 4 DESC, 2 LIMIT $3`, uid, strings.TrimSpace(q), limit)
+		sql += ` AND ($4::uuid IS NULL OR p.id = $4)`
+		rows, err := tx.Query(ctx, sql+` ORDER BY 4 DESC, 2 LIMIT $3`, uid, strings.TrimSpace(q), limit, id)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
 		for rows.Next() {
 			t := Tag{Kind: kind}
-			if err := rows.Scan(&t.ID, &t.Label, &t.Email, &t.Notes); err != nil {
+			if err := rows.Scan(&t.ID, &t.Label, &t.Email, &t.Days); err != nil {
 				return err
 			}
+			t.Notes = t.Days
 			out = append(out, t)
 		}
 		return rows.Err()
@@ -803,6 +889,10 @@ func (s *Service) MergeTopic(ctx context.Context, uid, id, into uuid.UUID) error
 		if n != 2 {
 			return apperr.NotFound("not_found", "topic not found")
 		}
+		ids, err := notesWithTag(ctx, tx, uid, KindTopic, id)
+		if err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `INSERT INTO comm_note_tags (user_id, note_id, kind, tag_id)
 			SELECT user_id, note_id, kind, $3 FROM comm_note_tags WHERE user_id = $1 AND kind = 'topic' AND tag_id = $2 ON CONFLICT DO NOTHING`, uid, id, into); err != nil {
 			return err
@@ -810,8 +900,10 @@ func (s *Service) MergeTopic(ctx context.Context, uid, id, into uuid.UUID) error
 		if _, err := tx.Exec(ctx, `DELETE FROM comm_note_tags WHERE user_id = $1 AND kind = 'topic' AND tag_id = $2`, uid, id); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `DELETE FROM comm_topics WHERE user_id = $1 AND id = $2`, uid, id)
-		return err
+		if _, err := tx.Exec(ctx, `DELETE FROM comm_topics WHERE user_id = $1 AND id = $2`, uid, id); err != nil {
+			return err
+		}
+		return refreshNotes(ctx, tx, uid, ids...)
 	})
 	if err == nil {
 		s.publish(ctx, events.CommChanged, uid)
@@ -822,6 +914,10 @@ func (s *Service) MergeTopic(ctx context.Context, uid, id, into uuid.UUID) error
 // DeleteTopic deletes a topic; its notes stay without it (R9).
 func (s *Service) DeleteTopic(ctx context.Context, uid, id uuid.UUID) error {
 	err := s.as(ctx, uid, func(tx pgx.Tx) error {
+		ids, err := notesWithTag(ctx, tx, uid, KindTopic, id)
+		if err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `DELETE FROM comm_note_tags WHERE user_id = $1 AND kind = 'topic' AND tag_id = $2`, uid, id); err != nil {
 			return err
 		}
@@ -829,7 +925,10 @@ func (s *Service) DeleteTopic(ctx context.Context, uid, id uuid.UUID) error {
 		if err == nil && tag.RowsAffected() == 0 {
 			return apperr.NotFound("not_found", "topic not found")
 		}
-		return err
+		if err != nil {
+			return err
+		}
+		return refreshNotes(ctx, tx, uid, ids...)
 	})
 	if err == nil {
 		s.publish(ctx, events.CommChanged, uid)
@@ -839,79 +938,151 @@ func (s *Service) DeleteTopic(ctx context.Context, uid, id uuid.UUID) error {
 
 // ─── graph (R19, tech §9) ───────────────────────────────────────────
 
-// Node is a person or a topic of the graph.
+// Node is a person or a topic of the graph; Days — the days of communication (FTR.NAB.MEM-0001 R20), Notes
+// repeats them for the clients of the version before.
 type Node struct {
 	ID    uuid.UUID `json:"id"`
 	Kind  string    `json:"kind"`
 	Label string    `json:"label"`
+	Days  int       `json:"days"`
 	Notes int       `json:"notes"`
 	Links int       `json:"links"`
 }
 
-// Edge joins two tags that meet in notes.
+// Edge links two tags that meet in a record; Days — the days they meet on.
 type Edge struct {
 	A     uuid.UUID `json:"a"`
 	B     uuid.UUID `json:"b"`
+	Days  int       `json:"days"`
 	Notes int       `json:"notes"`
 }
 
-// Graph is the graph of the filtered notes.
+// Graph is the graph of the filtered records.
 type Graph struct {
 	Nodes      []Node `json:"nodes"`
 	Edges      []Edge `json:"edges"`
 	TotalNodes int    `json:"totalNodes"`
+	TotalEdges int    `json:"totalEdges"`
 }
 
-// Graph builds the graph of people and topics over the filtered notes: a node
-// per tag, an edge per pair of tags that meet in a note. Nodes with fewer
-// than minLinks links are left out, of the rest the maxNodes most linked stay.
-func (s *Service) Graph(ctx context.Context, uid uuid.UUID, f Filter, minLinks, maxNodes int) (*Graph, error) {
+// GraphLimits are MEMORY_GRAPH_MAX_NODES, MEMORY_GRAPH_NODE_EDGES and MEMORY_GRAPH_MAX_EDGES.
+type GraphLimits struct {
+	MaxNodes, NodeEdges, MaxEdges int
+}
+
+// Graph builds the graph of people and topics over the filtered records (FTR.NAB.CMN-0003 R19, FTR.NAB.MEM-0001
+// R20, R24): a node per tag, an edge per pair of tags that meet in a record; the measure is the days of
+// communication. Without a filter by person, topic or text the graph is read from the aggregate by day (arch A6);
+// with one it is counted over the records. Nodes with fewer than minLinks links are left out, of the rest the
+// MaxNodes most linked stay, and of their links the strongest NodeEdges of each node, MaxEdges in all.
+func (s *Service) Graph(ctx context.Context, uid uuid.UUID, f Filter, minLinks int, lim GraphLimits) (*Graph, error) {
+	path := "live"
+	if f.Person == nil && f.Topic == nil && strings.TrimSpace(f.Query) == "" {
+		path = "aggregate"
+	}
 	defer observe("graph")()
-	if maxNodes <= 0 {
-		maxNodes = 150
+	if lim.MaxNodes <= 0 {
+		lim.MaxNodes = 150
 	}
 	type pair struct{ a, b uuid.UUID }
 	nodes := map[uuid.UUID]*Node{}
 	edges := map[pair]int{}
 	err := s.as(ctx, uid, func(tx pgx.Tx) error {
 		args := []any{uid}
-		cond := f.where(&args)
-		const scope = `SELECT t.kind, t.tag_id, t.note_id FROM comm_note_tags t JOIN comm_notes n ON n.user_id = t.user_id AND n.id = t.note_id
-			WHERE t.user_id = $1`
-		rows, err := tx.Query(ctx, `WITH t AS (`+scope+cond+`)
-			SELECT t.kind, t.tag_id, COALESCE(NULLIF(p.name,''), p.email, tp.name, ''), count(*)
-			FROM t LEFT JOIN comm_people p ON t.kind = 'person' AND p.id = t.tag_id
-			       LEFT JOIN comm_topics tp ON t.kind = 'topic' AND tp.id = t.tag_id
-			GROUP BY 1, 2, 3`, args...)
+		var tagSQL, pairSQL string
+		if path == "aggregate" {
+			cond := ""
+			add := func(c string, v any) {
+				args = append(args, v)
+				cond += fmt.Sprintf(" AND "+c, len(args))
+			}
+			if f.Source != "" {
+				add("d.source = $%d", f.Source)
+			}
+			if f.From != nil {
+				add("d.day >= "+localDay("$%d::timestamptz"), *f.From)
+			}
+			if f.To != nil {
+				add("d.day <= "+localDay("($%d::timestamptz - interval '1 microsecond')"), *f.To)
+			}
+			tagSQL = `SELECT d.kind, d.tag_id, count(DISTINCT d.day) FROM comm_tag_days d WHERE d.user_id = $1` + cond + ` GROUP BY 1, 2`
+			pairSQL = `SELECT d.a, d.b, count(DISTINCT d.day) FROM comm_pair_days d WHERE d.user_id = $1` + cond + ` GROUP BY 1, 2`
+		} else {
+			cond := f.where(&args)
+			if q := strings.TrimSpace(f.Query); q != "" {
+				args = append(args, q)
+				cond += fmt.Sprintf(` AND (n.search_vector @@ plainto_tsquery('simple', $%[1]d) OR `+postgres.Fold("n.title")+` ILIKE '%%' || `+postgres.Fold(fmt.Sprintf("$%d", len(args)))+` || '%%' OR `+postgres.Fold("n.summary")+` ILIKE '%%' || `+postgres.Fold(fmt.Sprintf("$%d", len(args)))+` || '%%')`, len(args))
+			}
+			// the days of the records inside the period only, as the aggregate counts them
+			days := ""
+			if f.From != nil {
+				args = append(args, *f.From)
+				days += fmt.Sprintf(" AND day >= "+localDay("$%d::timestamptz"), len(args))
+			}
+			if f.To != nil {
+				args = append(args, *f.To)
+				days += fmt.Sprintf(" AND day <= "+localDay("($%d::timestamptz - interval '1 microsecond')"), len(args))
+			}
+			scope := `WITH t AS (SELECT t.kind, t.tag_id, t.note_id FROM comm_note_tags t JOIN comm_notes n ON n.user_id = t.user_id AND n.id = t.note_id
+				WHERE t.user_id = $1` + cond + `), d AS (SELECT note_id, day FROM comm_note_days WHERE user_id = $1 AND note_id IN (SELECT note_id FROM t)` + days + `) `
+			tagSQL = scope + `SELECT t.kind, t.tag_id, count(DISTINCT d.day) FROM t JOIN d USING (note_id) GROUP BY 1, 2`
+			pairSQL = scope + `SELECT a.tag_id, b.tag_id, count(DISTINCT d.day) FROM t a JOIN t b ON a.note_id = b.note_id AND (a.kind, a.tag_id) < (b.kind, b.tag_id)
+				JOIN d ON d.note_id = a.note_id GROUP BY 1, 2`
+		}
+		rows, err := tx.Query(ctx, tagSQL, args...)
 		if err != nil {
 			return err
 		}
 		for rows.Next() {
 			var n Node
-			if err := rows.Scan(&n.Kind, &n.ID, &n.Label, &n.Notes); err != nil {
+			if err := rows.Scan(&n.Kind, &n.ID, &n.Days); err != nil {
 				rows.Close()
 				return err
 			}
+			n.Notes = n.Days
 			nodes[n.ID] = &n
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
 			return err
 		}
-		rows, err = tx.Query(ctx, `WITH t AS (`+scope+cond+`)
-			SELECT a.tag_id, b.tag_id, count(*) FROM t a JOIN t b ON a.note_id = b.note_id AND (a.kind, a.tag_id) < (b.kind, b.tag_id)
-			GROUP BY 1, 2`, args...)
+		rows, err = tx.Query(ctx, pairSQL, args...)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var p pair
+			var n int
+			if err := rows.Scan(&p.a, &p.b, &n); err != nil {
+				rows.Close()
+				return err
+			}
+			edges[p] = n
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		// the labels of the nodes
+		ids := make([]uuid.UUID, 0, len(nodes))
+		for id := range nodes {
+			ids = append(ids, id)
+		}
+		rows, err = tx.Query(ctx, `SELECT id, COALESCE(NULLIF(name,''), email) FROM comm_people WHERE user_id = $1 AND id = ANY($2)
+			UNION ALL SELECT id, name FROM comm_topics WHERE user_id = $1 AND id = ANY($2)`, uid, ids)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var p pair
-			var n int
-			if err := rows.Scan(&p.a, &p.b, &n); err != nil {
+			var id uuid.UUID
+			var label string
+			if err := rows.Scan(&id, &label); err != nil {
 				return err
 			}
-			edges[p] = n
+			if n := nodes[id]; n != nil {
+				n.Label = label
+			}
 		}
 		return rows.Err()
 	})
@@ -935,28 +1106,28 @@ func (s *Service) Graph(ctx context.Context, uid uuid.UUID, f Filter, minLinks, 
 		if a.Links != b.Links {
 			return a.Links > b.Links
 		}
-		if a.Notes != b.Notes {
-			return a.Notes > b.Notes
+		if a.Days != b.Days {
+			return a.Days > b.Days
 		}
 		return a.ID.String() < b.ID.String()
 	})
-	if len(g.Nodes) > maxNodes {
-		g.Nodes = g.Nodes[:maxNodes]
+	if len(g.Nodes) > lim.MaxNodes {
+		g.Nodes = g.Nodes[:lim.MaxNodes]
 	}
 	keep := map[uuid.UUID]bool{}
 	for _, n := range g.Nodes {
 		keep[n.ID] = true
 	}
+	var between []Edge
 	for p, n := range edges {
 		if keep[p.a] && keep[p.b] {
-			g.Edges = append(g.Edges, Edge{A: p.a, B: p.b, Notes: n})
+			between = append(between, Edge{A: p.a, B: p.b, Days: n, Notes: n})
 		}
 	}
-	sort.Slice(g.Edges, func(i, j int) bool {
-		if g.Edges[i].A != g.Edges[j].A {
-			return g.Edges[i].A.String() < g.Edges[j].A.String()
-		}
-		return g.Edges[i].B.String() < g.Edges[j].B.String()
-	})
+	g.TotalEdges = len(between)
+	g.Edges = capEdges(between, lim.NodeEdges, lim.MaxEdges)
+	if g.Edges == nil {
+		g.Edges = []Edge{}
+	}
 	return g, nil
 }

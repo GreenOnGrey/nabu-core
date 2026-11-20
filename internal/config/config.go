@@ -145,6 +145,8 @@ type Config struct {
 	TaskMaxFailures int
 	// FTR.NAB.CMN-0003 tech §12: the memory of communications.
 	MemoryGraphMaxNodes      int
+	MemoryGraphNodeEdges     int // FTR.NAB.MEM-0001 R24: links of a node in the answer of the graph
+	MemoryGraphMaxEdges      int // and links in all
 	MemoryCollectConcurrency int
 	MemoryBatchThreads       int
 	MemoryRunTimeout         time.Duration
@@ -413,6 +415,8 @@ func Load() (*Config, error) {
 		TaskTick: p.dur("TASK_TICK", "15s"), TaskRunTimeout: p.dur("TASK_RUN_TIMEOUT", "30m"),
 		TaskMinInterval: p.dur("TASK_MIN_INTERVAL", "15m"), TaskMaxActive: p.int("TASK_MAX_ACTIVE", 20),
 		MemoryGraphMaxNodes:      p.int("MEMORY_GRAPH_MAX_NODES", 150),
+		MemoryGraphNodeEdges:     p.int("MEMORY_GRAPH_NODE_EDGES", 8),
+		MemoryGraphMaxEdges:      p.int("MEMORY_GRAPH_MAX_EDGES", 600),
 		MemoryCollectConcurrency: p.int("MEMORY_COLLECT_CONCURRENCY", 40), MemoryBatchThreads: p.int("MEMORY_BATCH_THREADS", 8),
 		MemoryRunTimeout: p.dur("MEMORY_RUN_TIMEOUT", "20m"), MemoryBackfillDays: p.int("MEMORY_BACKFILL_DAYS", 30),
 		MemoryHousekeepingEvery: p.dur("MEMORY_HOUSEKEEPING_EVERY", "10m"),
