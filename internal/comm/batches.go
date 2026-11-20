@@ -222,6 +222,22 @@ func (s *Service) FinishBatch(ctx context.Context, uid, id uuid.UUID, ok bool, e
 		if final != "done" {
 			return nil
 		}
+		// the usage by day (FTR.NAB.MEM-0001 R25, R26): the messages of a done batch by source and the records it
+		// made; a failed batch is queued again and counted when it is done
+		read := 0
+		for _, t := range b.Threads {
+			read += len(t.Messages)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO comm_usage_source_days (user_id, day, item_id, source, messages) VALUES ($1, (now() AT TIME ZONE 'UTC')::date, $2, $3, $4)
+			ON CONFLICT (user_id, day, item_id, source) DO UPDATE SET messages = comm_usage_source_days.messages + EXCLUDED.messages`,
+			uid, b.ItemID, b.Source, read); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO comm_usage_days (user_id, day, created) SELECT $1, (now() AT TIME ZONE 'UTC')::date, notes FROM comm_batches WHERE user_id = $1 AND id = $2
+			ON CONFLICT (user_id, day) DO UPDATE SET created = comm_usage_days.created + EXCLUDED.created`, uid, id); err != nil {
+			return err
+		}
+
 		for _, t := range b.Threads {
 			for _, m := range t.Messages {
 				if _, err := tx.Exec(ctx, `INSERT INTO comm_skipped (user_id, item_id, source, thread_key, day_key, message_id)
@@ -414,9 +430,31 @@ func monthOf(t time.Time) time.Time {
 
 // AddUsage adds a run of the collector and its cost to the month of the user (R27).
 func (s *Service) AddUsage(ctx context.Context, uid uuid.UUID, costUSD float64) error {
-	_, err := s.Pool.Exec(ctx, `INSERT INTO comm_usage (user_id, month, runs, cost_usd) VALUES ($1, $2, 1, $3)
-		ON CONFLICT (user_id, month) DO UPDATE SET runs = comm_usage.runs + 1, cost_usd = comm_usage.cost_usd + EXCLUDED.cost_usd`, uid, monthOf(s.clock()), costUSD)
+	_, err := s.Pool.Exec(ctx, `WITH m AS (INSERT INTO comm_usage (user_id, month, runs, cost_usd) VALUES ($1, $2, 1, $3)
+			ON CONFLICT (user_id, month) DO UPDATE SET runs = comm_usage.runs + 1, cost_usd = comm_usage.cost_usd + EXCLUDED.cost_usd)
+		INSERT INTO comm_usage_days (user_id, day, runs, cost_collect) VALUES ($1, $4, 1, $3)
+		ON CONFLICT (user_id, day) DO UPDATE SET runs = comm_usage_days.runs + 1, cost_collect = comm_usage_days.cost_collect + EXCLUDED.cost_collect`,
+		uid, monthOf(s.clock()), costUSD, dayOf(s.clock()))
 	return err
+}
+
+// AddCompactUsage adds the cost of a compaction to the month of the user and to its day (FTR.NAB.MEM-0001 R14): it
+// counts in the monthly cost and the limit, but the limit does not stop it.
+func (s *Service) AddCompactUsage(ctx context.Context, uid uuid.UUID, costUSD float64, charsIn, charsOut, ok, failed int) error {
+	_, err := s.Pool.Exec(ctx, `WITH m AS (INSERT INTO comm_usage (user_id, month, cost_usd, compact_cost_usd) VALUES ($1, $2, $3, $3)
+			ON CONFLICT (user_id, month) DO UPDATE SET cost_usd = comm_usage.cost_usd + EXCLUDED.cost_usd,
+				compact_cost_usd = comm_usage.compact_cost_usd + EXCLUDED.compact_cost_usd)
+		INSERT INTO comm_usage_days (user_id, day, cost_compact, chars_in, chars_out, compact_ok, compact_failed) VALUES ($1, $4, $3, $5, $6, $7, $8)
+		ON CONFLICT (user_id, day) DO UPDATE SET cost_compact = comm_usage_days.cost_compact + EXCLUDED.cost_compact,
+			chars_in = comm_usage_days.chars_in + EXCLUDED.chars_in, chars_out = comm_usage_days.chars_out + EXCLUDED.chars_out,
+			compact_ok = comm_usage_days.compact_ok + EXCLUDED.compact_ok, compact_failed = comm_usage_days.compact_failed + EXCLUDED.compact_failed`,
+		uid, monthOf(s.clock()), costUSD, dayOf(s.clock()), charsIn, charsOut, ok, failed)
+	return err
+}
+
+func dayOf(t time.Time) time.Time {
+	t = t.UTC()
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
 }
 
 // MonthCost is what the collection of the user cost this month.

@@ -120,8 +120,8 @@ func TestCommLoad(t *testing.T) {
 		s.Embedder = func(context.Context) *comm.Embedder { return &comm.Embedder{BaseURL: emb.URL, Model: "load"} }
 	}
 	uid := ids[len(ids)/2]
-	topics, _ := s.Tags(ctx, uid, comm.KindTopic, "", 5)
-	people, _ := s.Tags(ctx, uid, comm.KindPerson, "", 5)
+	topics, _ := s.Tags(ctx, uid, comm.KindTopic, "", 5, nil)
+	people, _ := s.Tags(ctx, uid, comm.KindPerson, "", 5, nil)
 	month := time.Now().AddDate(0, 0, -30)
 	measure := func(name string, limit time.Duration, fn func(i int) error) {
 		t.Helper()
@@ -159,11 +159,11 @@ func TestCommLoad(t *testing.T) {
 	})
 	// PERF-02: the graph of a period — 3 seconds.
 	measure("graph, 30 days", 3*time.Second, func(int) error {
-		_, err := s.Graph(ctx, uid, comm.Filter{From: &month}, 0, 150)
+		_, err := s.Graph(ctx, uid, comm.Filter{From: &month}, 0, comm.GraphLimits{MaxNodes: 150, NodeEdges: 8, MaxEdges: 600})
 		return err
 	})
 	measure("graph, all the notes", 3*time.Second, func(int) error {
-		_, err := s.Graph(ctx, uid, comm.Filter{}, 0, 150)
+		_, err := s.Graph(ctx, uid, comm.Filter{}, 0, comm.GraphLimits{MaxNodes: 150, NodeEdges: 8, MaxEdges: 600})
 		return err
 	})
 

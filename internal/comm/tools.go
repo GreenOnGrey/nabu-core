@@ -31,7 +31,7 @@ func (s *Service) Tools(noteURL func(id uuid.UUID) string, today func(ctx contex
 		if strings.TrimSpace(name) == "" {
 			return nil, nil
 		}
-		l, err := s.Tags(ctx, uid, kind, name, 5)
+		l, err := s.Tags(ctx, uid, kind, name, 5, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -43,7 +43,9 @@ func (s *Service) Tools(noteURL func(id uuid.UUID) string, today func(ctx contex
 	return []mcp.Tool{
 		{Name: "comm_search", ReadOnly: true, Available: available,
 			Description: "Search the notes of the user's work communications (mail threads and chats collected into memory): what was discussed and agreed, with whom and on what topic. " +
-				"Use it when the user asks about past correspondence or agreements. Give the links from the result in your answer.",
+				"Use it when the user asks about past correspondence or agreements. Give the links from the result in your answer. " +
+				"A record is a chat for a day, a week or a month, or a whole mail thread; for a question about more than a week prefer the week and month records " +
+				"that cover the period, and name the level and the period of a record you answer from.",
 			InputSchema: mcp.Schema(map[string]any{
 				"query":  map[string]any{"type": "string", "description": "What to look for, in the user's words"},
 				"person": map[string]any{"type": "string", "description": "A name or an email of a participant"},
@@ -103,7 +105,8 @@ func (s *Service) Tools(noteURL func(id uuid.UUID) string, today func(ctx contex
 					if err != nil {
 						continue
 					}
-					fmt.Fprintf(&b, "## %s\n%s · %s · messages: %d\n", full.Title, full.LastAt.Format(dateLayout), full.Source, full.MessageCount)
+					// FTR.NAB.MEM-0001 R19: the level and the period of the record
+					fmt.Fprintf(&b, "## %s\n%s %s–%s · %s · days: %d · messages: %d\n", full.Title, full.Level, full.PeriodFrom, full.PeriodTo, full.Source, full.Days, full.MessageCount)
 					if len(full.People) > 0 {
 						b.WriteString("People: " + labels(full.People) + "\n")
 					}
@@ -232,7 +235,7 @@ func (s *Service) Tools(noteURL func(id uuid.UUID) string, today func(ctx contex
 				if p := strings.TrimSpace(in.Person); strings.Contains(p, "@") {
 					cc.PersonEmail = p // the exact email: an existing person or a new one
 				} else if p != "" {
-					l, err := s.Tags(ctx, g.UserID, KindPerson, p, 5)
+					l, err := s.Tags(ctx, g.UserID, KindPerson, p, 5, nil)
 					if err != nil {
 						return "", &mcp.ToolError{Msg: err.Error()}
 					}

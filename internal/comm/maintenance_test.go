@@ -22,6 +22,7 @@ func TestMaintenanceCallers(t *testing.T) {
 		"internal/comm/batches.go:LostRuns":       true,
 		"internal/comm/vectors.go:EmbedPending":   true,
 		"internal/comm/vectors.go:PendingVectors": true,
+		"internal/comm/days.go:SnapshotLevels":    true,
 	}
 	root := filepath.Join("..", "..")
 	seen := map[string]bool{}

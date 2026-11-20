@@ -48,6 +48,10 @@ func appPool(t *testing.T) *pgxpool.Pool {
 			"CREATE ROLE " + role + " LOGIN PASSWORD 'app' NOSUPERUSER NOBYPASSRLS",
 			"GRANT ALL ON ALL TABLES IN SCHEMA public TO " + role,
 			"GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO " + role,
+			// a test that rolls migrations back and forth (go_module_archives_test) recreates their tables after
+			// this grant: the role keeps its rights on them
+			"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO " + role,
+			"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO " + role,
 		} {
 			if _, err := pool.Exec(ctx, q); err != nil {
 				t.Fatal(err)
@@ -147,7 +151,7 @@ func TestCommIsolation(t *testing.T) {
 	if _, err := s.UpdateCommitment(ctx, b, cid, comm.CommitmentPatch{State: &done}, comm.ByUser); !isCode(err, "not_found") {
 		t.Fatalf("B closed the commitment of A: %v", err)
 	}
-	topicsA, _ := s.Tags(ctx, a, comm.KindTopic, "", 0)
+	topicsA, _ := s.Tags(ctx, a, comm.KindTopic, "", 0, nil)
 	if err := s.RenameTopic(ctx, b, topicsA[0].ID, "чужая"); !isCode(err, "not_found") {
 		t.Fatalf("B renamed the topic of A: %v", err)
 	}
@@ -279,7 +283,7 @@ func TestCommTagsAndGraph(t *testing.T) {
 
 	tag := func(kind, label string) uuid.UUID {
 		t.Helper()
-		l, err := s.Tags(ctx, u, kind, "", 0)
+		l, err := s.Tags(ctx, u, kind, "", 0, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -302,7 +306,9 @@ func TestCommTagsAndGraph(t *testing.T) {
 		}
 		return len(l.Items)
 	}
-	from, to := at(2, 0), at(5, 0)
+	// the bounds of a period are midnights of the user (Europe/Moscow by default), as the web sends them
+	msk, _ := time.LoadLocation("Europe/Moscow")
+	from, to := ptr(time.Date(2026, 10, 2, 0, 0, 0, 0, msk)), ptr(time.Date(2026, 10, 5, 0, 0, 0, 0, msk))
 	if a, b, c, d := count(comm.Filter{Topic: &release}), count(comm.Filter{Person: &ivanov}), count(comm.Filter{Topic: &release, Person: &ivanov}),
 		count(comm.Filter{From: from, To: to}); a != 4 || b != 3 || c != 2 || d != 3 {
 		t.Fatalf("filters: %d %d %d %d", a, b, c, d)
@@ -324,7 +330,7 @@ func TestCommTagsAndGraph(t *testing.T) {
 	}
 
 	// VIEW-04: the nodes and the edges of the notes on the topic Релиз.
-	g, err := s.Graph(ctx, u, comm.Filter{Topic: &release}, 0, 150)
+	g, err := s.Graph(ctx, u, comm.Filter{Topic: &release}, 0, comm.GraphLimits{MaxNodes: 150})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -347,7 +353,7 @@ func TestCommTagsAndGraph(t *testing.T) {
 		t.Fatalf("edges: %+v", g.Edges)
 	}
 	// VIEW-05: the most linked nodes stay, the total is reported; minLinks cuts.
-	g, _ = s.Graph(ctx, u, comm.Filter{}, 0, 3)
+	g, _ = s.Graph(ctx, u, comm.Filter{}, 0, comm.GraphLimits{MaxNodes: 3})
 	if len(g.Nodes) != 3 || g.TotalNodes != 9 || g.Nodes[0].Label != "Релиз" {
 		t.Fatalf("limited graph: %+v total %d", g.Nodes, g.TotalNodes)
 	}
@@ -362,7 +368,7 @@ func TestCommTagsAndGraph(t *testing.T) {
 			t.Fatalf("an edge to a node that was cut: %+v", e)
 		}
 	}
-	if g, _ = s.Graph(ctx, u, comm.Filter{}, 3, 150); len(g.Nodes) == 0 || g.Nodes[len(g.Nodes)-1].Links < 3 {
+	if g, _ = s.Graph(ctx, u, comm.Filter{}, 3, comm.GraphLimits{MaxNodes: 150}); len(g.Nodes) == 0 || g.Nodes[len(g.Nodes)-1].Links < 3 {
 		t.Fatalf("minLinks: %+v", g.Nodes)
 	}
 
@@ -401,7 +407,7 @@ func TestCommTagsAndGraph(t *testing.T) {
 	if err := s.DeleteAll(ctx, u, "all"); err != nil {
 		t.Fatal(err)
 	}
-	if l, _ := s.Tags(ctx, u, comm.KindPerson, "", 0); count(comm.Filter{}) != 0 || len(l) != 0 {
+	if l, _ := s.Tags(ctx, u, comm.KindPerson, "", 0, nil); count(comm.Filter{}) != 0 || len(l) != 0 {
 		t.Fatal("something is left after deleting everything")
 	}
 }
@@ -520,17 +526,25 @@ func TestCommSettings(t *testing.T) {
 	if _, err := s.Allowed(ctx); !isCode(err, "comm_disabled") {
 		t.Fatalf("allowed by default: %v", err)
 	}
-	on, days := true, 90
+	// FTR.NAB.MEM-0001 MEM-ST-04: days of the version before become months rounded up; months are 1–60
+	on, days := true, 45
 	st, err := s.SaveSettings(ctx, comm.SettingsPatch{Enabled: &on, RetentionDays: &days, Model: []byte(`{"connectionId":"c1","model":"m"}`)})
-	if err != nil || !st.Enabled || st.RetentionDays != 90 || st.Model == nil || st.Model.Model != "m" {
+	if err != nil || !st.Enabled || st.RetentionMonths != 2 || st.RetentionDays != 60 || st.Model == nil || st.Model.Model != "m" {
 		t.Fatalf("%+v %v", st, err)
 	}
-	zero := 0
-	if _, err := s.SaveSettings(ctx, comm.SettingsPatch{RetentionDays: &zero}); !isCode(err, "invalid_retention") {
+	zero, months := 0, 3
+	if _, err := s.SaveSettings(ctx, comm.SettingsPatch{RetentionMonths: &zero}); !isCode(err, "invalid_retention") {
 		t.Fatalf("%v", err)
 	}
-	if st, _ = s.Allowed(ctx); st.RetentionDays != 90 || st.Model == nil {
+	if st, err = s.SaveSettings(ctx, comm.SettingsPatch{RetentionMonths: &months, CompactModel: []byte(`{"connectionId":"c2","model":"big"}`)}); err != nil ||
+		st.RetentionMonths != 3 || st.CompactChoice().Model != "big" {
+		t.Fatalf("months and the model of the compaction: %+v %v", st, err)
+	}
+	if st, _ = s.Allowed(ctx); st.RetentionMonths != 3 || st.Model == nil || st.CompactModel == nil {
 		t.Fatalf("a partial patch dropped values: %+v", st)
+	}
+	if st, _ = s.SaveSettings(ctx, comm.SettingsPatch{CompactModel: []byte(`null`)}); st.CompactChoice().Model != "m" {
+		t.Fatalf("without its own model the compaction takes the one of the collection: %+v", st)
 	}
 	if ok, _ := s.Consented(ctx, u); ok {
 		t.Fatal("consented before accepting")
@@ -996,10 +1010,10 @@ func TestCommRetention(t *testing.T) {
 	if err != nil || p.Notes != 1 || titles() != "Свежая,Старая с долгом" {
 		t.Fatalf("%+v %v %s", p, err, titles())
 	}
-	if people, _ := s.Tags(ctx, u, comm.KindPerson, "", 0); len(people) != 2 {
+	if people, _ := s.Tags(ctx, u, comm.KindPerson, "", 0, nil); len(people) != 2 {
 		t.Fatalf("people after the purge: %+v", people)
 	}
-	if topics, _ := s.Tags(ctx, u, comm.KindTopic, "", 0); len(topics) != 2 {
+	if topics, _ := s.Tags(ctx, u, comm.KindTopic, "", 0, nil); len(topics) != 2 {
 		t.Fatalf("topics after the purge: %+v", topics)
 	}
 	if st, _ := s.State(ctx, u); st.Notes != 2 {
@@ -1015,17 +1029,18 @@ func TestCommRetention(t *testing.T) {
 	if _, err := s.Get(ctx, u, kept.ID); !isCode(err, "not_found") {
 		t.Fatal("the note is still there")
 	}
-	// LIFE-05: a shorter retention applies at the next purge.
-	days := 5
-	if _, err := s.SaveSettings(ctx, comm.SettingsPatch{RetentionDays: &days}); err != nil {
+	// LIFE-05, FTR.NAB.MEM-0001 MEM-ST-01: a shorter retention in months applies at the next purge.
+	older := time.Now().AddDate(0, 0, -45)
+	saveNote(t, s, u, "older", "Полуторамесячная", "Переписка полтора месяца назад.", []comm.PersonIn{{Email: "older@x.org"}}, []string{"Текущее"}, comm.Message{ID: "1", SentAt: &older})
+	month := 1
+	if _, err := s.SaveSettings(ctx, comm.SettingsPatch{RetentionMonths: &month}); err != nil {
 		t.Fatal(err)
 	}
-	// the purge is global: with five days it also takes the old notes of other tests
-	if p, _ = s.Purge(ctx); p.Notes < 1 || titles() != "" {
+	if p, _ = s.Purge(ctx); p.Notes < 1 || titles() != "Свежая" {
 		t.Fatalf("after shortening the retention: %+v %s", p, titles())
 	}
-	def := comm.DefaultRetentionDays
-	_, _ = s.SaveSettings(ctx, comm.SettingsPatch{RetentionDays: &def})
+	def := comm.DefaultRetentionMonths
+	_, _ = s.SaveSettings(ctx, comm.SettingsPatch{RetentionMonths: &def})
 }
 
 // fakeEmbeddings is an OpenAI-compatible /embeddings: a text becomes a vector

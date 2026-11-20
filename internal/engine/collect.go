@@ -800,6 +800,15 @@ func (e *Engine) finishTick(ctx context.Context, u *users.User, taskRun uuid.UUI
 // over (R17): a new month or a raised limit returns the budget; the access
 // to a source is back when the user connected it again.
 func (e *Engine) MemoryHousekeeping(ctx context.Context) {
+	// FTR.NAB.MEM-0001 R26: the records by level for the usage, once an hour; they exist after the function is
+	// switched off too (R24), so the snapshot goes first
+	if now := time.Now(); now.Sub(e.levelsAt) >= time.Hour {
+		if err := e.Comm.SnapshotLevels(ctx); err != nil {
+			slog.Warn("the snapshot of the records by level failed", "err", err)
+		} else {
+			e.levelsAt = now
+		}
+	}
 	st, err := e.Comm.LoadSettings(ctx)
 	if err != nil || !st.Enabled {
 		return
