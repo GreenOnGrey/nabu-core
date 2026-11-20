@@ -357,7 +357,7 @@ func (s *Service) toPDF(ctx context.Context, name string, data []byte) ([]byte, 
 		return nil, err
 	}
 	_, _ = fw.Write(data)
-	_ = mw.WriteField("nativePageRanges", fmt.Sprintf("1-%d", pagesShown))
+	_ = mw.WriteField("nativePages", fmt.Sprintf("1-%d", pagesShown))
 	_ = mw.Close()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(s.Cfg.ConvertURL, "/")+"/forms/libreoffice/convert", &body)
 	if err != nil {
