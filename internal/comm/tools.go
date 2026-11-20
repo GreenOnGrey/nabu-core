@@ -13,7 +13,7 @@ import (
 	"github.com/GreenOnGrey/nabu-core/internal/platform/mcp"
 )
 
-// Tools are comm_search, commitment_list and commitment_update of the
+// Tools are comm_search, commitment_list, commitment_update and commitment_create of the
 // built-in MCP: how the personal agent uses what was collected (R12, R20,
 // tech §5.2). They are offered only to a user who consented, so group and
 // service agents never see them (R22). The user
@@ -211,6 +211,65 @@ func (s *Service) Tools(noteURL func(id uuid.UUID) string, today func(ctx contex
 				}
 				return "Updated: " + describeCommitment(c), nil
 			}},
+		// FTR.NAB.CMN-0003 R11, tech decision 57: the agent proposes a commitment it notices in the chat and saves
+		// it after the user's yes; the collector later links the same commitment found in mail to it.
+		{Name: "commitment_create", Available: available,
+			Description: "Save a new commitment of the user from this conversation: something the user promised to do (mine) or someone promised the user (theirs). " +
+				"When you notice such a promise in the conversation, first ask the user whether to save it, naming what, with whom and the due day; call this tool only after the user agrees. " +
+				"When the user asks you to remember or save a commitment, call it without asking again. After saving, name what you saved.",
+			InputSchema: mcp.Schema(map[string]any{
+				"text":      map[string]any{"type": "string", "description": "What to do, one sentence"},
+				"direction": map[string]any{"type": "string", "enum": []string{Mine, Theirs}, "description": "mine when the user owes it, theirs when it is owed to the user"},
+				"person":    map[string]any{"type": "string", "description": "The other side: a name or an email; omit when there is none"},
+				"due":       map[string]any{"type": "string", "description": "The due day YYYY-MM-DD; omit when there is none"},
+			}, "text", "direction"),
+			Handler: func(ctx context.Context, g mcp.Grant, args json.RawMessage) (string, error) {
+				var in struct{ Text, Direction, Person, Due string }
+				if err := json.Unmarshal(args, &in); err != nil {
+					return "", &mcp.ToolError{Msg: "invalid arguments"}
+				}
+				cc := ChatCommitment{Text: in.Text, Direction: in.Direction, Conversation: g.Conversation}
+				if p := strings.TrimSpace(in.Person); strings.Contains(p, "@") {
+					cc.PersonEmail = p // the exact email: an existing person or a new one
+				} else if p != "" {
+					l, err := s.Tags(ctx, g.UserID, KindPerson, p, 5)
+					if err != nil {
+						return "", &mcp.ToolError{Msg: err.Error()}
+					}
+					var exact []Tag
+					for _, t := range l {
+						if sameName(t.Label, p) {
+							exact = append(exact, t)
+						}
+					}
+					switch {
+					case len(exact) == 1:
+						cc.Person = &exact[0].ID
+					case len(exact) == 0 && len(l) == 1:
+						cc.Person = &l[0].ID
+					case len(l) == 0:
+						return "", &mcp.ToolError{Msg: fmt.Sprintf("No person like %q in the collected communications: pass their email, or omit person and name them in the text.", p)}
+					default:
+						names := make([]string, len(l))
+						for i, t := range l {
+							names[i] = t.Label + " <" + t.Email + ">"
+						}
+						return "", &mcp.ToolError{Msg: fmt.Sprintf("Several people match %q: %s. Pass the email of the right one.", p, strings.Join(names, ", "))}
+					}
+				}
+				if in.Due != "" {
+					d, err := ParseDate(in.Due)
+					if err != nil {
+						return "", &mcp.ToolError{Msg: "due is YYYY-MM-DD"}
+					}
+					cc.Due = &d
+				}
+				c, err := s.CreateCommitment(ctx, g.UserID, cc)
+				if err != nil {
+					return "", &mcp.ToolError{Msg: err.Error()}
+				}
+				return fmt.Sprintf("Saved [%s]: %s", c.ID, describeCommitment(c)), nil
+			}},
 	}
 }
 
@@ -238,3 +297,9 @@ func describeCommitment(c *Commitment) string {
 }
 
 func pageOf(limit int) httpx.Page { return httpx.Page{Limit: limit} }
+
+// sameName compares two names of a person as the user types them: without case and with ё as е.
+func sameName(a, b string) bool {
+	fold := strings.NewReplacer("ё", "е", "Ё", "е")
+	return strings.EqualFold(fold.Replace(strings.TrimSpace(a)), fold.Replace(strings.TrimSpace(b)))
+}

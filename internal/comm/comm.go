@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/GreenOnGrey/nabu-core/internal/apperr"
+	"github.com/GreenOnGrey/nabu-core/internal/models"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/events"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/metrics"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/postgres"
@@ -55,6 +57,10 @@ type Settings struct {
 	// environment.
 	RunTimeoutMinutes *int `json:"runTimeoutMinutes"`
 	BatchThreads      *int `json:"batchThreads"`
+	// ThinkingOff is how a run of the collector switches the thinking of an OpenAI-compatible model off
+	// explicitly: models.ThinkingOffChatTemplate or models.ThinkingOffReasoningEffort; nil — at the level off
+	// without a parameter (FTR.NAB.CMN-0003 tech, decision 58).
+	ThinkingOff *string `json:"thinkingOff"`
 }
 
 // The bounds of the settings of the collection the administrator changes (decision 52).
@@ -152,6 +158,8 @@ type SettingsPatch struct {
 	// RunTimeoutMinutes and BatchThreads: a number sets the value, null returns the one of the environment.
 	RunTimeoutMinutes json.RawMessage `json:"runTimeoutMinutes"`
 	BatchThreads      json.RawMessage `json:"batchThreads"`
+	// ThinkingOff: a way sets it, null removes it (decision 58).
+	ThinkingOff json.RawMessage `json:"thinkingOff"`
 }
 
 // SaveSettings applies a patch of the instance settings (R29).
@@ -195,6 +203,13 @@ func (s *Service) SaveSettings(ctx context.Context, p SettingsPatch) (Settings, 
 				return apperr.Unprocessable("invalid_collect_limit", fmt.Sprintf("%s is between 1 and %d", f.field, f.max)).With("field", f.field)
 			}
 			*f.dst = n
+		}
+		if len(p.ThinkingOff) > 0 {
+			var way *string
+			if err := json.Unmarshal(p.ThinkingOff, &way); err != nil || (way != nil && !slices.Contains(models.ThinkingOffWays, *way)) {
+				return apperr.Unprocessable("invalid_thinking_off", "thinkingOff is null, "+strings.Join(models.ThinkingOffWays, " or ")).With("field", "thinkingOff")
+			}
+			st.ThinkingOff = way
 		}
 		for _, f := range []struct {
 			raw json.RawMessage
@@ -285,7 +300,8 @@ func (s *Service) DeleteAll(ctx context.Context, uid uuid.UUID, confirm string) 
 	}
 	err := s.as(ctx, uid, func(tx pgx.Tx) error {
 		for _, q := range []string{
-			`DELETE FROM comm_notes WHERE user_id = $1`, // messages, tags and commitments cascade
+			`DELETE FROM comm_notes WHERE user_id = $1`,  // messages, tags and commitments cascade
+			`DELETE FROM commitments WHERE user_id = $1`, // the commitments from the chat have no note (decision 57)
 			`DELETE FROM comm_people WHERE user_id = $1`,
 			`DELETE FROM comm_topics WHERE user_id = $1`,
 			`DELETE FROM comm_tombstones WHERE user_id = $1`,

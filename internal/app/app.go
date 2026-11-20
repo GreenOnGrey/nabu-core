@@ -1066,7 +1066,8 @@ func RunCleaner(ctx context.Context, cfg *config.Config) error {
 	if purged, err := (&comm.Service{Pool: pool}).Purge(ctx); err != nil {
 		return fmt.Errorf("communications: %w", err)
 	} else {
-		slog.Info("cleaned", "what", "communications", "notes", purged.Notes, "people", purged.People, "topics", purged.Topics)
+		slog.Info("cleaned", "what", "communications", "notes", purged.Notes, "people", purged.People, "topics", purged.Topics,
+			"chatCommitments", purged.ChatCommitments)
 	}
 	// the mail log is kept as long as the audit (arch §8)
 	if _, err := pool.Exec(ctx, `DELETE FROM email_log WHERE at < now() - make_interval(secs => $1)`, cfg.AuditRetention.Seconds()); err != nil {

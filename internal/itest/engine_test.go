@@ -263,7 +263,17 @@ func TestEngineWithPi(t *testing.T) {
 	// FTR.NAB.CMN-0010 STL-10, STL-13, STL-14: the detector stops the turn, the
 	// answer is not an error, has the wrap-up and the note, and the talk goes on.
 	stalled := turn("keep searching for it")
-	if stalled.Status != "done" || !strings.Contains(stalled.Text, "Nothing is done") || !strings.HasSuffix(stalled.Text, channels.T("en", "answer.stalled")) || len(stalled.ToolSteps) != 5 {
+	// five repeated calls stop the turn; Pi may have started one more call before the stop, and that one ends aborted
+	done, aborted := 0, 0
+	for _, st := range stalled.ToolSteps {
+		if st.Status == "done" {
+			done++
+		} else {
+			aborted++
+		}
+	}
+	if stalled.Status != "done" || !strings.Contains(stalled.Text, "Nothing is done") || !strings.HasSuffix(stalled.Text, channels.T("en", "answer.stalled")) ||
+		done != 5 || aborted > 1 {
 		t.Fatalf("STL-13: %+v", stalled)
 	}
 	if next := turn("hello after the stop"); next.Status != "done" {

@@ -11,12 +11,15 @@ import (
 // Purged is what a run of the retention removed.
 type Purged struct {
 	Notes, People, Topics, Tombstones, Batches int64
+	// ChatCommitments are the closed commitments from the chat without a note (decision 57).
+	ChatCommitments int64
 }
 
 // Purge applies the retention of notes (R23, tech §10): a note whose last
 // message is older than the retention goes with its messages, tags and closed
 // commitments — unless it has an open commitment, which keeps it. People and
-// topics left without notes follow, and so do old tombstones and batches.
+// topics left without notes follow, and so do old tombstones and batches. A commitment from the chat without a
+// note goes once it has been closed longer than the retention (FTR.NAB.CMN-0003 R23, tech decision 57).
 // It is the maintenance of the cleaner: it sees the rows of every user.
 func (s *Service) Purge(ctx context.Context) (Purged, error) {
 	var out Purged
@@ -39,6 +42,7 @@ func (s *Service) Purge(ctx context.Context) (Purged, error) {
 			dst *int64
 			sql string
 		}{
+			{&out.ChatCommitments, `DELETE FROM commitments WHERE note_id IS NULL AND state <> 'open' AND closed_at < now() - make_interval(days => $1)`},
 			{&out.People, `DELETE FROM comm_people p WHERE NOT EXISTS (SELECT 1 FROM comm_note_tags t WHERE t.user_id = p.user_id AND t.kind = 'person' AND t.tag_id = p.id)
 				AND NOT EXISTS (SELECT 1 FROM commitments c WHERE c.person_id = p.id)`},
 			{&out.Topics, `DELETE FROM comm_topics p WHERE NOT EXISTS (SELECT 1 FROM comm_note_tags t WHERE t.user_id = p.user_id AND t.kind = 'topic' AND t.tag_id = p.id)`},
@@ -48,7 +52,7 @@ func (s *Service) Purge(ctx context.Context) (Purged, error) {
 		} {
 			var tag interface{ RowsAffected() int64 }
 			var err error
-			if q.dst == &out.Tombstones {
+			if q.dst == &out.Tombstones || q.dst == &out.ChatCommitments {
 				tag, err = tx.Exec(ctx, q.sql, st.RetentionDays)
 			} else {
 				tag, err = tx.Exec(ctx, q.sql)

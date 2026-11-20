@@ -137,6 +137,9 @@ type ModelSpec struct {
 	ModelID      string     `json:"modelId"`
 	Thinking     string     `json:"thinking"`
 	Models       []ModelDef `json:"models"`
+	// ConnectionType is the type of the connection (deepseek, zai, gigachat, openai_compatible); it stays in
+	// the core and decides how the thinking of a run is switched off (FTR.NAB.CMN-0003 tech, decision 58).
+	ConnectionType string `json:"-"`
 }
 
 // Secrets travel only in the request body and live in the Pi process
