@@ -85,7 +85,7 @@ func RenderDigest(items []DigestItem, period, lang string) (string, json.RawMess
 		}
 		b.WriteString("\n")
 		card.Items = append(card.Items, DigestCardItem{CommitmentID: it.ID.String(), Text: it.Text, Direction: it.Direction, Group: it.Group,
-			Person: it.Person, Topics: it.Topics, Due: it.Due, State: it.State, NoteID: it.NoteID.String(), URL: it.BasisURL})
+			Person: it.Person, Topics: it.Topics, Due: it.Due, State: it.State, NoteID: noteRef(it.NoteID), URL: it.BasisURL})
 	}
 	b.WriteString("\n_" + t["hint"] + "_")
 	raw, _ := json.Marshal(card)

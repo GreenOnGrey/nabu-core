@@ -62,7 +62,7 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 			}}
 	}
 	return []mcp.Tool{
-		tool("comm_batch", "Get the batch of this run: the threads to process, how to read each, the note already saved for a thread and the open commitments with the participants. Call it first.",
+		tool("comm_batch", "Get the batch of this run: the threads to process, how to read each, the note already saved for a thread, the open commitments with the participants and the commitments saved in the chat (fromChat). Call it first.",
 			mcp.Schema(map[string]any{}),
 			func(ctx context.Context, g mcp.Grant, b *Batch, ad collect.Adapter, _ json.RawMessage) (string, error) {
 				info := UserInfo{Timezone: "UTC"}
@@ -138,12 +138,29 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 				if err != nil {
 					return "", &mcp.ToolError{Msg: "the batch could not be read"}
 				}
-				if open, err := s.Commitments(ctx, g.UserID, CommitmentFilter{State: Open}, 200); err == nil {
+				if open, err := s.Commitments(ctx, g.UserID, CommitmentFilter{State: Open, WithNote: true}, 200); err == nil {
 					for _, c := range open {
 						if c.Person == nil || !people[strings.ToLower(c.Person.Email)] {
 							continue
 						}
 						item := map[string]any{"id": c.ID, "text": c.Text, "direction": c.Direction, "person": c.Person.Email}
+						if c.Due != nil {
+							item["due"] = c.Due.Format(dateLayout)
+						}
+						out.OpenCommitments = append(out.OpenCommitments, item)
+					}
+				}
+				// the commitments from the chat the collector may find in mail: any person, the newest first
+				// (FTR.NAB.CMN-0003 tech, decision 57)
+				if chat, err := s.chatCommitments(ctx, g.UserID, maxChatCommitments); err == nil {
+					for _, c := range chat {
+						item := map[string]any{"id": c.ID, "text": c.Text, "direction": c.Direction, "fromChat": true}
+						switch {
+						case c.Person != nil && c.Person.Email != "":
+							item["person"] = c.Person.Email
+						case c.Person != nil:
+							item["personName"] = c.Person.Label
+						}
 						if c.Due != nil {
 							item["due"] = c.Due.Format(dateLayout)
 						}
@@ -253,10 +270,11 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 				"personEmail":    map[string]any{"type": "string", "description": "The other side: a participant of the thread"},
 				"due":            map[string]any{"type": "string", "description": "The due day YYYY-MM-DD when the text names it; omit otherwise"},
 				"basisMessageId": map[string]any{"type": "string", "description": "The message the commitment comes from"},
+				"sameAs":         map[string]any{"type": "string", "description": "The id of an open commitment of the batch with fromChat that is this same commitment: it is linked to the thread instead of a second one"},
 			}, "threadKey", "text", "direction"),
 			func(ctx context.Context, g mcp.Grant, b *Batch, _ collect.Adapter, args json.RawMessage) (string, error) {
 				var in struct {
-					ThreadKey, DayKey, Text, Direction, PersonEmail, Due, BasisMessageID string
+					ThreadKey, DayKey, Text, Direction, PersonEmail, Due, BasisMessageID, SameAs string
 				}
 				if err := json.Unmarshal(args, &in); err != nil {
 					return "", &mcp.ToolError{Msg: "invalid arguments"}
@@ -283,9 +301,19 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 					}
 					sc.Due = &d
 				}
+				if in.SameAs != "" {
+					same, err := uuid.Parse(in.SameAs)
+					if err != nil {
+						return "", &mcp.ToolError{Msg: "invalid sameAs"}
+					}
+					sc.SameAs = &same
+				}
 				id, err := s.SaveCommitment(ctx, g.UserID, sc)
 				if err != nil {
 					return "", &mcp.ToolError{Msg: err.Error()}
+				}
+				if sc.SameAs != nil {
+					return "Linked the commitment " + id.String() + " from the chat to the thread.", nil
 				}
 				return "Saved the commitment " + id.String() + ".", nil
 			}),

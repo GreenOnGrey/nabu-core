@@ -26,6 +26,11 @@ const (
 	ByUser      = "user"
 	ByAgent     = "agent"
 	ByCollector = "collector"
+
+	// Where a commitment comes from (FTR.NAB.CMN-0003 tech, decision 57): found by the collector in a thread or
+	// created by the personal agent in the chat.
+	OriginCollected = "collected"
+	OriginChat      = "chat"
 )
 
 // Date is a calendar day in JSON: "2026-10-16".
@@ -64,8 +69,12 @@ type Commitment struct {
 	State     string     `json:"state"`
 	ClosedBy  *string    `json:"closedBy"`
 	ClosedAt  *time.Time `json:"closedAt"`
-	NoteID    uuid.UUID  `json:"noteId"`
-	NoteTitle string     `json:"noteTitle"`
+	// Origin is collected or chat; a commitment from the chat has no note until the collector links it to a
+	// thread, and keeps the conversation it was created in while that exists (decision 57).
+	Origin         string     `json:"origin"`
+	NoteID         *uuid.UUID `json:"noteId"`
+	NoteTitle      string     `json:"noteTitle"`
+	ConversationID *uuid.UUID `json:"conversationId"`
 	// BasisURL opens the message the commitment comes from; CloseBasisURL —
 	// the message the collector closed it by (R12).
 	BasisURL      string    `json:"basisUrl"`
@@ -81,18 +90,21 @@ type CommitmentFilter struct {
 	Topic     *uuid.UUID
 	Note      *uuid.UUID
 	DueBefore *time.Time
+	// WithNote leaves out the commitments from the chat without a note (decision 57).
+	WithNote bool
 	// Today is the current day of the user: overdue is counted from it.
 	Today time.Time
 }
 
-const commitmentCols = `c.id, c.text, c.direction, c.due, c.state, c.closed_by, c.closed_at, c.note_id, n.title, c.created_at,
+const commitmentCols = `c.id, c.text, c.direction, c.due, c.state, c.closed_by, c.closed_at, c.note_id, COALESCE(n.title, ''), c.created_at,
+	c.origin, c.conversation_id,
 	p.id, COALESCE(NULLIF(p.name,''), p.email, ''), COALESCE(p.email, ''),
 	COALESCE((SELECT m.url FROM comm_note_messages m WHERE m.user_id = c.user_id AND m.note_id = c.note_id AND m.message_id = c.basis_message_id), ''),
 	-- the message that closed it may belong to another thread of the user
 	COALESCE((SELECT m.url FROM comm_note_messages m WHERE m.user_id = c.user_id AND m.message_id = c.close_basis_message_id
 		ORDER BY (m.note_id = c.note_id) DESC LIMIT 1), '')`
 
-const commitmentFrom = ` FROM commitments c JOIN comm_notes n ON n.user_id = c.user_id AND n.id = c.note_id
+const commitmentFrom = ` FROM commitments c LEFT JOIN comm_notes n ON n.user_id = c.user_id AND n.id = c.note_id
 	LEFT JOIN comm_people p ON p.id = c.person_id`
 
 func scanCommitment(row pgx.Row, today time.Time) (*Commitment, error) {
@@ -101,7 +113,7 @@ func scanCommitment(row pgx.Row, today time.Time) (*Commitment, error) {
 	var pid *uuid.UUID
 	var pLabel, pEmail string
 	if err := row.Scan(&c.ID, &c.Text, &c.Direction, &due, &c.State, &c.ClosedBy, &c.ClosedAt, &c.NoteID, &c.NoteTitle, &c.CreatedAt,
-		&pid, &pLabel, &pEmail, &c.BasisURL, &c.CloseBasisURL); err != nil {
+		&c.Origin, &c.ConversationID, &pid, &pLabel, &pEmail, &c.BasisURL, &c.CloseBasisURL); err != nil {
 		return nil, err
 	}
 	if due != nil {
@@ -150,6 +162,9 @@ func listCommitments(ctx context.Context, tx pgx.Tx, uid uuid.UUID, f Commitment
 	if f.DueBefore != nil {
 		add(`c.due < ?`, *f.DueBefore)
 	}
+	if f.WithNote {
+		cond.WriteString(` AND c.note_id IS NOT NULL`)
+	}
 	args = append(args, limit)
 	rows, err := tx.Query(ctx, `SELECT `+commitmentCols+commitmentFrom+` WHERE c.user_id = $1`+cond.String()+
 		fmt.Sprintf(` ORDER BY (c.state <> 'open'), c.due NULLS LAST, c.created_at, c.id LIMIT $%d`, len(args)), args...)
@@ -164,11 +179,13 @@ func listCommitments(ctx context.Context, tx pgx.Tx, uid uuid.UUID, f Commitment
 			rows.Close()
 			return nil, err
 		}
-		by[c.NoteID] = append(by[c.NoteID], len(out))
+		if c.NoteID != nil { // a commitment from the chat without a note has no topics
+			by[*c.NoteID] = append(by[*c.NoteID], len(out))
+		}
 		out = append(out, *c)
 	}
 	rows.Close()
-	if err := rows.Err(); err != nil || len(out) == 0 {
+	if err := rows.Err(); err != nil || len(by) == 0 {
 		return out, err
 	}
 	notes := make([]uuid.UUID, 0, len(by))
@@ -221,6 +238,9 @@ type SaveCommitment struct {
 	PersonName     string
 	Due            *Date
 	BasisMessageID string
+	// SameAs is an open commitment from the chat without a note that the collector found in this thread: it
+	// gets the note and the basis instead of a second commitment (FTR.NAB.CMN-0003 tech, decision 57).
+	SameAs *uuid.UUID
 }
 
 // SaveCommitment adds a commitment to the note of a thread (R11); the same
@@ -244,6 +264,9 @@ func (s *Service) SaveCommitment(ctx context.Context, uid uuid.UUID, in SaveComm
 		if err != nil {
 			return err
 		}
+		if in.SameAs != nil {
+			return linkChatCommitment(ctx, tx, uid, *in.SameAs, note, in)
+		}
 		err = tx.QueryRow(ctx, `SELECT id FROM commitments WHERE user_id = $1 AND note_id = $2 AND lower(`+postgres.Fold("text")+`) = lower(`+postgres.Fold("$3")+`)
 			AND COALESCE(basis_message_id,'') = $4`, uid, note, in.Text, in.BasisMessageID).Scan(&id)
 		if err == nil {
@@ -251,6 +274,18 @@ func (s *Service) SaveCommitment(ctx context.Context, uid uuid.UUID, in SaveComm
 		}
 		if !postgres.IsNoRows(err) {
 			return err
+		}
+		// a commitment from the chat linked to this message keeps its own words: the thread read again does not
+		// add the collector's version of it (decision 57)
+		if in.BasisMessageID != "" {
+			err = tx.QueryRow(ctx, `SELECT id FROM commitments WHERE user_id = $1 AND note_id = $2 AND origin = 'chat' AND basis_message_id = $3
+				AND direction = $4 LIMIT 1`, uid, note, in.BasisMessageID, in.Direction).Scan(&id)
+			if err == nil {
+				return nil
+			}
+			if !postgres.IsNoRows(err) {
+				return err
+			}
 		}
 		var person *uuid.UUID
 		if email := strings.ToLower(strings.TrimSpace(in.PersonEmail)); strings.Contains(email, "@") {
@@ -270,7 +305,103 @@ func (s *Service) SaveCommitment(ctx context.Context, uid uuid.UUID, in SaveComm
 	if err == nil {
 		s.publish(ctx, events.CommitmentsChanged, uid)
 	}
+	if in.SameAs != nil && err == nil {
+		id = *in.SameAs
+	}
 	return id, err
+}
+
+// linkChatCommitment gives an open commitment from the chat without a note the note and the basis the collector
+// found it by; the person and the due day are added when it had none (decision 57).
+func linkChatCommitment(ctx context.Context, tx pgx.Tx, uid, id, note uuid.UUID, in SaveCommitment) error {
+	var hasPerson, linked bool
+	err := tx.QueryRow(ctx, `SELECT person_id IS NOT NULL, note_id IS NOT NULL FROM commitments
+		WHERE user_id = $1 AND id = $2 AND origin = 'chat' AND state = 'open' AND direction = $3 AND (note_id IS NULL OR note_id = $4)
+		FOR UPDATE`, uid, id, in.Direction, note).Scan(&hasPerson, &linked)
+	if postgres.IsNoRows(err) {
+		return apperr.Unprocessable("invalid_same_as", "sameAs is not an open commitment from the chat without a note in the same direction").With("field", "sameAs")
+	}
+	if err != nil {
+		return err
+	}
+	if linked { // the same thread again, or a parallel batch: already done
+		return nil
+	}
+	var person *uuid.UUID
+	if email := strings.ToLower(strings.TrimSpace(in.PersonEmail)); !hasPerson && strings.Contains(email, "@") {
+		pid, err := upsertPerson(ctx, tx, uid, email, in.PersonName)
+		if err != nil {
+			return err
+		}
+		person = &pid
+	}
+	var due *time.Time
+	if in.Due != nil {
+		due = &in.Due.Time
+	}
+	_, err = tx.Exec(ctx, `UPDATE commitments SET note_id = $3, basis_message_id = NULLIF($4,''), person_id = COALESCE(person_id, $5),
+		due = COALESCE(due, $6), updated_at = now() WHERE user_id = $1 AND id = $2`, uid, id, note, in.BasisMessageID, person, due)
+	return err
+}
+
+// ChatCommitment is a commitment the personal agent creates in the chat after the user's yes (decision 57).
+type ChatCommitment struct {
+	Text      string
+	Direction string
+	// Person is a person of the user's memory; PersonEmail adds a new one when no person matched.
+	Person      *uuid.UUID
+	PersonEmail string
+	Due         *Date
+	// Conversation is where it was created; uuid.Nil for a run of a task.
+	Conversation uuid.UUID
+}
+
+// CreateCommitment saves a commitment from the chat: origin chat, no note (R11).
+func (s *Service) CreateCommitment(ctx context.Context, uid uuid.UUID, in ChatCommitment) (*Commitment, error) {
+	in.Text = clipRunes(masked(strings.TrimSpace(in.Text)), MaxText)
+	if in.Text == "" {
+		return nil, apperr.Unprocessable("invalid_commitment", "the text is required")
+	}
+	if in.Direction != Mine && in.Direction != Theirs {
+		return nil, apperr.Unprocessable("invalid_commitment", "direction is mine or theirs")
+	}
+	var out *Commitment
+	err := s.as(ctx, uid, func(tx pgx.Tx) error {
+		person := in.Person
+		if email := strings.ToLower(strings.TrimSpace(in.PersonEmail)); person == nil && strings.Contains(email, "@") {
+			pid, err := upsertPerson(ctx, tx, uid, email, "")
+			if err != nil {
+				return err
+			}
+			person = &pid
+		}
+		var due *time.Time
+		if in.Due != nil {
+			due = &in.Due.Time
+		}
+		var conv *uuid.UUID
+		if in.Conversation != uuid.Nil {
+			conv = &in.Conversation
+		}
+		// a repeated call (a retry, a second "yes") returns the open commitment already saved
+		var id uuid.UUID
+		err := tx.QueryRow(ctx, `SELECT id FROM commitments WHERE user_id = $1 AND origin = 'chat' AND state = 'open' AND direction = $2
+			AND lower(`+postgres.Fold("text")+`) = lower(`+postgres.Fold("$3")+`) AND person_id IS NOT DISTINCT FROM $4 LIMIT 1`,
+			uid, in.Direction, in.Text, person).Scan(&id)
+		if postgres.IsNoRows(err) {
+			err = tx.QueryRow(ctx, `INSERT INTO commitments (user_id, text, direction, person_id, due, origin, conversation_id)
+				VALUES ($1,$2,$3,$4,$5,'chat',$6) RETURNING id`, uid, in.Text, in.Direction, person, due, conv).Scan(&id)
+		}
+		if err != nil {
+			return err
+		}
+		out, err = scanCommitment(tx.QueryRow(ctx, `SELECT `+commitmentCols+commitmentFrom+` WHERE c.user_id = $1 AND c.id = $2`, uid, id), s.clock())
+		return err
+	})
+	if err == nil {
+		s.publish(ctx, events.CommitmentsChanged, uid)
+	}
+	return out, err
 }
 
 // CommitmentPatch changes a commitment: its state, its due day (R12).
@@ -388,4 +519,37 @@ func (s *Service) Digest(ctx context.Context, uid uuid.UUID, period string, toda
 		out = append(out, groups[g]...)
 	}
 	return out, nil
+}
+
+// noteRef is the note of a digest item; empty for a commitment from the chat without a note.
+func noteRef(id *uuid.UUID) string {
+	if id == nil {
+		return ""
+	}
+	return id.String()
+}
+
+// maxChatCommitments bounds the commitments from the chat a batch shows the collector (decision 57).
+const maxChatCommitments = 50
+
+// chatCommitments are the open commitments from the chat without a note, the newest first.
+func (s *Service) chatCommitments(ctx context.Context, uid uuid.UUID, limit int) ([]Commitment, error) {
+	out := []Commitment{}
+	err := s.as(ctx, uid, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT `+commitmentCols+commitmentFrom+` WHERE c.user_id = $1 AND c.note_id IS NULL AND c.state = 'open'
+			ORDER BY c.created_at DESC LIMIT $2`, uid, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			c, err := scanCommitment(rows, time.Time{})
+			if err != nil {
+				return err
+			}
+			out = append(out, *c)
+		}
+		return rows.Err()
+	})
+	return out, err
 }

@@ -537,7 +537,7 @@ func (s *Service) spec(ctx context.Context, c *Connection, model, thinking strin
 		thinking = "off"
 	}
 	return agent.ModelSpec{Provider: "nabu-" + strings.ReplaceAll(c.ID.String(), "-", "")[:12], ConnectionID: c.ID.String(),
-		API: c.api, BaseURL: base, ModelID: model, Thinking: thinking, Models: c.Models}, key, nil
+		API: c.api, BaseURL: base, ModelID: model, Thinking: thinking, Models: c.Models, ConnectionType: c.Type}, key, nil
 }
 
 // ErrNotConfigured is agent_not_configured (MOD-06).
