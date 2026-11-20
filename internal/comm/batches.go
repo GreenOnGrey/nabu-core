@@ -98,6 +98,18 @@ func (s *Service) CreateBatches(ctx context.Context, uid uuid.UUID, taskRun *uui
 	}
 	var ids []uuid.UUID
 	err := s.as(ctx, uid, func(tx pgx.Tx) error {
+		// the batches of a user and a compaction exclude each other under one lock (FTR.NAB.MEM-0001 R13): a
+		// compaction that started while the tick read the sources makes the tick wait
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('nabu:comm:batches:' || $1::text))`, uid); err != nil {
+			return err
+		}
+		var compacting bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM comm_batches WHERE user_id = $1 AND kind = 'compact' AND status IN ('queued','running'))`, uid).Scan(&compacting); err != nil {
+			return err
+		}
+		if compacting {
+			return ErrCompacting
+		}
 		if _, err := tx.Exec(ctx, `INSERT INTO comm_cursors (user_id, item_id, source, cursor, pending_cursor) VALUES ($1,$2,$3,'',$4)
 			ON CONFLICT (user_id, item_id, source) DO UPDATE SET pending_cursor = EXCLUDED.pending_cursor`, uid, item, source, cursor); err != nil {
 			return err

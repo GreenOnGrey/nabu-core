@@ -453,13 +453,23 @@ func (s *Service) SaveNote(ctx context.Context, uid uuid.UUID, in SaveNote) (*Sa
 	res := &Saved{}
 	err := s.as(ctx, uid, func(tx pgx.Tx) error {
 		var gone bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM comm_tombstones WHERE user_id = $1 AND item_id = $2 AND source = $3 AND thread_key = $4 AND day_key = $5)`,
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM comm_tombstones WHERE user_id = $1 AND item_id = $2 AND source = $3 AND thread_key = $4 AND day_key = $5)
+				OR EXISTS (SELECT 1 FROM comm_tombstones t WHERE t.user_id = $1 AND t.item_id = $2 AND t.source = $3 AND t.thread_key = $4
+					AND `+tombstoneCovers("$5")+`)`,
 			uid, in.ItemID, in.Source, in.ThreadKey, in.DayKey).Scan(&gone); err != nil {
 			return err
 		}
 		if gone {
 			res.Skipped = true
 			return nil
+		}
+		// FTR.NAB.MEM-0001 R11: a message of a period already compacted goes into the record of that period as a
+		// block «Added by the collection», never a new record of a day inside it
+		late := false
+		if key, ok, err := coveringKey(ctx, tx, uid, in.ItemID, in.Source, in.ThreadKey, in.DayKey); err != nil {
+			return err
+		} else if ok {
+			in.DayKey, late = key, true
 		}
 		first, last := span(in.Messages, s.clock())
 		var edited bool
@@ -495,12 +505,12 @@ func (s *Service) SaveNote(ctx context.Context, uid uuid.UUID, in SaveNote) (*Sa
 		}
 		if !res.Created {
 			switch {
-			case edited && res.NewMessages > 0:
+			case (edited || late) && res.NewMessages > 0:
 				b, _ := json.Marshal([]Appended{{At: s.clock().UTC(), Text: in.Summary}})
 				if _, err := tx.Exec(ctx, `UPDATE comm_notes SET appended = appended || $3::jsonb, updated_at = now() WHERE user_id = $1 AND id = $2`, uid, res.ID, b); err != nil {
 					return err
 				}
-			case !edited:
+			case !edited && !late:
 				if _, err := tx.Exec(ctx, `UPDATE comm_notes SET title = $3, summary = $4, updated_at = now() WHERE user_id = $1 AND id = $2`, uid, res.ID, in.Title, in.Summary); err != nil {
 					return err
 				}
@@ -514,7 +524,7 @@ func (s *Service) SaveNote(ctx context.Context, uid uuid.UUID, in SaveNote) (*Sa
 		}
 		// Tags: the collector's set replaces the tags of a note the user did
 		// not touch; an edited note only gains tags.
-		if !edited {
+		if !edited && !late {
 			if _, err := tx.Exec(ctx, `DELETE FROM comm_note_tags WHERE user_id = $1 AND note_id = $2`, uid, res.ID); err != nil {
 				return err
 			}

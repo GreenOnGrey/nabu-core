@@ -152,6 +152,13 @@ type Config struct {
 	MemoryRunTimeout         time.Duration
 	MemoryBackfillDays       int
 	MemoryHousekeepingEvery  time.Duration
+	// FTR.NAB.MEM-0001 tech §10: the compaction of the records
+	MemoryCompactEnabled     bool
+	MemoryCompactEvery       time.Duration
+	MemoryCompactConcurrency int
+	MemoryCompactGroups      int
+	MemoryCompactTimeout     time.Duration
+	MemoryCompactMaxKey      int
 	MemoryBackfillPoolShare  float64
 	MemoryEmbedBatch         int
 	MemoryGmailOverlap       time.Duration
@@ -419,8 +426,14 @@ func Load() (*Config, error) {
 		MemoryGraphMaxEdges:      p.int("MEMORY_GRAPH_MAX_EDGES", 600),
 		MemoryCollectConcurrency: p.int("MEMORY_COLLECT_CONCURRENCY", 40), MemoryBatchThreads: p.int("MEMORY_BATCH_THREADS", 8),
 		MemoryRunTimeout: p.dur("MEMORY_RUN_TIMEOUT", "20m"), MemoryBackfillDays: p.int("MEMORY_BACKFILL_DAYS", 30),
-		MemoryHousekeepingEvery: p.dur("MEMORY_HOUSEKEEPING_EVERY", "10m"),
-		MemoryBackfillPoolShare: p.float("MEMORY_BACKFILL_POOL_SHARE", 0.3), MemoryEmbedBatch: p.int("MEMORY_EMBED_BATCH", 64),
+		MemoryHousekeepingEvery:  p.dur("MEMORY_HOUSEKEEPING_EVERY", "10m"),
+		MemoryCompactEnabled:     p.bool("MEMORY_COMPACT_ENABLED", true),
+		MemoryCompactEvery:       p.dur("MEMORY_COMPACT_EVERY", "10m"),
+		MemoryCompactConcurrency: p.int("MEMORY_COMPACT_CONCURRENCY", 4),
+		MemoryCompactGroups:      p.int("MEMORY_COMPACT_GROUPS", 20),
+		MemoryCompactTimeout:     p.dur("MEMORY_COMPACT_TIMEOUT", "20m"),
+		MemoryCompactMaxKey:      p.int("MEMORY_COMPACT_MAX_KEY_MESSAGES", 20),
+		MemoryBackfillPoolShare:  p.float("MEMORY_BACKFILL_POOL_SHARE", 0.3), MemoryEmbedBatch: p.int("MEMORY_EMBED_BATCH", 64),
 		MemoryGmailOverlap: p.dur("MEMORY_GMAIL_OVERLAP", "24h"),
 		MemoryVKOverlap:    p.dur("MEMORY_VK_OVERLAP", "1h"), MemoryVKChatLimit: p.int("MEMORY_VK_CHAT_LIMIT", 1000),
 		MemoryAgentAddr: strings.TrimRight(os.Getenv("MEMORY_AGENT_ADDR"), "/"),
