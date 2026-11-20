@@ -83,6 +83,9 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 					NewMessageIDs   []string           `json:"newMessageIds"`
 					KnownMessageIDs []string           `json:"knownMessageIds"`
 					Note            any                `json:"note"`
+					// Previous is the last record of the same conversation before this one: the context the
+					// collection continues, not a text to retell (FTR.NAB.MEM-0001 R7)
+					Previous any `json:"previous"`
 				}
 				out := struct {
 					UserEmail       string           `json:"userEmail"`
@@ -103,13 +106,21 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 							people[strings.ToLower(p)] = true
 						}
 						var noteID uuid.UUID
-						var title, summary string
+						var title, summary, level, from, until string
 						var edited bool
-						err := tx.QueryRow(ctx, `SELECT id, title, summary, user_edited FROM comm_notes WHERE user_id = $1 AND item_id = $2 AND source = $3 AND thread_key = $4 AND day_key = $5`,
-							g.UserID, b.ItemID, b.Source, t.Key, t.DayKey).Scan(&noteID, &title, &summary, &edited)
+						// R11: the messages of a compacted period go into the record of that period
+						key := t.DayKey
+						if k, ok, err := coveringKey(ctx, tx, g.UserID, b.ItemID, b.Source, t.Key, t.DayKey); err != nil {
+							return err
+						} else if ok {
+							key = k
+						}
+						err := tx.QueryRow(ctx, `SELECT id, title, summary, user_edited, level, COALESCE(to_char(period_from, 'YYYY-MM-DD'), ''), COALESCE(to_char(period_to, 'YYYY-MM-DD'), '')
+							FROM comm_notes WHERE user_id = $1 AND item_id = $2 AND source = $3 AND thread_key = $4 AND day_key = $5`,
+							g.UserID, b.ItemID, b.Source, t.Key, key).Scan(&noteID, &title, &summary, &edited, &level, &from, &until)
 						known := map[string]bool{}
 						if err == nil {
-							to.Note = map[string]any{"title": title, "summary": summary, "userEdited": edited}
+							to.Note = map[string]any{"title": title, "summary": summary, "userEdited": edited, "level": level, "periodFrom": from, "periodTo": until}
 							rows, err := tx.Query(ctx, `SELECT message_id FROM comm_note_messages WHERE user_id = $1 AND note_id = $2`, g.UserID, noteID)
 							if err != nil {
 								return err
@@ -123,6 +134,11 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 								known[id] = true
 							}
 							rows.Close()
+						}
+						if prev, err := previousRecord(ctx, tx, g.UserID, b.ItemID, b.Source, t.Key, t.DayKey, noteID); err != nil {
+							return err
+						} else if prev != nil {
+							to.Previous = prev
 						}
 						for _, m := range t.Messages {
 							if known[m.ID] {

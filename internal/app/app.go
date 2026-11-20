@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -837,6 +838,20 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 			}
 		}
 	})
+	if cfg.MemoryCompactEnabled { // FTR.NAB.MEM-0001: the nightly compaction of the records
+		g.Go(func() error {
+			t := time.NewTicker(cfg.MemoryCompactEvery)
+			defer t.Stop()
+			for {
+				select {
+				case <-gctx.Done():
+					return nil
+				case <-t.C:
+					c.compactMemory(gctx, cfg)
+				}
+			}
+		})
+	}
 	g.Go(func() error { // the vectors of new and changed notes, and the recount after a change of the model
 		for {
 			n, err := c.comm.EmbedPending(gctx, cfg.MemoryEmbedBatch)
@@ -1234,4 +1249,77 @@ func every(ctx context.Context, d time.Duration, fn func()) {
 			fn()
 		}
 	}
+}
+
+// compactMemory runs the compaction of the users who are in their night (FTR.NAB.MEM-0001 R2–R15, tech §6): at most
+// MEMORY_COMPACT_CONCURRENCY users at a time, each with its own batch beside the collection.
+func (c *core) compactMemory(ctx context.Context, cfg *config.Config) {
+	users, err := c.comm.CompactCandidates(ctx)
+	if err != nil {
+		slog.Warn("compaction: candidates", "err", err)
+		return
+	}
+	if len(users) == 0 {
+		return
+	}
+	st, err := c.comm.LoadSettings(ctx)
+	if err != nil {
+		slog.Warn("compaction: settings", "err", err)
+		return
+	}
+	choice := st.CompactChoice()
+	ccfg := comm.CompactConfig{Groups: cfg.MemoryCompactGroups, Timeout: cfg.MemoryCompactTimeout, MaxKey: cfg.MemoryCompactMaxKey, MaxMessages: 300}
+	sem := make(chan struct{}, max(1, cfg.MemoryCompactConcurrency))
+	var wg sync.WaitGroup
+	for _, uid := range users {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(uid uuid.UUID) {
+			defer func() { <-sem; wg.Done() }()
+			out, err := c.comm.CompactUser(ctx, uid, choice, c.completeCompaction, ccfg, c.auditCompaction)
+			if err != nil {
+				slog.Warn("compaction of a user failed", "user", uid, "err", err)
+			} else if out.Groups > 0 {
+				slog.Info("compaction", "user", uid, "groups", out.Groups, "failed", out.Failed, "charsIn", out.CharsIn, "charsOut", out.CharsOut)
+			}
+		}(uid)
+	}
+	wg.Wait()
+}
+
+// completeCompaction asks the model of the compaction (arch A1, A7): a connection of the OpenAI chat protocol, the
+// cost by the prices of its model.
+func (c *core) completeCompaction(ctx context.Context, ch comm.Choice, system, user string) (string, float64, error) {
+	id, err := uuid.Parse(ch.ConnectionID)
+	if err != nil {
+		return "", 0, fmt.Errorf("the model of the compaction is not set")
+	}
+	spec, key, err := c.models.Resolve(ctx, models.Choice{ConnectionID: id, Model: ch.Model})
+	if err != nil {
+		return "", 0, err
+	}
+	if spec.API != "" && spec.API != "openai-completions" {
+		return "", 0, fmt.Errorf("the connection speaks %s: the compaction needs the OpenAI chat protocol", spec.API)
+	}
+	text, usage, err := (&comm.ChatModel{BaseURL: spec.BaseURL, Key: key, Model: spec.ModelID, Client: &http.Client{Timeout: 5 * time.Minute}}).Complete(ctx, system, user)
+	cost := 0.0
+	if def, _ := c.models.Def(ctx, id, ch.Model); def != nil {
+		cost = (float64(usage.PromptTokens)*def.Cost.Input + float64(usage.CompletionTokens)*def.Cost.Output) / 1e6
+	}
+	return text, cost, err
+}
+
+// auditCompaction writes the compaction of a conversation into the audit (R27): the level and the numbers, «System»
+// on behalf of the user whose records are compacted.
+func (c *core) auditCompaction(ctx context.Context, uid uuid.UUID, level string, counts map[string]int, failed error) {
+	e := ledger.Entry{AgentKind: "service", Agent: engine.CollectorAgent, UserID: &uid, Channel: "memory", Tool: "memory.compact", Result: "ok"}
+	if failed != nil {
+		msg := failed.Error()
+		if r := []rune(msg); len(r) > 300 {
+			msg = string(r[:300])
+		}
+		e.Result, e.Error = "error", &msg
+	}
+	b, _ := json.Marshal(map[string]any{"level": level, "counts": counts, "prompt": comm.CompactPromptVersion})
+	c.ledger.Audit(ctx, e, string(b), nil)
 }

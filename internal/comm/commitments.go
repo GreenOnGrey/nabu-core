@@ -256,6 +256,12 @@ func (s *Service) SaveCommitment(ctx context.Context, uid uuid.UUID, in SaveComm
 	var id uuid.UUID
 	err := s.as(ctx, uid, func(tx pgx.Tx) error {
 		var note uuid.UUID
+		// a late message went into the record of its compacted period (FTR.NAB.MEM-0001 R11): so does its commitment
+		if key, ok, err := coveringKey(ctx, tx, uid, in.ItemID, in.Source, in.ThreadKey, in.DayKey); err != nil {
+			return err
+		} else if ok {
+			in.DayKey = key
+		}
 		err := tx.QueryRow(ctx, `SELECT id FROM comm_notes WHERE user_id = $1 AND item_id = $2 AND source = $3 AND thread_key = $4 AND day_key = $5`,
 			uid, in.ItemID, in.Source, in.ThreadKey, in.DayKey).Scan(&note)
 		if postgres.IsNoRows(err) {

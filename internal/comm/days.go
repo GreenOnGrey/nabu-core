@@ -158,5 +158,5 @@ func foldE(expr string) string {
 // localDay is the date of a time (an SQL expression) in the time zone of the user $1: the dates of the records are
 // in it (comm_refresh_notes).
 func localDay(at string) string {
-	return "(" + at + " AT TIME ZONE (SELECT COALESCE(NULLIF(u.timezone, ''), 'UTC') FROM users u WHERE u.id = $1))::date"
+	return "(" + at + " AT TIME ZONE comm_safe_tz((SELECT u.timezone FROM users u WHERE u.id = $1)))::date"
 }

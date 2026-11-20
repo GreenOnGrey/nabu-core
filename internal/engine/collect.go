@@ -33,7 +33,7 @@ import (
 const CollectorAgent = "memory-collector"
 
 // CollectorInstructionsVersion names the instructions a run worked with.
-const CollectorInstructionsVersion = "4"
+const CollectorInstructionsVersion = "5" // 5: the previous record, late messages and the commitments from the chat (FTR.NAB.MEM-0001 R7, R11; FTR.NAB.CMN-0003 decision 57)
 
 // auditToolError names the class of a failed tool of the collector (FTR.NAB.CMN-0001 R28): R30 keeps the text of
 // the source out of the audit, but a row with an empty error told an administrator nothing at all.
@@ -192,6 +192,8 @@ How to work:
 The note:
 - title: a short name of the conversation, not the subject line with "Re:".
 - summary: what was discussed, what was decided, what stays open. A few short lines, in the language of the conversation. When the batch gives a previous note, write the summary of the whole thread, not only of the news.
+- previous: when the batch gives the previous record of a chat, it is what was discussed before (yesterday, last week). It is context: do not retell it. When a topic goes on, say so in the summary ("continuation of the discussion of the estimate from 12 November"). A commitment in its openCommitments is not saved again: close it with commitment_close when a new message shows it is done.
+- note with a level week or month: the messages are late ones of a period already compacted; write only what they add.
 - people: the participants other than the user, with their names when the messages give them.
 - topics: zero to five, in three steps.
   1) Name the key subjects of the thread yourself from its text: the project, product, client or matter it is about, two or three words each.
@@ -381,6 +383,13 @@ func (e *Engine) Collect(ctx context.Context, u *users.User, ri *tasks.RunInfo) 
 		e.Ledger.Audit(ctx, ledger.Entry{AgentKind: "service", Agent: CollectorAgent, UserID: &u.ID, Channel: "task:" + ri.TaskID.String(),
 			Server: &src.Source, Tool: "memory.collect.changes", Result: "ok"}, string(counts), nil)
 		ids, err := e.Comm.CreateBatches(ctx, u.ID, &ri.RunID, src.ItemID, src.Source, threads, cursor == "", limits.BatchThreads, cs.Cursor)
+		if errors.Is(err, comm.ErrCompacting) {
+			// FTR.NAB.MEM-0001 R13: the records of the user are being compacted; the next tick reads on from the
+			// cursor, as after a busy tick
+			metrics.MemoryCollect.WithLabelValues("busy").Inc()
+			e.auditTick(ctx, u, ri, "ok", "", map[string]int{"compacting": 1})
+			return e.Tasks.Finish(ctx, ri.RunID, true, "busy", "", "", nil)
+		}
 		if err != nil {
 			return err
 		}

@@ -17,12 +17,13 @@ import (
 // allowed callers, and a new one fails the build until it is reviewed here.
 func TestMaintenanceCallers(t *testing.T) {
 	allowed := map[string]bool{
-		"internal/comm/purge.go:Purge":            true,
-		"internal/comm/batches.go:StaleBatches":   true,
-		"internal/comm/batches.go:LostRuns":       true,
-		"internal/comm/vectors.go:EmbedPending":   true,
-		"internal/comm/vectors.go:PendingVectors": true,
-		"internal/comm/days.go:SnapshotLevels":    true,
+		"internal/comm/purge.go:Purge":               true,
+		"internal/comm/batches.go:StaleBatches":      true,
+		"internal/comm/batches.go:LostRuns":          true,
+		"internal/comm/vectors.go:EmbedPending":      true,
+		"internal/comm/vectors.go:PendingVectors":    true,
+		"internal/comm/days.go:SnapshotLevels":       true,
+		"internal/comm/compact.go:CompactCandidates": true,
 	}
 	root := filepath.Join("..", "..")
 	seen := map[string]bool{}
