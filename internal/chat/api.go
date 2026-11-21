@@ -87,6 +87,10 @@ type API struct {
 	// QueueMax bounds the messages waiting in a conversation
 	// (FTR.NAB.CHAT-0004 R4: CHAT_QUEUE_MAX); 0 — no bound.
 	QueueMax int
+	// TurnTimeout bounds a live turn (FTR.NAB.CHAT-0004 R13: TURN_TIMEOUT); 0 —
+	// 30 minutes. An answer older than TurnStale(TurnTimeout) is not being
+	// written by a turn any more.
+	TurnTimeout time.Duration
 	// PreviewOffice: documents and spreadsheets open in the preview; a client
 	// learns it from GET /agent (FTR.HMR.CMN-0007 R26).
 	PreviewOffice bool
@@ -94,6 +98,10 @@ type API struct {
 
 // staleTurn: an answer streaming for longer is not a running turn (R1).
 const staleTurn = 15 * time.Minute
+
+// turnStale is the age after which no live turn writes an answer: the stop of
+// an answer and the sweep of the worker use it (FTR.NAB.CHAT-0004 R13).
+func (a *API) turnStale() time.Duration { return TurnStale(a.TurnTimeout) }
 
 // MinCompact: a shorter context is not compacted (R2, CTX-06).
 const MinCompact = 2000
@@ -765,8 +773,15 @@ func (a *API) Routes(r chi.Router, site bool) {
 		if err != nil {
 			return err
 		}
-		if err := a.Store.RequestStop(r.Context(), p.UserID, id); err != nil {
+		m, err := a.Store.RequestStop(r.Context(), p.UserID, id, a.turnStale())
+		if err != nil {
 			return err
+		}
+		if m.Status == "stopped" {
+			// FTR.NAB.CHAT-0004 R13: no live turn will read the flag — the answer
+			// is over now, and the site learns it as it learns a stopped answer.
+			m.Retryable = true
+			a.Events.Publish(r.Context(), events.Event{Type: events.MessageDone, UserID: &p.UserID, Data: m})
 		}
 		w.WriteHeader(http.StatusAccepted)
 		return nil

@@ -17,6 +17,7 @@ import (
 
 	"github.com/GreenOnGrey/nabu-core/internal/apperr"
 	"github.com/GreenOnGrey/nabu-core/internal/channels"
+	"github.com/GreenOnGrey/nabu-core/internal/domain"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/kafka"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/metrics"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/storage"
@@ -84,7 +85,7 @@ func (a *API) stop(ctx context.Context, in channels.Inbound) string {
 		slog.WarnContext(ctx, "stop: the main conversation", "err", err)
 		return "cmd.stop_failed"
 	}
-	m := a.Store.Running(ctx, c.ID)
+	m := a.Store.Running(ctx, c.ID, a.turnStale())
 	if m == nil {
 		return "cmd.not_running"
 	}
@@ -98,7 +99,7 @@ func (a *API) stop(ctx context.Context, in channels.Inbound) string {
 			return "cmd.stop_forbidden"
 		}
 	}
-	if err := a.Store.RequestStop(ctx, in.UserID, m.ID); err != nil {
+	if _, err := a.Store.RequestStop(ctx, in.UserID, m.ID, TurnStale(a.TurnTimeout)); err != nil {
 		return "cmd.not_running"
 	}
 	return "cmd.stopped"
@@ -154,8 +155,13 @@ func (a *API) command(ctx context.Context, in channels.Inbound) (bool, error) {
 	}
 	switch word {
 	case "/start", "/help":
-		// the standard entry of a bot: every command available to the user
-		a.say(ctx, in.UserID, in.Channel, channels.Help(lang))
+		// the standard entry of a bot: every command available to the user; VK
+		// Teams needs hard line breaks in Markdown (R6)
+		help := channels.Help(lang)
+		if channelLabel(in.Channel) == domain.ChannelVKTeams {
+			help = channels.HelpMarkdown(lang)
+		}
+		a.say(ctx, in.UserID, in.Channel, help)
 		return true, nil
 	case "/new":
 		if _, err := a.Reset(ctx, in.UserID, nil, in.Channel); err != nil {

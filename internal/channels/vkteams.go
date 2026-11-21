@@ -9,8 +9,10 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -130,7 +132,7 @@ func (v *VKTeams) Send(ctx context.Context, chatID, md string) error {
 		return errVKNotConfigured
 	}
 	for _, part := range render.HTMLParts(render.Parse(md), VKTeamsLimit) {
-		m := &botgolang.Message{Chat: botgolang.Chat{ID: chatID}, Text: part, ParseMode: botgolang.ParseModeHTML}
+		m := &botgolang.Message{Chat: botgolang.Chat{ID: chatID}, Text: vkBreaks(part), ParseMode: botgolang.ParseModeHTML}
 		if err := c.SendTextMessage(m); err != nil {
 			metrics.ChannelOutbound.WithLabelValues("vkteams", "error").Inc()
 			return v.scrub(err)
@@ -380,9 +382,12 @@ func (p *VKPoller) private(ctx context.Context, pl botgolang.EventPayload) {
 	_, _ = p.Pool.Exec(ctx, `INSERT INTO channel_contacts (channel, user_id, chat_id) VALUES ('vkteams',$1,$2)
 		ON CONFLICT (channel, user_id) DO UPDATE SET chat_id = EXCLUDED.chat_id, updated_at = now()`, uid, chat)
 	text := strings.TrimSpace(pl.Text)
+	caption := ""
 	var atts []uuid.UUID
+	var files []string // the ids of the parts that came as attachments
 	for _, part := range pl.Parts {
-		if part.Type != botgolang.FILE {
+		// R21: a voice message is a part of its own type, not a file
+		if part.Type != botgolang.FILE && part.Type != botgolang.VOICE {
 			continue
 		}
 		rc, name, err := p.Bot.FetchFile(ctx, part.Payload.FileID)
@@ -390,19 +395,28 @@ func (p *VKPoller) private(ctx context.Context, pl botgolang.EventPayload) {
 			slog.WarnContext(ctx, "vkteams file", "err", err)
 			continue
 		}
-		id, err := p.Attachments.Store(ctx, uid, name, "", rc, -1)
+		mime := ""
+		if part.Type == botgolang.VOICE {
+			name, mime = voiceFile(name) // the recognizer knows a recording by its type
+		}
+		id, err := p.Attachments.Store(ctx, uid, name, mime, rc, -1)
 		rc.Close()
 		switch {
 		case err == nil:
 			atts = append(atts, id)
+			files = append(files, part.Payload.FileID)
 		case tooLarge(err):
 			p.say(ctx, chat, p.Users.Language(ctx, uid), "tg.too_large")
 		default:
 			slog.WarnContext(ctx, "vkteams attachment", "err", err)
 		}
-		if text == "" {
-			text = strings.TrimSpace(part.Payload.Caption)
+		if caption == "" {
+			caption = strings.TrimSpace(part.Payload.Caption)
 		}
+	}
+	text = stripFileLinks(text, files)
+	if text == "" {
+		text = caption
 	}
 	if text == "" && len(atts) == 0 {
 		return
@@ -449,3 +463,64 @@ func (p *VKPoller) group(ctx context.Context, pl botgolang.EventPayload, botID s
 	}
 	p.Bot.Typing(ctx, pl.Chat.ID)
 }
+
+// audioTypes maps the name of a recording to its type: a voice part of VK
+// Teams carries no type, and the recognizer knows a recording by the type or
+// by the extension of its name (FTR.NAB.CHAT-0001 R21).
+var audioTypes = map[string]string{".ogg": "audio/ogg", ".oga": "audio/ogg", ".opus": "audio/ogg",
+	".m4a": "audio/mp4", ".aac": "audio/aac", ".mp3": "audio/mpeg", ".wav": "audio/wav", ".amr": "audio/amr", ".webm": "audio/webm"}
+
+// voiceFile names the recording of a voice part: the name the file service
+// gave it, or "voice.ogg" when that name says nothing about the type.
+func voiceFile(name string) (string, string) {
+	if mime, ok := audioTypes[strings.ToLower(filepath.Ext(name))]; ok {
+		return name, mime
+	}
+	return "voice.ogg", "audio/ogg"
+}
+
+// urlToken is a link in the text of a message.
+var urlToken = regexp.MustCompile(`https?://\S+`)
+
+// stripFileLinks removes the links of the files that came as attachments: VK
+// Teams puts them into the text of the message, and the agent opens the link
+// instead of the file in its space (FTR.NAB.CHAT-0001 R21).
+func stripFileLinks(text string, ids []string) string {
+	if len(ids) == 0 || text == "" {
+		return text
+	}
+	out := urlToken.ReplaceAllStringFunc(text, func(tok string) string {
+		if fileLink(tok, ids) {
+			return ""
+		}
+		return tok
+	})
+	if out == text {
+		return text
+	}
+	out = spaceRun.ReplaceAllString(out, " ")
+	return strings.TrimSpace(out)
+}
+
+// spaceRun is the run of spaces left where a link was taken out of the text.
+var spaceRun = regexp.MustCompile(`[ \t]{2,}`)
+
+// fileLink reports a link of one of the files of the message: it carries the
+// id of the file, or it is the file service of the messenger.
+func fileLink(tok string, ids []string) bool {
+	u, err := url.Parse(tok)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	for _, id := range ids {
+		if id != "" && strings.Contains(tok, id) {
+			return true
+		}
+	}
+	return strings.HasPrefix(u.Hostname(), "files.") && strings.Contains(u.Path, "/get/")
+}
+
+// vkBreaks turns the line breaks of the answer into <br>: the HTML of VK Teams
+// reads a newline of the source as a space, and the commands of /start came in
+// one line (FTR.NAB.CHAT-0001 R6). A paragraph gap becomes two breaks.
+func vkBreaks(s string) string { return strings.ReplaceAll(s, "\n", "<br>") }

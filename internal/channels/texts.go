@@ -142,6 +142,13 @@ func Help(lang string) string {
 	return b.String()
 }
 
+// HelpMarkdown is Help for a channel that renders Markdown (VK Teams): a single
+// newline there is a space, so every line ends with a hard break — otherwise
+// the commands come in one line (FTR.NAB.CHAT-0001 R6).
+func HelpMarkdown(lang string) string {
+	return strings.ReplaceAll(Help(lang), "\n", "\\\n")
+}
+
 // ─── group agents (R16–R17) ─────────────────────────────────────────
 
 // GroupEvent is the bot added to a group.

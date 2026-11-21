@@ -238,7 +238,7 @@ func newCore(ctx context.Context, cfg *config.Config) (*core, error) {
 	c.vk = channels.NewVKTeams()
 	c.chatAPI = &chat.API{Store: c.chat, Pool: pool, Users: c.users, Models: c.models, Bus: producer, Events: pub, S3: s3, MaxFile: cfg.UploadMaxBytes,
 		// FTR.NAB.CHAT-0001 R20: 5 minutes of opus at up to 192 kbit/s
-		MaxVoiceSeconds: cfg.TranscribeMaxSeconds, QueueMax: cfg.ChatQueueMax}
+		MaxVoiceSeconds: cfg.TranscribeMaxSeconds, QueueMax: cfg.ChatQueueMax, TurnTimeout: cfg.TurnTimeout}
 	if cfg.WhisperURL != "" { // the site (api) and the voice messages of messengers (api, worker)
 		c.chatAPI.Whisper = whisper.New(cfg.WhisperURL)
 	}
@@ -442,8 +442,11 @@ type PublicConfig struct {
 	UploadMaxBytes  int64    `json:"uploadMaxBytes"`
 	Voice           bool     `json:"voice"`
 	// VoiceMaxSeconds bounds a recording of the site (FTR.NAB.CHAT-0001 R20).
-	VoiceMaxSeconds int  `json:"voiceMaxSeconds"`
-	Spaces          bool `json:"spaces"`
+	VoiceMaxSeconds int `json:"voiceMaxSeconds"`
+	// TurnStaleSeconds: an answer older than this is not being written any
+	// more (FTR.NAB.CHAT-0004 R13): the site does not wait for it.
+	TurnStaleSeconds int  `json:"turnStaleSeconds"`
+	Spaces           bool `json:"spaces"`
 	// PreviewOffice: documents and spreadsheets open in the preview (FTR.NAB.CHAT-0003 R22).
 	PreviewOffice bool            `json:"previewOffice"`
 	Channels      map[string]bool `json:"channels"`
@@ -553,7 +556,7 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 		}}
 	pubCfg := PublicConfig{AuthProvider: prov.Kind(), ProviderLabel: prov.Label(), AllowedOrg: cfg.GitHubAllowedOrg, Languages: domain.Languages,
 		DefaultLanguage: cfg.DefaultLanguage, UploadMaxBytes: cfg.UploadMaxBytes, Voice: c.chatAPI.Whisper != nil, PreviewOffice: previews.Cfg.Enabled(),
-		VoiceMaxSeconds: c.chatAPI.MaxVoiceSeconds, Spaces: c.space.Enabled,
+		VoiceMaxSeconds: c.chatAPI.MaxVoiceSeconds, TurnStaleSeconds: int(chat.TurnStale(cfg.TurnTimeout).Seconds()), Spaces: c.space.Enabled,
 		Version: version, BootstrapAdminsConfigured: len(cfg.BootstrapAdmins) > 0}
 	if prov.Kind() == "oidc" {
 		pubCfg.AllowedOrg = ""
@@ -835,6 +838,18 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 				return nil
 			case <-t.C:
 				eng.MemoryHousekeeping(gctx)
+			}
+		}
+	})
+	g.Go(func() error { // FTR.NAB.CHAT-0004 R13: the answers that no turn writes any more
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-gctx.Done():
+				return nil
+			case <-t.C:
+				eng.CloseStaleAnswers(gctx)
 			}
 		}
 	})

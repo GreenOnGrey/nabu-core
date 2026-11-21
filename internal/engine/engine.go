@@ -632,12 +632,18 @@ func (e *Engine) HandleInbound(ctx context.Context, key, value []byte) error {
 	}
 	// At-least-once delivery: an answered message is not answered again. An
 	// answer left unfinished by a turn that lost its pod does not count: the
-	// turn waits in the queue to continue it.
+	// turn waits in the queue to continue it (agent_queue.resume). Any other
+	// unfinished answer was left by a turn that died: this delivery closes it
+	// (FTR.NAB.CHAT-0004 R13) instead of leaving the conversation busy forever.
 	if in.RetryOf == nil {
-		var n int
-		_ = e.Pool.QueryRow(ctx, `SELECT count(*) FROM messages m WHERE m.reply_to = $1 AND m.role = 'assistant'
-			AND NOT EXISTS (SELECT 1 FROM agent_queue q WHERE q.resume = m.id)`, userMsg.ID).Scan(&n)
-		if n > 0 {
+		finished, unfinished, err := e.Chat.Answers(ctx, userMsg.ID)
+		if err != nil {
+			return err
+		}
+		for _, id := range unfinished {
+			e.closeAnswer(ctx, u, in.Channel, id)
+		}
+		if finished || len(unfinished) > 0 {
 			e.Chat.Start(ctx, userMsg.ID)
 			e.Pods.Drop(ctx, u.ID, turn.Ref)
 			return nil
@@ -731,6 +737,12 @@ func (e *Engine) HandleInbound(ctx context.Context, key, value []byte) error {
 		skill = *userMsg.Skill
 	}
 	res := e.personalTurn(ctx, lease, asked, u, in.ConversationID, asst.ID, in.Channel, in.ClientID, text, images, author, seg, skill)
+	// FTR.NAB.CHAT-0004 R13: the end of the turn — the answer, its events and
+	// its delivery — is written outside the timeout of the turn. A turn that
+	// ran out of time used to fail to store its own result, and its answer
+	// stayed streaming forever.
+	ctx, finishCancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+	defer finishCancel()
 	if res.podLost {
 		// R5, LC-04: the pod went away before the answer began — the turn goes
 		// back to the queue and continues this answer in a new pod.
@@ -745,7 +757,10 @@ func (e *Engine) HandleInbound(ctx context.Context, key, value []byte) error {
 	}
 	final, err := e.Chat.Finish(ctx, asst.ID, res.text, status, res.steps, res.errClass, res.errText)
 	if err != nil {
-		return err
+		// R13: the last attempt — an answer must not stay streaming forever.
+		slog.ErrorContext(ctx, "finish an answer", "message", asst.ID, "err", err)
+		e.closeAnswer(ctx, u, in.Channel, asst.ID)
+		return nil
 	}
 	final.Retryable = status != "done"
 	metrics.Turns.WithLabelValues(channelLabel(in.Channel), turnLabel[status]).Inc()
@@ -798,10 +813,67 @@ func channelLabel(ch string) string {
 // administrator fixes the connection the retry succeeds (CONV-09).
 func retryable(string) bool { return true }
 
+// closeAnswer closes an answer that no turn writes any more (FTR.NAB.CHAT-0004
+// R13): the user sees the failure and the Retry button, and the conversation
+// stops waiting for the answer. The text and the steps the turn wrote stay.
+func (e *Engine) closeAnswer(ctx context.Context, u *users.User, ch string, id uuid.UUID) {
+	const text = "the turn did not finish: the worker stopped while the answer was being written"
+	class := string(agent.ErrAgentCrashed)
+	final, err := e.Chat.Fail(ctx, id, class, text)
+	if err != nil {
+		slog.WarnContext(ctx, "close an abandoned answer", "message", id, "err", err)
+		return
+	}
+	if final == nil {
+		return // another turn closed the answer meanwhile
+	}
+	e.announceClosed(ctx, u.ID, final, class, text)
+	if domain.Messenger(ch) {
+		e.deliver(ctx, u.ID, ch, errorText(u.Language, class))
+	}
+}
+
+// announceClosed tells the site that an answer is over and why: the failure of
+// its turn (FTR.NAB.CHAT-0004 R13).
+func (e *Engine) announceClosed(ctx context.Context, uid uuid.UUID, m *chat.Message, class, text string) {
+	m.Retryable = true
+	e.publish(ctx, events.ChatError, uid, map[string]any{"messageId": m.ID, "conversationId": m.ConversationID,
+		"errorClass": class, "retryable": true, "text": text})
+	e.publish(ctx, events.MessageDone, uid, m)
+}
+
+// CloseStaleAnswers closes the answers that a dead turn left streaming
+// (FTR.NAB.CHAT-0004 R13): the sweeper of the worker calls it. The age comes
+// from the timeout of a turn: a live turn finishes its answer within it.
+func (e *Engine) CloseStaleAnswers(ctx context.Context) {
+	const text = "the turn did not finish within its time"
+	class := string(agent.ErrAgentCrashed)
+	closed, err := e.Chat.CloseStale(ctx, chat.TurnStale(e.Cfg.TurnTimeout), class, text, 200)
+	if err != nil {
+		slog.WarnContext(ctx, "close stale answers", "err", err)
+		return
+	}
+	for _, a := range closed {
+		e.announceClosed(ctx, a.UserID, &a.Message, class, text)
+		if !domain.Messenger(a.Channel) {
+			continue
+		}
+		u, err := e.Users.Get(ctx, a.UserID)
+		if err != nil || u == nil {
+			continue
+		}
+		e.deliver(ctx, a.UserID, a.Channel, errorText(u.Language, class))
+	}
+}
+
 func (e *Engine) fail(ctx context.Context, u *users.User, msgID uuid.UUID, ch, class, text string, steps []chat.ToolStep) {
 	final, err := e.Chat.Finish(ctx, msgID, "", "failed", steps, class, text)
 	if err != nil {
-		return
+		// R13: a failed answer is no reason to leave the answer streaming.
+		slog.WarnContext(ctx, "fail an answer", "message", msgID, "err", err)
+		if final, err = e.Chat.Fail(ctx, msgID, class, text); err != nil || final == nil {
+			return
+		}
 	}
 	e.publish(ctx, events.ChatError, u.ID, map[string]any{"messageId": msgID, "conversationId": final.ConversationID, "errorClass": class, "retryable": false, "text": text})
 	e.publish(ctx, events.MessageDone, u.ID, final)
