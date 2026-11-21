@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/GreenOnGrey/nabu-core/internal/channels"
+	"github.com/GreenOnGrey/nabu-core/internal/chat"
 	"github.com/GreenOnGrey/nabu-core/internal/domain"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/httpx"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/kafka"
@@ -197,10 +198,10 @@ func TestChatStop(t *testing.T) {
 	r.op.during = func() {
 		var id uuid.UUID
 		_ = pool.QueryRow(ctx, `SELECT id FROM messages WHERE conversation_id = $1 AND role = 'assistant' AND status = 'streaming'`, main.ID).Scan(&id)
-		if err := r.api.Store.RequestStop(ctx, uid, id); err != nil {
+		if _, err := r.api.Store.RequestStop(ctx, uid, id, chat.TurnStale(r.api.TurnTimeout)); err != nil {
 			t.Errorf("STP-01: %v", err)
 		}
-		if err := r.api.Store.RequestStop(ctx, uid, id); err != nil { // STP-04: a repeated request
+		if _, err := r.api.Store.RequestStop(ctx, uid, id, chat.TurnStale(r.api.TurnTimeout)); err != nil { // STP-04: a repeated request
 			t.Errorf("STP-04: again %v", err)
 		}
 		time.Sleep(3 * time.Second) // the turn sees the mark within 2 s
@@ -215,7 +216,7 @@ func TestChatStop(t *testing.T) {
 		t.Fatalf("STP-01, STP-05: %+v", h[0])
 	}
 	// STP-04: a finished answer is not stopped
-	if err := r.api.Store.RequestStop(ctx, uid, h[0].ID); !isCodeErr(err, "not_running") {
+	if _, err := r.api.Store.RequestStop(ctx, uid, h[0].ID, chat.TurnStale(r.api.TurnTimeout)); !isCodeErr(err, "not_running") {
 		t.Fatalf("STP-04: %v", err)
 	}
 	// STP-07: the next prompt tells the agent

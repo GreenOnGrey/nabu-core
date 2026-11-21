@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -459,21 +460,73 @@ func (s *Store) Progress(ctx context.Context, id uuid.UUID, text string, steps [
 	if id == uuid.Nil {
 		return
 	}
-	sb, _ := json.Marshal(steps)
+	sb, _ := json.Marshal(stepsWithoutNUL(steps))
 	_, _ = s.Pool.Exec(ctx, `UPDATE messages SET text = $2, tool_steps = $3
-		WHERE id = $1 AND role = 'assistant' AND status IN ('streaming','pending')`, id, text, sb)
+		WHERE id = $1 AND role = 'assistant' AND status IN ('streaming','pending')`, id, withoutNUL(text), sb)
 }
 
 // Finish stores the final state of an answer.
 func (s *Store) Finish(ctx context.Context, id uuid.UUID, text, status string, steps []ToolStep, errClass, errText string) (*Message, error) {
-	sb, _ := json.Marshal(steps)
+	sb, _ := json.Marshal(stepsWithoutNUL(steps))
 	m, err := scanMsg(s.Pool.QueryRow(ctx, `WITH m AS (UPDATE messages SET text = $2, status = $3, tool_steps = $4,
 		error_class = NULLIF($5,''), error_text = NULLIF($6,'') WHERE id = $1 RETURNING *) SELECT `+msgCols+` FROM m`,
-		id, text, status, sb, errClass, errText))
+		id, withoutNUL(text), status, sb, errClass, withoutNUL(errText)))
 	if err == nil {
 		_, _ = s.Pool.Exec(ctx, `UPDATE conversations SET last_message_at = now() WHERE id = $1`, m.ConversationID)
 	}
 	return m, err
+}
+
+// Fail closes an answer that a turn left unfinished (FTR.NAB.CHAT-0004 R13):
+// the status and the error go in, the text and the steps the turn wrote stay.
+// nil is an answer that is already over or gone — another turn closed it.
+func (s *Store) Fail(ctx context.Context, id uuid.UUID, class, text string) (*Message, error) {
+	if id == uuid.Nil {
+		return nil, nil
+	}
+	m, err := scanMsg(s.Pool.QueryRow(ctx, `WITH m AS (UPDATE messages SET status = 'failed', error_class = NULLIF($2,''), error_text = NULLIF($3,'')
+		WHERE id = $1 AND role = 'assistant' AND status IN ('pending','streaming') RETURNING *) SELECT `+msgCols+` FROM m`,
+		id, class, withoutNUL(text)))
+	if postgres.IsNoRows(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	_, _ = s.Pool.Exec(ctx, `UPDATE conversations SET last_message_at = now() WHERE id = $1`, m.ConversationID)
+	return m, nil
+}
+
+// withoutNUL removes NUL characters: PostgreSQL refuses them both in text and in
+// JSONB (SQLSTATE 22P05), and a result of a tool brings one into the steps of
+// an answer now and then (FTR.NAB.CHAT-0004 R13).
+func withoutNUL(s string) string {
+	if !strings.ContainsRune(s, 0) {
+		return s
+	}
+	return strings.ReplaceAll(s, "\x00", "")
+}
+
+func stepsWithoutNUL(steps []ToolStep) []ToolStep {
+	if len(steps) == 0 {
+		return steps
+	}
+	out := make([]ToolStep, len(steps))
+	for i, s := range steps {
+		s.ID, s.Server, s.Tool = withoutNUL(s.ID), withoutNUL(s.Server), withoutNUL(s.Tool)
+		s.Summary, s.Status = withoutNUL(s.Summary), withoutNUL(s.Status)
+		if len(s.Subagents) > 0 {
+			subs := make([]SubagentTask, len(s.Subagents))
+			for j, t := range s.Subagents {
+				t.Description, t.State = withoutNUL(t.Description), withoutNUL(t.State)
+				t.Error, t.Result = withoutNUL(t.Error), withoutNUL(t.Result)
+				subs[j] = t
+			}
+			s.Subagents = subs
+		}
+		out[i] = s
+	}
+	return out
 }
 
 // SetModel records the model that writes an answer (FTR.NAB.CHAT-0001 R18).
@@ -623,19 +676,132 @@ func (s *Store) Cancel(ctx context.Context, uid, id uuid.UUID) (uuid.UUID, error
 
 // RequestStop marks an answer being written to stop (FTR.NAB.CHAT-0004 R8);
 // the turn sees the mark within seconds. A repeated request is accepted.
-func (s *Store) RequestStop(ctx context.Context, uid, id uuid.UUID) error {
-	tag, err := s.Pool.Exec(ctx, `UPDATE messages m SET stop_requested_at = COALESCE(m.stop_requested_at, now()) FROM conversations c
-		WHERE m.id = $1 AND m.role = 'assistant' AND m.status IN ('pending','streaming') AND c.id = m.conversation_id AND c.user_id = $2`, id, uid)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
+// An answer older than stale is not written by a live turn any more: the flag
+// would be read by nobody, so the answer is stopped at once (R13), and the
+// conversation stops waiting for it. stale comes from TurnStale.
+func (s *Store) RequestStop(ctx context.Context, uid, id uuid.UUID, stale time.Duration) (*Message, error) {
+	m, err := scanMsg(s.Pool.QueryRow(ctx, `UPDATE messages m SET
+		stop_requested_at = COALESCE(m.stop_requested_at, now()),
+		status = CASE WHEN m.created_at < now() - make_interval(secs => $3) THEN 'stopped' ELSE m.status END
+		FROM conversations c
+		WHERE m.id = $1 AND m.role = 'assistant' AND m.status IN ('pending','streaming') AND c.id = m.conversation_id AND c.user_id = $2
+		RETURNING `+msgCols, id, uid, stale.Seconds()))
+	if postgres.IsNoRows(err) {
 		if _, err := s.Message(ctx, uid, id); err != nil {
-			return err
+			return nil, err
 		}
-		return apperr.Conflict("not_running", "the answer is not being written")
+		return nil, apperr.Conflict("not_running", "the answer is not being written")
 	}
-	return nil
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// TurnStaleMargin: how long after the timeout of a turn its answer may still
+// be written by that turn: the end of the turn is written outside the timeout
+// (FTR.NAB.CHAT-0004 R13).
+const TurnStaleMargin = time.Minute
+
+// TurnStale is the age after which no live turn writes an answer. The answer
+// of a turn that ran out of time is finished within the margin; an answer
+// older than that belongs to a turn that died (FTR.NAB.CHAT-0004 R13).
+func TurnStale(turnTimeout time.Duration) time.Duration {
+	if turnTimeout <= 0 {
+		turnTimeout = 30 * time.Minute // TURN_TIMEOUT by default
+	}
+	return turnTimeout + TurnStaleMargin
+}
+
+// Answers returns the answers of a user message: finished reports that one of
+// them is over — the message is answered and a redelivery does not answer it
+// again; unfinished are the answers a turn left behind (FTR.NAB.CHAT-0004 R13).
+func (s *Store) Answers(ctx context.Context, userMsg uuid.UUID) (finished bool, unfinished []uuid.UUID, err error) {
+	rows, err := s.Pool.Query(ctx, `SELECT m.id, m.status FROM messages m WHERE m.reply_to = $1 AND m.role = 'assistant'
+		AND NOT EXISTS (SELECT 1 FROM agent_queue q WHERE q.resume = m.id)`, userMsg)
+	if err != nil {
+		return false, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id uuid.UUID
+		var status string
+		if err := rows.Scan(&id, &status); err != nil {
+			return false, nil, err
+		}
+		if status == "pending" || status == "streaming" {
+			unfinished = append(unfinished, id)
+			continue
+		}
+		finished = true
+	}
+	return finished, unfinished, rows.Err()
+}
+
+// ClosedAnswer is an answer closed by the sweeper: the message and the owner
+// of its conversation (the events go to the owner).
+type ClosedAnswer struct {
+	Message
+	UserID uuid.UUID `json:"-"`
+}
+
+// CloseStale closes the answers that no turn writes any more (FTR.NAB.CHAT-0004
+// R13): a turn that died leaves its answer in pending or streaming, and the
+// conversation counts as busy until the answer is over. At most limit answers
+// per call, oldest first.
+func (s *Store) CloseStale(ctx context.Context, olderThan time.Duration, class, text string, limit int) ([]ClosedAnswer, error) {
+	// an answer waiting for a pod to continue it is alive: the turn is in agent_queue
+	rows, err := s.Pool.Query(ctx, `SELECT m.id, c.user_id FROM messages m JOIN conversations c ON c.id = m.conversation_id
+		WHERE m.role = 'assistant' AND m.status IN ('pending','streaming') AND m.created_at < now() - make_interval(secs => $1)
+		AND NOT EXISTS (SELECT 1 FROM agent_queue q WHERE q.resume = m.id)
+		ORDER BY m.created_at LIMIT $2`, olderThan.Seconds(), limit)
+	if err != nil {
+		return nil, err
+	}
+	owners := map[uuid.UUID]uuid.UUID{}
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id, owner uuid.UUID
+		if err := rows.Scan(&id, &owner); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+		owners[id] = owner
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil || len(ids) == 0 {
+		return nil, err
+	}
+	// the conditional status keeps an answer that a turn finished meanwhile
+	closed, err := s.Pool.Query(ctx, `UPDATE messages m SET status = 'failed', error_class = NULLIF($2,''), error_text = NULLIF($3,'')
+		WHERE m.id = ANY($1) AND m.role = 'assistant' AND m.status IN ('pending','streaming')
+		RETURNING `+msgCols, ids, class, withoutNUL(text))
+	if err != nil {
+		return nil, err
+	}
+	defer closed.Close()
+	var out []ClosedAnswer
+	convs := map[uuid.UUID]bool{}
+	for closed.Next() {
+		m, err := scanMsg(closed)
+		if err != nil {
+			return nil, err
+		}
+		convs[m.ConversationID] = true
+		out = append(out, ClosedAnswer{Message: *m, UserID: owners[m.ID]})
+	}
+	if err := closed.Err(); err != nil {
+		return nil, err
+	}
+	if len(convs) > 0 { // the conversation list shows the last activity
+		ids := make([]uuid.UUID, 0, len(convs))
+		for id := range convs {
+			ids = append(ids, id)
+		}
+		_, _ = s.Pool.Exec(ctx, `UPDATE conversations SET last_message_at = now() WHERE id = ANY($1)`, ids)
+	}
+	return out, nil
 }
 
 // StopRequested reports that the user asked to stop the answer.
@@ -645,11 +811,13 @@ func (s *Store) StopRequested(ctx context.Context, id uuid.UUID) bool {
 	return stop
 }
 
-// Running is the answer being written in the conversation, nil — none.
-func (s *Store) Running(ctx context.Context, conv uuid.UUID) *Message {
+// Running is the answer being written in the conversation, nil — none. An
+// answer older than stale is not a running turn (FTR.NAB.CHAT-0004 R13: the
+// stop takes the age of a turn, not the age of a queue).
+func (s *Store) Running(ctx context.Context, conv uuid.UUID, stale time.Duration) *Message {
 	m, err := scanMsg(s.Pool.QueryRow(ctx, `SELECT `+msgCols+` FROM messages m WHERE m.conversation_id = $1 AND m.role = 'assistant'
 		AND m.status IN ('pending','streaming') AND m.created_at > now() - make_interval(secs => $2)
-		ORDER BY m.created_at DESC LIMIT 1`, conv, staleTurn.Seconds()))
+		ORDER BY m.created_at DESC LIMIT 1`, conv, stale.Seconds()))
 	if err != nil {
 		return nil
 	}
