@@ -408,7 +408,7 @@ func (s *Service) CommitTickCursors(ctx context.Context, uid, taskRun uuid.UUID)
 
 // CommitCursors ends a tick: with every batch done the pending cursors become
 // the cursors; otherwise they are dropped and the next tick repeats from the
-// old ones (R15: nothing is lost, TASK-12).
+// old ones (FTR.NAB.CMN-0003 qa; R15: nothing is lost, TASK-12).
 func (s *Service) CommitCursors(ctx context.Context, uid uuid.UUID, ok bool) error {
 	return s.as(ctx, uid, func(tx pgx.Tx) error {
 		q := `UPDATE comm_cursors SET pending_cursor = NULL WHERE user_id = $1 AND pending_cursor IS NOT NULL`

@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// TG-01, TG-04: the format of the key and its normalization.
+// TG-01, TG-04 (FTR.NAB.CMN-0002 qa): the format of the key and its normalization.
 func TestKeyFormat(t *testing.T) {
 	k := NewKey()
 	if len(k) != 17 || !strings.HasPrefix(k, "NB-") || strings.ContainsAny(k[3:], "0O1IL") {
