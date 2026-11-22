@@ -8,6 +8,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/GreenOnGrey/nabu-core/internal/models"
+	"github.com/GreenOnGrey/nabu-core/internal/platform/agent"
 )
 
 // FTR.NAB.MEM-0001 arch A1: the call of the model of the compaction. A server that does not know response_format
@@ -43,6 +46,61 @@ func TestChatModelComplete(t *testing.T) {
 	m.Model = "long"
 	if _, _, err = m.Complete(context.Background(), "sys", "user"); err == nil || !strings.Contains(err.Error(), "too long") || calls != 1 {
 		t.Fatalf("another 400: %v, %d calls", err, calls)
+	}
+}
+
+// FTR.NAB.MEM-0001 tech, decision 23: the fields of the thinking off travel in both calls of the compaction — with
+// response_format and without it (MEM-CP-32).
+func TestChatModelExtra(t *testing.T) {
+	str := func(s string) *string { return &s }
+	for _, tc := range []struct {
+		name    string
+		conn    string
+		setting *string
+		check   func(map[string]any) bool
+	}{
+		{"deepseek", models.TypeDeepSeek, nil, func(b map[string]any) bool {
+			th, _ := b["thinking"].(map[string]any)
+			return th["type"] == "disabled"
+		}},
+		{"openai chat-template", models.TypeOpenAICompatible, str(models.ThinkingOffChatTemplate), func(b map[string]any) bool {
+			kw, _ := b["chat_template_kwargs"].(map[string]any)
+			return kw["enable_thinking"] == false
+		}},
+		{"openai reasoning-effort", models.TypeOpenAICompatible, str(models.ThinkingOffReasoningEffort), func(b map[string]any) bool {
+			return b["reasoning_effort"] == "none"
+		}},
+		{"openai allow", models.TypeOpenAICompatible, str(models.ThinkingAllow), func(b map[string]any) bool {
+			return b["thinking"] == nil && b["chat_template_kwargs"] == nil && b["reasoning_effort"] == nil
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var bodies []map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var req map[string]any
+				_ = json.NewDecoder(r.Body).Decode(&req)
+				bodies = append(bodies, req)
+				if _, ok := req["response_format"]; ok {
+					http.Error(w, `{"error":"unknown parameter response_format"}`, http.StatusBadRequest)
+					return
+				}
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{}"}}]}`))
+			}))
+			defer srv.Close()
+			spec := agent.ModelSpec{ConnectionType: tc.conn, ModelID: "m", Models: []agent.ModelDef{{ID: "m", Reasoning: true}}}
+			m := &ChatModel{BaseURL: srv.URL, Model: "m", Extra: models.ThinkingBody(spec, tc.setting)}
+			if _, _, err := m.Complete(context.Background(), "sys", "user"); err != nil {
+				t.Fatal(err)
+			}
+			if len(bodies) != 2 {
+				t.Fatalf("%d calls", len(bodies))
+			}
+			for _, b := range bodies {
+				if !tc.check(b) {
+					t.Fatalf("the fields are not in the body: %+v", b)
+				}
+			}
+		})
 	}
 }
 

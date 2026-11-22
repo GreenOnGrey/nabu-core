@@ -264,7 +264,7 @@ func TestChatCommitmentsRetention(t *testing.T) {
 	}
 }
 
-// ADM-07 (R29, tech decision 58): thinkingOff takes a way or null.
+// ADM-07 (R29, tech decision 58): thinkingOff takes a value or null.
 func TestCommThinkingOffSetting(t *testing.T) {
 	ctx := context.Background()
 	s := commStore(t)
@@ -278,6 +278,12 @@ func TestCommThinkingOffSetting(t *testing.T) {
 	}
 	if st, _ = s.LoadSettings(ctx); st.ThinkingOff == nil || *st.ThinkingOff != "chat-template" {
 		t.Fatal("not stored")
+	}
+	for _, v := range []string{"provider", "reasoning-effort", "allow"} {
+		st, err = s.SaveSettings(ctx, comm.SettingsPatch{ThinkingOff: []byte(`"` + v + `"`)})
+		if err != nil || st.ThinkingOff == nil || *st.ThinkingOff != v {
+			t.Fatalf("%s: %+v %v", v, st.ThinkingOff, err)
+		}
 	}
 	if st, err = s.SaveSettings(ctx, comm.SettingsPatch{}); err != nil || st.ThinkingOff == nil {
 		t.Fatal("a patch without the field changed it")

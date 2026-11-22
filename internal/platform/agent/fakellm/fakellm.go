@@ -66,6 +66,7 @@ type Request struct {
 	// How the request switches the thinking of the model (FTR.NAB.CMN-0003 tech, decision 58).
 	ChatTemplateKwargs map[string]any `json:"chat_template_kwargs"`
 	ReasoningEffort    *string        `json:"reasoning_effort"`
+	Thinking           map[string]any `json:"thinking"`
 }
 
 // ToolNames lists the tools declared in the request.

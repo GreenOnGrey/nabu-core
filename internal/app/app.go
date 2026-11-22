@@ -1284,6 +1284,10 @@ func (c *core) compactMemory(ctx context.Context, cfg *config.Config) {
 	}
 	choice := st.CompactChoice()
 	ccfg := comm.CompactConfig{Groups: cfg.MemoryCompactGroups, Timeout: cfg.MemoryCompactTimeout, MaxKey: cfg.MemoryCompactMaxKey, MaxMessages: 300}
+	// the same setting of the thinking governs the collection and the compaction (FTR.NAB.MEM-0001 tech, decision 23)
+	complete := func(ctx context.Context, ch comm.Choice, system, user string) (string, float64, error) {
+		return c.completeCompaction(ctx, ch, st.ThinkingOff, system, user)
+	}
 	sem := make(chan struct{}, max(1, cfg.MemoryCompactConcurrency))
 	var wg sync.WaitGroup
 	for _, uid := range users {
@@ -1291,7 +1295,7 @@ func (c *core) compactMemory(ctx context.Context, cfg *config.Config) {
 		wg.Add(1)
 		go func(uid uuid.UUID) {
 			defer func() { <-sem; wg.Done() }()
-			out, err := c.comm.CompactUser(ctx, uid, choice, c.completeCompaction, ccfg, c.auditCompaction)
+			out, err := c.comm.CompactUser(ctx, uid, choice, complete, ccfg, c.auditCompaction)
 			if err != nil {
 				slog.Warn("compaction of a user failed", "user", uid, "err", err)
 			} else if out.Groups > 0 {
@@ -1303,8 +1307,8 @@ func (c *core) compactMemory(ctx context.Context, cfg *config.Config) {
 }
 
 // completeCompaction asks the model of the compaction (arch A1, A7): a connection of the OpenAI chat protocol, the
-// cost by the prices of its model.
-func (c *core) completeCompaction(ctx context.Context, ch comm.Choice, system, user string) (string, float64, error) {
+// cost by the prices of its model. The thinking of the model follows the setting of the memory (FTR.NAB.MEM-0001 tech, decision 23).
+func (c *core) completeCompaction(ctx context.Context, ch comm.Choice, thinkingOff *string, system, user string) (string, float64, error) {
 	id, err := uuid.Parse(ch.ConnectionID)
 	if err != nil {
 		return "", 0, fmt.Errorf("the model of the compaction is not set")
@@ -1316,7 +1320,8 @@ func (c *core) completeCompaction(ctx context.Context, ch comm.Choice, system, u
 	if spec.API != "" && spec.API != "openai-completions" {
 		return "", 0, fmt.Errorf("the connection speaks %s: the compaction needs the OpenAI chat protocol", spec.API)
 	}
-	text, usage, err := (&comm.ChatModel{BaseURL: spec.BaseURL, Key: key, Model: spec.ModelID, Client: &http.Client{Timeout: 5 * time.Minute}}).Complete(ctx, system, user)
+	text, usage, err := (&comm.ChatModel{BaseURL: spec.BaseURL, Key: key, Model: spec.ModelID, Client: &http.Client{Timeout: 5 * time.Minute},
+		Extra: models.ThinkingBody(spec, thinkingOff)}).Complete(ctx, system, user)
 	cost := 0.0
 	if def, _ := c.models.Def(ctx, id, ch.Model); def != nil {
 		cost = (float64(usage.PromptTokens)*def.Cost.Input + float64(usage.CompletionTokens)*def.Cost.Output) / 1e6
