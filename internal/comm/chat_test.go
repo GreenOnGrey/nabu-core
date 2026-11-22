@@ -50,7 +50,7 @@ func TestChatModelComplete(t *testing.T) {
 }
 
 // FTR.NAB.MEM-0001 tech, decision 23: the fields of the thinking off travel in both calls of the compaction — with
-// response_format and without it (MEM-CP-32, ADM-09).
+// response_format and without it (MEM-CP-32).
 func TestChatModelExtra(t *testing.T) {
 	str := func(s string) *string { return &s }
 	for _, tc := range []struct {
