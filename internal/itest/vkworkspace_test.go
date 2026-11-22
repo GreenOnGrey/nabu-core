@@ -2,7 +2,7 @@
 
 package itest
 
-// FTR.NAB.ADM-0001 qa
+// FTR.NAB.ADM-0001 qa; RATE-02, RATE-03 are FTR.NAB.CMN-0003
 
 import (
 	"context"
