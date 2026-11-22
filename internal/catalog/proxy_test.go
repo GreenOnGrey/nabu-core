@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// RATE-02 (FTR.NAB.ADM-0001 tech §4.3): a source of a company system answers the limit of its budget in the
+// RATE-02 (FTR.NAB.CMN-0003 qa; FTR.NAB.ADM-0001 tech §4.3): a source of a company system answers the limit of its budget in the
 // result of a tool, not as HTTP 429 — «Rate limit exceeded for budget "short" (5m0s). Retry in 276 seconds.»
 // The tick reads it as a limit with the wait the server named, not as a failure of the source.
 func TestRateLimitAnswer(t *testing.T) {
