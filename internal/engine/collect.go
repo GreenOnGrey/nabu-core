@@ -648,9 +648,8 @@ func (e *Engine) collectTurn(ctx context.Context, u *users.User, b *comm.Batch, 
 	if err != nil {
 		return "agent_not_configured", err.Error(), total
 	}
-	if st.ThinkingOff != nil { // the thinking of the run is switched off explicitly (FTR.NAB.CMN-0003 tech, decision 58)
-		model = models.WithThinkingOff(model, *st.ThinkingOff)
-	}
+	// the thinking of the run follows the setting of the memory (FTR.NAB.CMN-0003 tech, decision 58)
+	model = models.ApplyThinking(model, st.ThinkingOff)
 	item, err := e.Catalog.Get(ctx, b.ItemID)
 	if err != nil || item == nil {
 		return "source_unavailable", "the source is gone from the catalog", total

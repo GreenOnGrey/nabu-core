@@ -62,9 +62,9 @@ type Settings struct {
 	// environment.
 	RunTimeoutMinutes *int `json:"runTimeoutMinutes"`
 	BatchThreads      *int `json:"batchThreads"`
-	// ThinkingOff is how a run of the collector switches the thinking of an OpenAI-compatible model off
-	// explicitly: models.ThinkingOffChatTemplate or models.ThinkingOffReasoningEffort; nil — at the level off
-	// without a parameter (FTR.NAB.CMN-0003 tech, decision 58).
+	// ThinkingOff is how the collection and the compaction switch the thinking of the model off: a value of
+	// models.ThinkingOffValues; nil — the default of the connection type, off for DeepSeek and Z.AI and allowed
+	// for the others (FTR.NAB.CMN-0003 tech, decision 58; FTR.NAB.MEM-0001 tech, decision 23).
 	ThinkingOff *string `json:"thinkingOff"`
 }
 
@@ -185,7 +185,8 @@ type SettingsPatch struct {
 	// RunTimeoutMinutes and BatchThreads: a number sets the value, null returns the one of the environment.
 	RunTimeoutMinutes json.RawMessage `json:"runTimeoutMinutes"`
 	BatchThreads      json.RawMessage `json:"batchThreads"`
-	// ThinkingOff: a way sets it, null removes it (decision 58).
+	// ThinkingOff: a value of models.ThinkingOffValues sets it, null returns the default of the connection type
+	// (FTR.NAB.CMN-0003 tech, decision 58).
 	ThinkingOff json.RawMessage `json:"thinkingOff"`
 }
 
@@ -240,8 +241,8 @@ func (s *Service) SaveSettings(ctx context.Context, p SettingsPatch) (Settings, 
 		}
 		if len(p.ThinkingOff) > 0 {
 			var way *string
-			if err := json.Unmarshal(p.ThinkingOff, &way); err != nil || (way != nil && !slices.Contains(models.ThinkingOffWays, *way)) {
-				return apperr.Unprocessable("invalid_thinking_off", "thinkingOff is null, "+strings.Join(models.ThinkingOffWays, " or ")).With("field", "thinkingOff")
+			if err := json.Unmarshal(p.ThinkingOff, &way); err != nil || (way != nil && !slices.Contains(models.ThinkingOffValues, *way)) {
+				return apperr.Unprocessable("invalid_thinking_off", "thinkingOff is null, "+strings.Join(models.ThinkingOffValues, " or ")).With("field", "thinkingOff")
 			}
 			st.ThinkingOff = way
 		}

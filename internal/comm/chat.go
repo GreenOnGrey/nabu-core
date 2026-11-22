@@ -18,6 +18,9 @@ type ChatModel struct {
 	Key     string
 	Model   string
 	Client  *http.Client
+	// Extra are fields of the body of every request — the way the model switches its thinking off
+	// (FTR.NAB.MEM-0001 tech, decision 23).
+	Extra map[string]any
 }
 
 // ChatUsage are the tokens of a call.
@@ -47,6 +50,9 @@ func (m *ChatModel) call(ctx context.Context, system, user string, jsonMode bool
 	}
 	if jsonMode {
 		req["response_format"] = map[string]string{"type": "json_object"}
+	}
+	for k, v := range m.Extra {
+		req[k] = v
 	}
 	body, _ := json.Marshal(req)
 	r, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(m.BaseURL, "/")+"/chat/completions", bytes.NewReader(body))
