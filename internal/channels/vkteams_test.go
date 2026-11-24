@@ -1,6 +1,8 @@
 package channels
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -28,6 +30,73 @@ func TestStripFileLinks(t *testing.T) {
 			t.Errorf("%s: %q, want %q", c.name, got, c.want)
 		}
 	}
+}
+
+// FTR.NAB.CMN-0002 VK-02; FTR.NAB.CHAT-0001 R6: the tags of the render are wider than the subset of VK Teams. A part it refuses by
+// its format ("Format error") goes again as plain text: the answer is not lost to markup, and the consumer does not
+// spend its eight attempts on it.
+func TestSendPartsFallback(t *testing.T) {
+	md := "## Итоги\n\n| Сервис | Ошибки |\n|:--|--:|\n| api | 3 |\n\n> цитата\n"
+	t.Run("markup refused, text goes", func(t *testing.T) {
+		var sent []string
+		send := func(text string, html bool) error {
+			if html {
+				return errors.New("vkteams: error status from API: Format error")
+			}
+			sent = append(sent, text)
+			return nil
+		}
+		if err := (&VKTeams{}).sendParts(context.Background(), md, send); err != nil {
+			t.Fatal(err)
+		}
+		if len(sent) == 0 {
+			t.Fatal("nothing was sent")
+		}
+		for _, s := range sent {
+			if strings.ContainsAny(s, "<>") {
+				t.Fatalf("the text carries markup: %q", s)
+			}
+			if !strings.Contains(s, "Итоги") || !strings.Contains(s, "api") {
+				t.Fatalf("the answer is not whole: %q", s)
+			}
+		}
+	})
+	t.Run("markup accepted, html goes", func(t *testing.T) {
+		var html, plain int
+		send := func(_ string, isHTML bool) error {
+			if isHTML {
+				html++
+			} else {
+				plain++
+			}
+			return nil
+		}
+		if err := (&VKTeams{}).sendParts(context.Background(), md, send); err != nil {
+			t.Fatal(err)
+		}
+		if html == 0 || plain != 0 {
+			t.Fatalf("html %d, plain %d", html, plain)
+		}
+	})
+	t.Run("another failure is transient", func(t *testing.T) {
+		send := func(string, bool) error { return errors.New("vkteams: connection reset by peer") }
+		err := (&VKTeams{}).sendParts(context.Background(), md, send)
+		if err == nil {
+			t.Fatal("no error")
+		}
+		var refusal interface{ Permanent() bool }
+		if errors.As(err, &refusal) && refusal.Permanent() {
+			t.Fatal("a network failure is not permanent")
+		}
+	})
+	t.Run("the text is refused too", func(t *testing.T) {
+		send := func(string, bool) error { return errors.New("vkteams: error status from API: Format error") }
+		err := (&VKTeams{}).sendParts(context.Background(), md, send)
+		var refusal interface{ Permanent() bool }
+		if !errors.As(err, &refusal) || !refusal.Permanent() {
+			t.Fatalf("a repeated refusal of the format must not be retried: %v", err)
+		}
+	})
 }
 
 // VOC-16: the recording of a voice part goes to the recognizer by its type.

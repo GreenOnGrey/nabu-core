@@ -151,6 +151,8 @@ func Consume(ctx context.Context, brokers []string, group, topic string, h Handl
 				break
 			}
 			if attempt >= 8 {
+				// FTR.NAB.CMN-0001: the number of losses is visible without a search in the log
+				metrics.KafkaDropped.WithLabelValues(topic).Inc()
 				slog.ErrorContext(ctx, "message dropped after retries", "topic", topic, "offset", m.Offset, "err", err)
 				break
 			}

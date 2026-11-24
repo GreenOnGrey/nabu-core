@@ -404,7 +404,6 @@ func (s *Sandbox) pull(ctx context.Context, local map[string]entry) error {
 func (s *Sandbox) Sync(ctx context.Context) {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
-	var pending []change
 	lastPull := time.Now()
 	var prevSig string
 	for {
@@ -423,14 +422,19 @@ func (s *Sandbox) Sync(ctx context.Context) {
 			prevSig = sig
 			s.lastLocal = time.Now()
 		}
-		pending = cs
-		if len(pending) > 0 && time.Since(s.lastLocal) >= s.cfg.Quiet {
-			if _, err := s.upload(ctx, pending); err != nil {
+		if len(cs) > 0 && time.Since(s.lastLocal) >= s.cfg.Quiet {
+			if _, err := s.upload(ctx, cs); err != nil {
 				slog.Warn("upload", "err", err)
 			}
-			continue
+			// what was just uploaded is known now: the pull below must not take it for a local change
+			if local, err = s.scan(); err != nil {
+				continue
+			}
 		}
-		if len(pending) == 0 && time.Since(lastPull) >= s.cfg.PullEvery {
+		// SPC-09: the pull has a clock of its own. While it waited for the upload path to be free, a sandbox that
+		// writes all the time (a long answer, a build) never saw the files the user uploaded: the agent polled
+		// attachments/ for minutes with the file already in the space.
+		if time.Since(lastPull) >= s.cfg.PullEvery {
 			lastPull = time.Now()
 			if err := s.pull(ctx, local); err != nil {
 				slog.Warn("pull", "err", err)

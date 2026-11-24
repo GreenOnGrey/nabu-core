@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/GreenOnGrey/nabu-core/internal/apperr"
+	"github.com/GreenOnGrey/nabu-core/internal/channels"
 	"github.com/GreenOnGrey/nabu-core/internal/chat"
 	"github.com/GreenOnGrey/nabu-core/internal/comm"
 	"github.com/GreenOnGrey/nabu-core/internal/domain"
@@ -904,6 +905,114 @@ func TestDigestRun(t *testing.T) {
 	if cur, _ := ts.Get(ctx, uid, *mt.TaskID); cur.Failures != 0 || cur.Status != "active" {
 		t.Fatalf("%+v", cur)
 	}
+}
+
+// DIG-05, DIG-06: both digest periods reach VK Teams; an unavailable channel
+// leaves the web copy and marks the run instead of publishing an outbound message.
+func TestDigestDelivery(t *testing.T) {
+	ctx := context.Background()
+	s := commStore(t)
+	on := true
+	if _, err := s.SaveSettings(ctx, comm.SettingsPatch{Enabled: &on}); err != nil {
+		t.Fatal(err)
+	}
+	run := func(t *testing.T, eng *engine.Engine, uid, taskID uuid.UUID) (status, summary string, message *uuid.UUID, deliveryNote *string) {
+		t.Helper()
+		var id uuid.UUID
+		if err := pool.QueryRow(ctx, `INSERT INTO task_runs (task_id, scheduled_for, status) VALUES ($1, now(), 'running') RETURNING id`, taskID).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		b, _ := json.Marshal(tasks.RunMessage{RunID: id, TaskID: taskID, UserID: uid})
+		if err := eng.HandleTaskRun(ctx, []byte(uid.String()), b); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT status, summary, message_id, delivery_note FROM task_runs WHERE id = $1`, id).Scan(&status, &summary, &message, &deliveryNote); err != nil {
+			t.Fatal(err)
+		}
+		return status, summary, message, deliveryNote
+	}
+	prepare := func(t *testing.T, kind string) (uuid.UUID, *tasks.Service, *chat.Store) {
+		t.Helper()
+		uid := newUser(t, "digest-delivery-"+kind+"@x.org")
+		if _, err := pool.Exec(ctx, `UPDATE users SET timezone = 'UTC' WHERE id = $1`, uid); err != nil {
+			t.Fatal(err)
+		}
+		saveNote(t, s, uid, "delivery-"+kind, "Выпуск", "Обсудили выпуск.", []comm.PersonIn{{Email: "petrova@x.org", Name: "Петрова М."}}, nil,
+			comm.Message{ID: "m1", URL: "https://mail.google.com/mail/#all/abc"})
+		now := time.Now().UTC()
+		due := &comm.Date{Time: time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)}
+		if _, err := s.SaveCommitment(ctx, uid, comm.SaveCommitment{ItemID: commItem, Source: "gmail", ThreadKey: "delivery-" + kind,
+			Text: "Отправить смету", Direction: comm.Mine, PersonEmail: "petrova@x.org", Due: due, BasisMessageID: "m1"}); err != nil {
+			t.Fatal(err)
+		}
+		ts := &tasks.Service{Pool: pool, Events: &capture{}, Bus: &bus{}, Rules: tasks.Rules{MinInterval: time.Minute, MaxActive: 5}, Catchup: time.Hour,
+			Tick: time.Second, MaxFailures: 3, DefaultTimezone: "Europe/Moscow"}
+		return uid, ts, &chat.Store{Pool: pool}
+	}
+	for _, kind := range []string{"digest_day", "digest_week"} {
+		t.Run(kind, func(t *testing.T) {
+			uid, ts, store := prepare(t, kind)
+			mt, err := ts.SetMemoryTask(ctx, uid, kind, tasks.MemoryPatch{Enabled: &on, Settings: []byte(`{"channel":"vkteams"}`)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `INSERT INTO channel_contacts (channel, user_id, chat_id) VALUES ('vkteams', $1, 'chat-1')`, uid); err != nil {
+				t.Fatal(err)
+			}
+			out := &bus{}
+			ad := &sendings{kind: domain.ChannelVKTeams}
+			eng := &engine.Engine{Pool: pool, Users: repo(), Chat: store, Tasks: ts, Comm: s, Events: &capture{}, Bus: out,
+				Adapters: map[string]channels.Adapter{domain.ChannelVKTeams: ad}}
+			status, summary, messageID, deliveryNote := run(t, eng, uid, *mt.TaskID)
+			if status != "succeeded" || summary != "items:1" || messageID == nil || deliveryNote != nil {
+				t.Fatalf("digest: %s %q %v %v", status, summary, messageID, deliveryNote)
+			}
+			m, err := store.Message(ctx, uid, *messageID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			main, _ := store.Main(ctx, uid)
+			if m.ConversationID != main.ID || !strings.Contains(m.Text, "Отправить смету") {
+				t.Fatalf("web copy: %+v", m)
+			}
+			var outbound []engine.Outbound
+			for _, raw := range out.msgs {
+				if value, ok := strings.CutPrefix(raw, "nabu.outbound "); ok {
+					var o engine.Outbound
+					if err := json.Unmarshal([]byte(value), &o); err != nil {
+						t.Fatal(err)
+					}
+					outbound = append(outbound, o)
+				}
+			}
+			if len(outbound) != 1 || outbound[0].UserID != uid || outbound[0].Channel != domain.ChannelVKTeams ||
+				!strings.Contains(outbound[0].Text, "Отправить смету") {
+				t.Fatalf("outbound: %+v; all messages: %v", outbound, out.msgs)
+			}
+			b, _ := json.Marshal(outbound[0])
+			if err := eng.HandleOutbound(ctx, nil, b); err != nil || len(ad.sent) != 1 || ad.sent[0] != outbound[0].Text {
+				t.Fatalf("VK Teams delivery: %v %v", err, ad.sent)
+			}
+		})
+	}
+	t.Run("channel_unavailable", func(t *testing.T) {
+		uid, ts, store := prepare(t, "unavailable")
+		mt, err := ts.SetMemoryTask(ctx, uid, "digest_day", tasks.MemoryPatch{Enabled: &on, Settings: []byte(`{"channel":"vkteams"}`)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := &bus{}
+		eng := &engine.Engine{Pool: pool, Users: repo(), Chat: store, Tasks: ts, Comm: s, Events: &capture{}, Bus: out}
+		status, _, messageID, deliveryNote := run(t, eng, uid, *mt.TaskID)
+		if status != "succeeded" || messageID == nil || deliveryNote == nil || *deliveryNote != "channel_unavailable" {
+			t.Fatalf("unavailable channel: %s %v %v", status, messageID, deliveryNote)
+		}
+		for _, raw := range out.msgs {
+			if strings.HasPrefix(raw, "nabu.outbound ") {
+				t.Fatalf("an unavailable channel received an outbound message: %s", raw)
+			}
+		}
+	})
 }
 
 // ISO-04, ISO-07, CMT-05, VIEW-08 (the tool part): the tools of the personal agent.

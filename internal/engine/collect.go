@@ -49,6 +49,9 @@ func auditToolError(class agent.ErrorClass) *string {
 // §6.4): the id of a thread or a chat names the object an administrator looks for and carries no text, while the
 // rest of the arguments of the source tools carry the text of messages and of queries. A call that Pi clipped
 // names no identifiers, and its row stays without arguments.
+// collectorArgSummary keeps what tells one call from another (R30): the identifiers as they are, the other arguments
+// by their shape — a count of items or characters, never the text. A row of comm_note_save names its thread and the
+// size of its summary; a row of comm_batch says that the call takes nothing.
 func collectorArgSummary(raw json.RawMessage) string {
 	raw = unwrapJSON(raw)
 	if len(raw) == 0 {
@@ -59,29 +62,96 @@ func collectorArgSummary(raw json.RawMessage) string {
 		return ""
 	}
 	out := map[string]string{}
+	ids := map[string]string{}
 	for key, v := range in {
-		if !identifierArg(key) {
+		if identifierArg(key) {
+			// an identifier that is empty or broken says nothing; its shape is no better than no row
+			if s, ok := identifierValue(key, v); ok {
+				ids[key] = s
+				out[key] = s
+			}
 			continue
 		}
-		var s string
-		if json.Unmarshal(v, &s) != nil {
-			continue
+		if shape := argShape(v); shape != "" {
+			out[key] = shape
 		}
-		if s == "" || len([]rune(s)) > 200 || strings.ContainsFunc(s, unicode.IsControl) {
-			continue
-		}
-		out[key] = s
 	}
 	if len(out) == 0 {
 		return ""
 	}
-	b, _ := json.Marshal(out)
+	if b := marshalArgs(out); len(b) <= collectorArgsMax {
+		return string(b)
+	}
+	// the shape of every argument does not fit: the identifiers alone, as before
+	if len(ids) == 0 {
+		return ""
+	}
+	b := marshalArgs(ids)
 	if len(b) > collectorArgsMax {
 		// the ledger clips a longer value with an ellipsis, which is no longer JSON: a row that an administrator
 		// cannot read is worse than no row
 		return ""
 	}
 	return string(b)
+}
+
+// marshalArgs writes the summary without the HTML escaping of json.Marshal: "<12 chars>" is read by a person, and
+// \u003c12 chars\u003e is not.
+func marshalArgs(m map[string]string) []byte {
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(m); err != nil {
+		return nil
+	}
+	return bytes.TrimRight(b.Bytes(), "\n")
+}
+
+// identifierValue is the value of an argument that names a thread or a record: short, one line, printable.
+func identifierValue(key string, v json.RawMessage) (string, bool) {
+	if !identifierArg(key) {
+		return "", false
+	}
+	var s string
+	if json.Unmarshal(v, &s) != nil {
+		return "", false
+	}
+	if s == "" || len([]rune(s)) > 200 || strings.ContainsFunc(s, unicode.IsControl) {
+		return "", false
+	}
+	return s, true
+}
+
+// argShape is what an argument looks like without its text: "<12 chars>", "<3 items>", a number, a flag.
+func argShape(v json.RawMessage) string {
+	t := strings.TrimSpace(string(v))
+	switch {
+	case t == "" || t == "null":
+		return "null"
+	case t == "true" || t == "false":
+		return t
+	case t[0] == '"':
+		var s string
+		if json.Unmarshal(v, &s) != nil {
+			return ""
+		}
+		return fmt.Sprintf("<%d chars>", len([]rune(s)))
+	case t[0] == '[':
+		var a []json.RawMessage
+		if json.Unmarshal(v, &a) != nil {
+			return ""
+		}
+		return fmt.Sprintf("<%d items>", len(a))
+	case t[0] == '{':
+		var m map[string]json.RawMessage
+		if json.Unmarshal(v, &m) != nil {
+			return ""
+		}
+		return fmt.Sprintf("<%d keys>", len(m))
+	case len(t) <= 24:
+		return t // a number, or a value that is neither text nor a structure
+	}
+	return ""
 }
 
 // collectorArgsMax stays below ledger.ArgsMax, so the row holds the whole object of identifiers.
@@ -115,7 +185,11 @@ const (
 // identifierArg reports whether an argument names an object rather than carries text: the id of Gmail, the id of
 // the VK mail thread or the chat number of VK Teams (FTR.NAB.CMN-0003 tech §14, decision 47).
 func identifierArg(name string) bool {
-	return name == "id" || name == "chat_sn" || strings.HasSuffix(name, "Id") || strings.HasSuffix(name, "_id")
+	switch name {
+	case "id", "chat_sn", "threadKey", "thread_key", "key", "noteId", "commitmentId":
+		return true
+	}
+	return strings.HasSuffix(name, "Id") || strings.HasSuffix(name, "_id")
 }
 
 // unwrapJSON reads the arguments of a call that came wrapped in a JSON string: an object inside a string named no

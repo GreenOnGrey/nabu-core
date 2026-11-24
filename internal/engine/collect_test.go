@@ -26,22 +26,23 @@ func TestAuditToolError(t *testing.T) {
 // drops the arguments that carry text.
 func TestCollectorArgSummary(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
-		{`{"id":"t1","limit":100}`, `{"id":"t1"}`},                                             // a VK mail thread
-		{`{"threadId":"t1","messageFormat":"FULL_CONTENT"}`, `{"threadId":"t1"}`},              // a Gmail thread
-		{`{"chat_sn":"c1","limit":20,"cursor":"eyJmcm9tX21zZ19pZCI6MX0"}`, `{"chat_sn":"c1"}`}, // a VK chat
-		{`{"query":"Qwerty!2345","from":"a@x.org"}`, ``},                                       // a search: the text of a user
-		{`{"title":"Перенос","summary":"Согласовали"}`, ``},                                    // a note: the text of messages
+		{`{"id":"t1","limit":100}`, `{"id":"t1","limit":"100"}`},                                                                  // a VK mail thread
+		{`{"threadId":"t1","messageFormat":"FULL_CONTENT"}`, `{"messageFormat":"<12 chars>","threadId":"t1"}`},                    // a Gmail thread
+		{`{"chat_sn":"c1","limit":20,"cursor":"eyJmcm9tX21zZ19pZCI6MX0"}`, `{"chat_sn":"c1","cursor":"<23 chars>","limit":"20"}`}, // a VK chat
+		{`{"query":"Qwerty!2345","from":"a@x.org"}`, `{"from":"<7 chars>","query":"<11 chars>"}`},                                 // a search: no text
+		{`{"title":"Перенос","summary":"Согласовали"}`, `{"summary":"<11 chars>","title":"<7 chars>"}`},                           // a note: no text
+		{`{"threadKey":"gmail:t1"}`, `{"threadKey":"gmail:t1"}`},
 		{`{"id":""}`, ``},
 		{`{"id":"a\nb"}`, ``},
 		{`{"id":"` + strings.Repeat("a", 201) + `"}`, ``},
 		{`{"chatId":"c1"}`, `{"chatId":"c1"}`},
-		{`{"threadID":"t1"}`, ``}, // not the suffix the decision names
+		{`{"threadID":"t1"}`, `{"threadID":"<2 chars>"}`},                                              // not the suffix the decision names
 		{`{"id":"` + strings.Repeat("a", 200) + `","chat_sn":"` + strings.Repeat("b", 200) + `"}`, ``}, // above collectorArgsMax
 		{`not json`, ``},
 		// AUD-09: the arguments of a call that came wrapped in a JSON string: an object in a string named no
 		// identifiers, and the row of a read call stayed empty although the server gave the id of the thread.
-		{`"{\"id\":\"t1\",\"limit\":100}"`, `{"id":"t1"}`},
-		{`"{\"summary\":\"Согласовали\"}"`, ``},
+		{`"{\"id\":\"t1\",\"limit\":100}"`, `{"id":"t1","limit":"100"}`},
+		{`"{\"summary\":\"Согласовали\"}"`, `{"summary":"<11 chars>"}`},
 		{`""`, ``},
 		{`"not json"`, ``},
 	} {
@@ -64,7 +65,7 @@ func TestCollectorCallArgs(t *testing.T) {
 
 	var a callArgs
 	a.add(call("c1", "mcp__vk__mail_read_thread", `{"id":"t1","limit":100}`))
-	if got := a.take(result("c1", "mcp__vk__mail_read_thread")); got != `{"id":"t1"}` {
+	if got := a.take(result("c1", "mcp__vk__mail_read_thread")); got != `{"id":"t1","limit":"100"}` {
 		t.Fatalf("by id: %q", got)
 	}
 	if got := a.take(result("c1", "mcp__vk__mail_read_thread")); got != "" {
@@ -90,7 +91,7 @@ func TestCollectorCallArgs(t *testing.T) {
 	// a call without identifiers (a note, a search) and a call of another tool are not mixed up
 	a.add(call("", "mcp__nabu__comm_note_save", `{"summary":"Согласовали"}`))
 	a.add(call("", "mcp__vk__mail_read_thread", `{"id":"t3"}`))
-	if got := a.take(result("", "mcp__nabu__comm_note_save")); got != "" {
+	if got := a.take(result("", "mcp__nabu__comm_note_save")); got != `{"summary":"<11 chars>"}` {
 		t.Fatalf("a note: %q", got)
 	}
 	if got := a.take(result("", "mcp__vk__mail_read_thread")); got != `{"id":"t3"}` {

@@ -705,6 +705,7 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 		}
 		return data, err
 	}))
+	builtin.Register(c.snapshots.WaitTool()) // FTR.NAB.CHAT-0001 R33: a file the user has just uploaded
 	builtin.Register(c.tasks.Tools()...)
 	builtin.Register(c.comm.Tools(func(id uuid.UUID) string {
 		return strings.TrimRight(cfg.PublicWebURL, "/") + "/memory?tab=comm&note=" + id.String()
