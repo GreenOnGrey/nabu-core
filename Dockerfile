@@ -83,7 +83,8 @@ ARG VERSION=dev
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
       poppler-utils qpdf libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0 \
- && rm -rf /var/lib/apt/lists/*
+      fonts-montserrat \
+ && rm -rf /var/lib/apt/lists/* && fc-cache -f
 COPY sandbox/documents /tmp/sandbox
 RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
     cd /tmp/sandbox && uv export --frozen --no-emit-project --format requirements-txt >/tmp/requirements.txt \

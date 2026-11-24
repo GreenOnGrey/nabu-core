@@ -34,6 +34,10 @@ for img in "$base" "$documents"; do
   done
 done
 
+echo "PRF-05: Montserrat in documents (FTR.NAB.CHAT-0005 qa, MNT-03)"
+fonts=$(run "$documents" 'fc-list :lang=ru family')
+grep -q "Montserrat" <<<"$fonts" || fail "PRF-05 $documents: no Montserrat"
+
 echo "PRF-06: no package managers"
 for img in "$base" "$documents"; do
   run "$img" '! command -v pip && ! command -v pip3 && ! command -v npm && ! python3 -m pip --version 2>/dev/null &&
