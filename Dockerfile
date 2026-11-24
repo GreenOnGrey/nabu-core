@@ -14,8 +14,8 @@
 # later than the image: apt-get upgrade brings the security fixes of that day.
 # `make debian-snapshot` moves the image to the latest dated one and the
 # archive to today.
-ARG DEBIAN_IMAGE=debian:trixie-20261104-slim
-ARG DEBIAN_SNAPSHOT=20261116T000000Z
+ARG DEBIAN_IMAGE=debian:trixie-20261123-slim
+ARG DEBIAN_SNAPSHOT=20261124T000000Z
 
 FROM golang:1.27-alpine AS build
 WORKDIR /src
