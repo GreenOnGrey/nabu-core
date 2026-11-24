@@ -26,3 +26,16 @@ func TestPriceKnown(t *testing.T) {
 		}
 	}
 }
+
+// FTR.NAB.CHAT-0001 R16: the user sees a price only when Nabu knows it.
+func TestPriceOf(t *testing.T) {
+	unknown := priceOf(agent.ModelDef{Sources: map[string]string{FCost: SrcDefault}})
+	if unknown != nil {
+		t.Fatalf("a default price is not a price: %+v", unknown)
+	}
+	p := priceOf(agent.ModelDef{Cost: agent.Cost{Input: 3, Output: 6, CacheRead: 0.3, CacheWrite: 3.75},
+		Sources: map[string]string{FCost: SrcProvider}})
+	if p == nil || p.CacheRead != 0.3 || p.CacheWrite != 3.75 {
+		t.Fatalf("the price of a model: %+v", p)
+	}
+}

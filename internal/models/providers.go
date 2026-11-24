@@ -140,6 +140,7 @@ func (s *Service) liteLLMInfo(ctx context.Context, base, key string) map[string]
 				InputCostPerToken       *float64 `json:"input_cost_per_token"`
 				OutputCostPerToken      *float64 `json:"output_cost_per_token"`
 				CacheReadInputTokenCost *float64 `json:"cache_read_input_token_cost"`
+				CacheCreationInputCost  *float64 `json:"cache_creation_input_token_cost"`
 				SupportsVision          *bool    `json:"supports_vision"`
 				SupportsFunctionCalling *bool    `json:"supports_function_calling"`
 				SupportsReasoning       *bool    `json:"supports_reasoning"`
@@ -164,7 +165,7 @@ func (s *Service) liteLLMInfo(ctx context.Context, base, key string) map[string]
 		mi := d.ModelInfo
 		p := &providerInfo{Embeddings: mi.Mode == "embedding", Image: mi.SupportsVision, Tools: mi.SupportsFunctionCalling,
 			Reasoning: mi.SupportsReasoning, ContextWindow: mi.MaxInputTokens, MaxTokens: mi.MaxOutputTokens}
-		if mi.InputCostPerToken != nil || mi.OutputCostPerToken != nil {
+		if mi.InputCostPerToken != nil || mi.OutputCostPerToken != nil || mi.CacheReadInputTokenCost != nil || mi.CacheCreationInputCost != nil {
 			c := agent.Cost{}
 			if mi.InputCostPerToken != nil {
 				c.Input = *mi.InputCostPerToken * 1e6
@@ -174,6 +175,9 @@ func (s *Service) liteLLMInfo(ctx context.Context, base, key string) map[string]
 			}
 			if mi.CacheReadInputTokenCost != nil {
 				c.CacheRead = *mi.CacheReadInputTokenCost * 1e6
+			}
+			if mi.CacheCreationInputCost != nil {
+				c.CacheWrite = *mi.CacheCreationInputCost * 1e6
 			}
 			p.Cost = &c
 		}
