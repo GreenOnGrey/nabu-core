@@ -34,7 +34,7 @@ for img in "$base" "$documents"; do
   done
 done
 
-echo "PRF-05: Montserrat in documents (FTR.NAB.CHAT-0005 qa, MNT-03)"
+echo "PRF-05: Montserrat in documents (FTR.NAB.CHAT-0006 qa, MNT-03)"
 fonts=$(run "$documents" 'fc-list :lang=ru family')
 grep -q "Montserrat" <<<"$fonts" || fail "PRF-05 $documents: no Montserrat"
 
