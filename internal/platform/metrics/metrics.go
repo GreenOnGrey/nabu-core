@@ -19,6 +19,10 @@ var (
 	KafkaLag = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "nabu_kafka_consumer_lag", Help: "Kafka consumer lag by topic.",
 	}, []string{"topic"})
+	// KafkaDropped: a message nothing could handle after the retries; its offset is in the log line beside the counter.
+	KafkaDropped = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_kafka_dropped_total", Help: "Kafka messages dropped after the retries by topic.",
+	}, []string{"topic"})
 	AgentSessions = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "nabu_agent_sessions_active", Help: "Active harness sessions of the agent operator by kind.",
 	}, []string{"kind"})
@@ -184,7 +188,7 @@ func init() {
 
 func init() {
 	Registry.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-		HTTPRequests, HTTPDuration, KafkaLag, AgentSessions, AgentProcessStarts, SubagentRuns, SubagentDuration, SubagentRejected, AgentStalls, LLMRequests, LLMErrors, LLMTokens, LLMCost,
+		HTTPRequests, HTTPDuration, KafkaLag, KafkaDropped, AgentSessions, AgentProcessStarts, SubagentRuns, SubagentDuration, SubagentRejected, AgentStalls, LLMRequests, LLMErrors, LLMTokens, LLMCost,
 		Turns, WorkspaceConnections, WorkspaceCalls, Sandboxes, TaskRuns, ServiceRuns, ChannelMessages,
 		ChannelInbound, ChannelOutbound, EmailAuthRejected, IMAPConnected, VKTeamsPollLag, PendingConfirmations, Users, PurgeDeleted,
 		MemoryMaskedSecrets, MemoryDeniedTools, MemoryDigests, MemorySearch, MemoryCollect, MemoryCollectSeconds, MemoryEmbedPending,

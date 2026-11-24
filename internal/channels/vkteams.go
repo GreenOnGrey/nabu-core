@@ -125,22 +125,66 @@ func (v *VKTeams) Me(context.Context) (*botgolang.BotInfo, error) {
 	return info, nil
 }
 
-// Send implements Adapter: HTML; tables as pre blocks (VK-02).
+// Send implements Adapter: HTML; tables as pre blocks (VK-02). A part VK Teams refuses by its format goes as plain
+// text: the answer reaches the user whatever markup it carries (FTR.NAB.CHAT-0001 R6).
 func (v *VKTeams) Send(ctx context.Context, chatID, md string) error {
 	c, _, _ := v.get()
 	if c == nil {
 		return errVKNotConfigured
 	}
+	return v.sendParts(ctx, md, func(text string, html bool) error {
+		m := &botgolang.Message{Chat: botgolang.Chat{ID: chatID}, Text: text}
+		if html {
+			m.ParseMode = botgolang.ParseModeHTML
+		}
+		return c.SendTextMessage(m)
+	})
+}
+
+// sendParts delivers an answer part by part; send puts one message and returns the error of the messenger. The
+// subset of tags of VK Teams is narrower than what the render writes, and an answer with a table or a quote was
+// refused as a whole ("Format error"): such a part is sent again as plain text, and the retry of the consumer is
+// not spent on markup it would refuse again.
+func (v *VKTeams) sendParts(ctx context.Context, md string, send func(text string, html bool) error) error {
 	for _, part := range render.HTMLParts(render.Parse(md), VKTeamsLimit) {
-		m := &botgolang.Message{Chat: botgolang.Chat{ID: chatID}, Text: vkBreaks(part), ParseMode: botgolang.ParseModeHTML}
-		if err := c.SendTextMessage(m); err != nil {
-			metrics.ChannelOutbound.WithLabelValues("vkteams", "error").Inc()
-			return v.scrub(err)
+		err := send(vkBreaks(part), true)
+		if err != nil {
+			if !formatRefusal(err) {
+				metrics.ChannelOutbound.WithLabelValues("vkteams", "error").Inc()
+				return v.scrub(err)
+			}
+			slog.WarnContext(ctx, "vkteams refused the markup of a part, sending it as text", "err", v.scrub(err))
+			metrics.ChannelOutbound.WithLabelValues("vkteams", "fallback").Inc()
+			plain := render.StripHTML(part)
+			if strings.TrimSpace(plain) == "" {
+				plain = part
+			}
+			if err = send(plain, false); err != nil {
+				metrics.ChannelOutbound.WithLabelValues("vkteams", "error").Inc()
+				if formatRefusal(err) {
+					return permanentRefusal{v.scrub(err)}
+				}
+				return v.scrub(err)
+			}
 		}
 		metrics.ChannelOutbound.WithLabelValues("vkteams", "ok").Inc()
 	}
 	return nil
 }
+
+// formatRefusal reports the answer of the messenger to markup it cannot read: "error status from API: Format error".
+func formatRefusal(err error) bool {
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "format error") || strings.Contains(s, "invalid markup")
+}
+
+// permanentRefusal is a failure the consumer does not retry: the same message would be refused again, and eight
+// attempts hold the partition for minutes.
+type permanentRefusal struct{ err error }
+
+func (p permanentRefusal) Error() string   { return p.err.Error() }
+func (p permanentRefusal) Unwrap() error   { return p.err }
+func (p permanentRefusal) Permanent() bool { return true }
 
 // SendText sends plain text.
 func (v *VKTeams) SendText(_ context.Context, chatID, text string) error {

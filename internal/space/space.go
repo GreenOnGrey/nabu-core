@@ -204,6 +204,20 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// Stat is the record of a file of the space, without reading it.
+func (s *Service) Stat(ctx context.Context, uid uuid.UUID, p string) (File, error) {
+	p, err := CleanPath(p)
+	if err != nil {
+		return File{}, err
+	}
+	var f File
+	if err := s.Pool.QueryRow(ctx, `SELECT path, size, sha256, modified_at, modified_by FROM space_files WHERE user_id = $1 AND path = $2`, uid, p).
+		Scan(&f.Path, &f.Size, &f.SHA256, &f.ModifiedAt, &f.ModifiedBy); err != nil {
+		return File{}, apperr.NotFound("not_found", "file not found")
+	}
+	return f, nil
+}
+
 // Open reads a file.
 func (s *Service) Open(ctx context.Context, uid uuid.UUID, p string) (io.ReadCloser, *File, error) {
 	p, err := CleanPath(p)
@@ -289,6 +303,12 @@ func (s *Service) Routes(r chi.Router) {
 		p, err := httpx.MustPrincipal(r)
 		if err != nil {
 			return err
+		}
+		// a body above the limit is refused before it is read: the client used to send the whole file to learn that
+		// it does not fit, and the stand saw 413 after six seconds of uploading
+		if r.ContentLength > s.MaxFile {
+			return apperr.TooLarge("too_large", fmt.Sprintf("the file is larger than %d MB", s.MaxFile>>20)).
+				With("maxBytes", s.MaxFile)
 		}
 		body := http.MaxBytesReader(w, r.Body, s.MaxFile)
 		f, err := s.Put(r.Context(), p.UserID, r.URL.Query().Get("path"), body, r.ContentLength, "user")
