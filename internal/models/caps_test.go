@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -128,11 +129,13 @@ func TestDiscover(t *testing.T) {
 			_, _ = io.WriteString(w, `{"error":{"message":"invalid key"}}`)
 			return
 		}
-		_, _ = io.WriteString(w, `{"data":[{"id":"vision-x"},{"id":"embed-x"},{"id":"plain"}]}`)
+		_, _ = io.WriteString(w, `{"data":[{"id":"vision-x"},{"id":"cache-x"},{"id":"embed-x"},{"id":"plain"}]}`)
 	})
 	mux.HandleFunc("/litellm/model/info", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, `{"data":[{"model_name":"vision-x","model_info":{"mode":"chat","max_input_tokens":200000,"max_output_tokens":8000,
-			"input_cost_per_token":0.000001,"output_cost_per_token":0.000002,"supports_vision":true,"supports_function_calling":true}},
+			"input_cost_per_token":0.000001,"output_cost_per_token":0.000002,"cache_read_input_token_cost":0.0000001,
+			"cache_creation_input_token_cost":0.0000015,"supports_vision":true,"supports_function_calling":true}},
+			{"model_name":"cache-x","model_info":{"mode":"chat","cache_read_input_token_cost":0.0000003}},
 			{"model_name":"embed-x","model_info":{"mode":"embedding"}}]}`)
 	})
 	mux.HandleFunc("/zai/models", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(404) })
@@ -141,7 +144,7 @@ func TestDiscover(t *testing.T) {
 	s := &Service{}
 	ctx := context.Background()
 	d, err := s.discover(ctx, &Connection{ID: uuid.New(), Type: TypeOpenAICompatible, BaseURL: srv.URL + "/litellm/v1"}, "sk-good-key", nil)
-	if err != nil || !d.Listed || len(d.Models) != 3 {
+	if err != nil || !d.Listed || len(d.Models) != 4 {
 		t.Fatalf("%+v %v", d, err)
 	}
 	by := map[string]agent.ModelDef{}
@@ -151,6 +154,14 @@ func TestDiscover(t *testing.T) {
 	v := by["vision-x"]
 	if !v.HasInput("image") || v.ContextWindow != 200_000 || v.Cost.Input != 1 || v.Sources[FImage] != SrcProvider {
 		t.Fatalf("MDL-02: %+v", v)
+	}
+	// MDL-02: the prices of the cached tokens come with the others, and a model
+	// the provider prices only by its cache still has a price (FTR.NAB.CHAT-0001 R16)
+	if !closeTo(v.Cost.CacheRead, 0.1) || !closeTo(v.Cost.CacheWrite, 1.5) || v.Sources[FCost] != SrcProvider {
+		t.Fatalf("MDL-02: the cache prices: %+v", v.Cost)
+	}
+	if c := by["cache-x"]; !closeTo(c.Cost.CacheRead, 0.3) || c.Sources[FCost] != SrcProvider {
+		t.Fatalf("MDL-02: a cache-only price: %+v", c.Cost)
 	}
 	if Usable(by["embed-x"]) || !Usable(by["plain"]) {
 		t.Fatal("embeddings are not usable by an agent")
@@ -209,3 +220,6 @@ func TestEmbeddingsByName(t *testing.T) {
 		t.Fatalf("an administrator's choice is kept: %+v", kept)
 	}
 }
+
+// closeTo compares prices the provider gave as floats with a long tail.
+func closeTo(a, b float64) bool { return math.Abs(a-b) < 1e-9 }

@@ -740,6 +740,19 @@ type AvailableModel struct {
 	Name         string    `json:"name"`
 	Connection   string    `json:"connection"`
 	Caps         Caps      `json:"caps"`
+	// Price is what a million tokens cost, nil when Nabu does not know it
+	// (FTR.NAB.CHAT-0001 R16): an unknown price is not a free one.
+	Price *agent.Cost `json:"price,omitempty"`
+}
+
+// priceOf is the price of a description for the user: nil when the price is
+// unknown, so a zero is never read as free.
+func priceOf(d agent.ModelDef) *agent.Cost {
+	if !priceKnown(&d) {
+		return nil
+	}
+	c := d.Cost
+	return &c
 }
 
 // AvailableForUsers lists the models a user may choose (R19, MOD-03): models
@@ -768,7 +781,7 @@ func (s *Service) AvailableForUsers(ctx context.Context) ([]AvailableModel, erro
 				if name == "" {
 					name = m.ID
 				}
-				out = append(out, AvailableModel{ConnectionID: a.ConnectionID, Model: a.Model, Name: name, Connection: c.Name, Caps: CapsOf(m)})
+				out = append(out, AvailableModel{ConnectionID: a.ConnectionID, Model: a.Model, Name: name, Connection: c.Name, Caps: CapsOf(m), Price: priceOf(m)})
 			}
 		}
 	}
@@ -805,7 +818,7 @@ func (s *Service) availableOf(ctx context.Context, a *access.Access) ([]Availabl
 		}
 		for _, d := range c.Models {
 			if d.ID == m.Model {
-				out = append(out, AvailableModel{ConnectionID: m.ConnectionID, Model: m.Model, Name: m.Name, Connection: m.Connection, Caps: CapsOf(d)})
+				out = append(out, AvailableModel{ConnectionID: m.ConnectionID, Model: m.Model, Name: m.Name, Connection: m.Connection, Caps: CapsOf(d), Price: priceOf(d)})
 			}
 		}
 	}
@@ -851,7 +864,7 @@ func (s *Service) DefaultFor(ctx context.Context, uid uuid.UUID) (*AvailableMode
 	if c != nil {
 		conn = c.Name
 	}
-	return &AvailableModel{ConnectionID: ch.ConnectionID, Model: d.ID, Name: name, Connection: conn, Caps: CapsOf(*d)}, nil
+	return &AvailableModel{ConnectionID: ch.ConnectionID, Model: d.ID, Name: name, Connection: conn, Caps: CapsOf(*d), Price: priceOf(*d)}, nil
 }
 
 // defaultWithoutChoice recomputes the default of the access without the
