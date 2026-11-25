@@ -625,7 +625,7 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 				c.groups.Routes(r, allowedModel)
 				confirms.Routes(r)
 				c.ledger.UserRoutes(r)
-				r.Get("/events", events.SSEHandler(hub))
+				r.Get("/events", events.SSEHandler(hub, c.pool))
 			})
 		})
 	})
@@ -678,7 +678,7 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 			r.Use(auth.Delegation(c.users, c.registry.Open))
 			chatAPI.Routes(r, false)
 			previews.Routes(r) // FTR.HMR.CMN-0007 R26
-			r.Get("/events", events.SSEHandler(hub))
+			r.Get("/events", events.SSEHandler(hub, c.pool))
 		})
 	})
 	// the webhook is always mounted: the bot may be set in the administration later
@@ -851,6 +851,20 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 				return nil
 			case <-t.C:
 				eng.CloseStaleAnswers(gctx)
+			}
+		}
+	})
+	g.Go(func() error { // FTR.NAB.CMN-0001 tech §3.2, decision 27: the journal of the user stream
+		t := time.NewTicker(10 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-gctx.Done():
+				return nil
+			case <-t.C:
+				if err := events.Cleanup(gctx, c.pool); err != nil {
+					slog.WarnContext(gctx, "clean the journal of events", "err", err)
+				}
 			}
 		}
 	})
