@@ -5,6 +5,10 @@
 // api pod LISTENs and fans them out to its locally connected SSE clients. The
 // worker runs agent turns and publishes their deltas this way, so a user's
 // stream gets them on any api pod (FTR.NAB.CMN-0001 tech §3.2).
+//
+// NOTIFY keeps nothing, so the events a user may miss are also written to the
+// journal (table events) with an id: a reconnecting site sends it back as
+// Last-Event-ID and gets what it missed (tech §3.2, decision 27).
 package events
 
 import (
@@ -56,6 +60,11 @@ type Event struct {
 	UserID *uuid.UUID `json:"userId,omitempty"`
 	RunID  *uuid.UUID `json:"runId,omitempty"`
 	Data   any        `json:"data"`
+	// Seq is the id of the event in the journal: the browser sends it back as
+	// Last-Event-ID, and the missed events are replayed (tech spec §3.2,
+	// decision 27). 0 — the event is not kept: a delta is restored by reading
+	// the message, not by replay.
+	Seq int64 `json:"seq,omitempty"`
 }
 
 // Publisher publishes events to all pods.
@@ -72,6 +81,7 @@ func NewPGPublisher(pool *pgxpool.Pool) *PGPublisher { return &PGPublisher{pool:
 // Publish sends the event; failures are logged, never returned: events are
 // a refresh signal, the source of truth is the database.
 func (p *PGPublisher) Publish(ctx context.Context, e Event) {
+	e.Seq = p.keep(ctx, e)
 	b, err := json.Marshal(e)
 	if err != nil {
 		slog.ErrorContext(ctx, "encode event", "err", err)
@@ -79,7 +89,7 @@ func (p *PGPublisher) Publish(ctx context.Context, e Event) {
 	}
 	if len(b) > maxNotify {
 		slog.WarnContext(ctx, "event too large for NOTIFY, sending its ids", "type", e.Type)
-		b, _ = json.Marshal(Event{Type: e.Type, UserID: e.UserID, RunID: e.RunID, Data: Stub(e.Data)})
+		b, _ = json.Marshal(Event{Type: e.Type, UserID: e.UserID, RunID: e.RunID, Seq: e.Seq, Data: Stub(e.Data)})
 	}
 	if _, err := p.pool.Exec(context.WithoutCancel(ctx), "SELECT pg_notify($1, $2)", channel, string(b)); err != nil {
 		slog.ErrorContext(ctx, "publish event", "err", err, "type", e.Type)
