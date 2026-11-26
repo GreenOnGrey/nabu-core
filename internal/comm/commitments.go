@@ -325,7 +325,7 @@ func linkChatCommitment(ctx context.Context, tx pgx.Tx, uid, id, note uuid.UUID,
 		WHERE user_id = $1 AND id = $2 AND origin = 'chat' AND state = 'open' AND direction = $3 AND (note_id IS NULL OR note_id = $4)
 		FOR UPDATE`, uid, id, in.Direction, note).Scan(&hasPerson, &linked)
 	if postgres.IsNoRows(err) {
-		return apperr.Unprocessable("invalid_same_as", "sameAs is not an open commitment from the chat without a note in the same direction").With("field", "sameAs")
+		return apperr.Unprocessable("invalid_same_as", "sameAs is not an open commitment from the chat (fromChat) without a note in the same direction: pass the id of an openCommitments item with fromChat in the same direction, or omit sameAs when openCommitments has none for this promise").With("field", "sameAs")
 	}
 	if err != nil {
 		return err

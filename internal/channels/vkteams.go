@@ -5,6 +5,7 @@ package channels
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	botgolang "github.com/mail-ru-im/bot-golang"
 	"github.com/sirupsen/logrus"
@@ -143,33 +146,140 @@ func (v *VKTeams) Send(ctx context.Context, chatID, md string) error {
 
 // sendParts delivers an answer part by part; send puts one message and returns the error of the messenger. The
 // subset of tags of VK Teams is narrower than what the render writes, and an answer with a table or a quote was
-// refused as a whole ("Format error"): such a part is sent again as plain text, and the retry of the consumer is
-// not spent on markup it would refuse again.
+// refused as a whole ("Format error"): such a part is sent again as plain text, then in smaller plain chunks. One
+// part the messenger refuses does not take the other parts with it.
 func (v *VKTeams) sendParts(ctx context.Context, md string, send func(text string, html bool) error) error {
+	var partial error
 	for _, part := range render.HTMLParts(render.Parse(md), VKTeamsLimit) {
-		err := send(vkBreaks(part), true)
-		if err != nil {
-			if !formatRefusal(err) {
-				metrics.ChannelOutbound.WithLabelValues("vkteams", "error").Inc()
-				return v.scrub(err)
-			}
-			slog.WarnContext(ctx, "vkteams refused the markup of a part, sending it as text", "err", v.scrub(err))
-			metrics.ChannelOutbound.WithLabelValues("vkteams", "fallback").Inc()
-			plain := render.StripHTML(part)
-			if strings.TrimSpace(plain) == "" {
-				plain = part
-			}
-			if err = send(plain, false); err != nil {
-				metrics.ChannelOutbound.WithLabelValues("vkteams", "error").Inc()
-				if formatRefusal(err) {
-					return permanentRefusal{v.scrub(err)}
-				}
-				return v.scrub(err)
-			}
+		err := v.sendPart(ctx, part, send)
+		if err == nil {
+			continue
 		}
-		metrics.ChannelOutbound.WithLabelValues("vkteams", "ok").Inc()
+		var refusal refuser
+		if !errors.As(err, &refusal) || !refusal.Permanent() {
+			return err // transient: the consumer retries the delivery
+		}
+		if partial == nil {
+			partial = err // the answer is incomplete: the rest of it still goes
+		}
 	}
-	return nil
+	return partial
+}
+
+// sendPart sends one part: as HTML, then as plain text, then as smaller plain
+// chunks. A part of markup only (a rule, a spacer) has nothing to say and is
+// skipped: sending its HTML as plain text is a refusal of the format again.
+func (v *VKTeams) sendPart(ctx context.Context, part string, send func(text string, html bool) error) error {
+	err := send(vkBreaks(part), true)
+	if err == nil {
+		outbound("ok")
+		return nil
+	}
+	if !formatRefusal(err) {
+		return v.failed(err)
+	}
+	slog.WarnContext(ctx, "vkteams refused the markup of a part, sending it as text", "err", v.scrub(err))
+	outbound("fallback")
+	plain := plainText(part)
+	if plain == "" {
+		slog.InfoContext(ctx, "vkteams: a part carries no text, skipped")
+		return nil
+	}
+	if err = send(plain, false); err == nil {
+		outbound("ok")
+		return nil
+	}
+	if !formatRefusal(err) {
+		return v.failed(err)
+	}
+	// The text is refused too. A smaller message may pass, and one bad chunk
+	// does not take the rest of the part with it: the answer of a digest stays
+	// whole for the user even when one of its lines breaks the format.
+	chunks := chunkText(plain, VKTeamsLimit/2)
+	slog.ErrorContext(ctx, "vkteams refused a plain part, sending it in chunks",
+		"len", utf8.RuneCountInString(plain), "chunks", len(chunks), "err", v.scrub(err))
+	failed := 0
+	for _, chunk := range chunks {
+		cerr := send(chunk, false)
+		if cerr == nil {
+			outbound("ok")
+			continue
+		}
+		if !formatRefusal(cerr) {
+			return v.scrub(cerr) // transient: the consumer retries the delivery
+		}
+		failed++
+		outbound("dropped")
+		slog.ErrorContext(ctx, "vkteams refused a chunk of a part, it is lost",
+			"len", utf8.RuneCountInString(chunk), "err", v.scrub(cerr))
+	}
+	if failed == 0 {
+		return nil
+	}
+	if failed == len(chunks) {
+		return permanentRefusal{v.scrub(err)}
+	}
+	return permanentRefusal{fmt.Errorf("vkteams dropped %d of %d chunks of a part: %w", failed, len(chunks), v.scrub(err))}
+}
+
+// plainText is the text of an HTML part without markup: control characters
+// that break the format of the messenger are dropped, lines stay.
+func plainText(part string) string {
+	s := strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n' || r == '\t':
+			return r
+		case unicode.IsControl(r):
+			return -1
+		}
+		return r
+	}, render.StripHTML(part))
+	return strings.TrimSpace(s)
+}
+
+// chunkText cuts plain text into pieces of at most limit runes at a line end,
+// else at a space, else anywhere: nothing is added and nothing is dropped.
+func chunkText(s string, limit int) []string {
+	if limit <= 0 || utf8.RuneCountInString(s) <= limit {
+		return []string{s}
+	}
+	var out []string
+	rest := s
+	for utf8.RuneCountInString(rest) > limit {
+		cut := cutAt(rest, limit)
+		if p := strings.TrimRight(rest[:cut], " \t"); p != "" {
+			out = append(out, p)
+		}
+		rest = strings.TrimLeft(rest[cut:], " \t")
+	}
+	if p := strings.TrimSpace(rest); p != "" {
+		out = append(out, p)
+	}
+	return out
+}
+
+// cutAt is the byte index of a cut of at most limit runes: a line end, else a
+// space, else the limit itself.
+func cutAt(s string, limit int) int {
+	i, n, lineEnd, space := 0, 0, -1, -1
+	for i < len(s) && n < limit {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		i += size
+		n++
+		switch r {
+		case '\n':
+			lineEnd = i
+		case ' ':
+			space = i
+		}
+	}
+	switch {
+	case lineEnd > 0:
+		return lineEnd
+	case space > 0:
+		return space
+	}
+	return i
 }
 
 // formatRefusal reports the answer of the messenger to markup it cannot read: "error status from API: Format error".
@@ -185,6 +295,19 @@ type permanentRefusal struct{ err error }
 func (p permanentRefusal) Error() string   { return p.err.Error() }
 func (p permanentRefusal) Unwrap() error   { return p.err }
 func (p permanentRefusal) Permanent() bool { return true }
+
+// refuser is a failure the consumer does not retry; HandleOutbound reads it.
+type refuser interface{ Permanent() bool }
+
+// outbound counts one delivered, fallen back or dropped piece of an answer.
+func outbound(result string) { metrics.ChannelOutbound.WithLabelValues("vkteams", result).Inc() }
+
+// failed counts an attempt that is neither a format refusal nor a delivery:
+// the consumer retries it.
+func (v *VKTeams) failed(err error) error {
+	outbound("error")
+	return v.scrub(err)
+}
 
 // SendText sends plain text.
 func (v *VKTeams) SendText(_ context.Context, chatID, text string) error {

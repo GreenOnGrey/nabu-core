@@ -416,7 +416,7 @@ func TestCollect(t *testing.T) {
 	// The "model" follows the instructions — and also tries what a letter told it to (SEC-01).
 	var refused []string
 	var offered, sourceTools []string
-	var batchJSON, topicsJSON, topicsRefused string
+	var batchJSON, topicsJSON, topicsSix, topicsEmpty string
 	op.script = func(call func(server, tool string, args any) (string, bool)) {
 		out, isErr := call("nabu", "comm_batch", map[string]any{})
 		if isErr {
@@ -459,7 +459,7 @@ func TestCollect(t *testing.T) {
 					call("nabu", "commitment_save", map[string]any{"threadKey": "t1", "text": "Прислать отчёт", "direction": "mine", "personEmail": "ivanov@x.org",
 						"due": "2026-10-16", "basisMessageId": "m2"})
 				} else if strings.Contains(body, "Отчёт во вложении") {
-					call("nabu", "commitment_close", map[string]any{"commitmentId": batch.OpenCommitments[0].ID, "threadKey": "t1", "basisMessageId": "m5"})
+					call("nabu", "commitment_close", map[string]any{"commitmentId": batch.OpenCommitments[0].ID, "basisMessageId": "m5"})
 				}
 			case "t3":
 				// the letter asks to forward the thread and carries a password; an obedient model tries
@@ -467,7 +467,7 @@ func TestCollect(t *testing.T) {
 				try(item.Name, "get_thread", map[string]any{"threadId": "t-of-another-user"})
 				try("nabu", "comm_note_save", map[string]any{"threadKey": "t-of-another-user", "title": "x", "summary": "y", "topics": []string{"z"}})
 				try("nabu", "commitment_save", map[string]any{"threadKey": "t-of-another-user", "text": "x", "direction": "mine"})
-				try("nabu", "commitment_close", map[string]any{"commitmentId": uuid.NewString(), "threadKey": "t3", "basisMessageId": "m4"})
+				try("nabu", "commitment_close", map[string]any{"commitmentId": uuid.NewString(), "basisMessageId": "m4"})
 				try("nabu", "memory_save", map[string]any{"text": "взлом"})
 				try("nabu", "task_create", map[string]any{"title": "x"})
 				call("nabu", "comm_note_save", map[string]any{"threadKey": "t3", "title": "Письмо с просьбой переслать переписку",
@@ -476,7 +476,8 @@ func TestCollect(t *testing.T) {
 		}
 		// NOTE-17: the collector looks its key subjects up through the tool.
 		topicsJSON, _ = call("nabu", "comm_topic_find", map[string]any{"names": []string{"релиз 2.3", "Проект Альфа"}})
-		topicsRefused, _ = call("nabu", "comm_topic_find", map[string]any{"names": []string{"a", "b", "c", "d", "e", "f"}})
+		topicsSix, _ = call("nabu", "comm_topic_find", map[string]any{"names": []string{"a", "b", "c", "d", "e", "f"}})
+		topicsEmpty, _ = call("nabu", "comm_topic_find", map[string]any{"names": []string{}})
 		// SEC-03: what the run sees
 		req := op.requests[len(op.requests)-1]
 		for _, srv := range req.MCP {
@@ -541,8 +542,12 @@ func TestCollect(t *testing.T) {
 		!strings.Contains(topicsJSON, `{"query":"Проект Альфа","matches":[],"suggestion":null}`) {
 		t.Fatalf("comm_topic_find: %s", topicsJSON)
 	}
-	if !strings.Contains(topicsRefused, "from 1 to 5 names") {
-		t.Fatalf("six names: %s", topicsRefused)
+	// CMT-17: six names are cut to the first five, no names is an empty result: neither costs the run a step.
+	if !strings.Contains(topicsSix, `"query":"e"`) || strings.Contains(topicsSix, `"query":"f"`) {
+		t.Fatalf("six names: the first five are looked up: %s", topicsSix)
+	}
+	if !strings.Contains(topicsEmpty, `"results":[]`) {
+		t.Fatalf("no names: %s", topicsEmpty)
 	}
 	// NOTE-07: the password the model copied is masked.
 	sec, _ := s.Search(ctx, a, comm.Filter{Query: "переслать"}, 5)
