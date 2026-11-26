@@ -194,9 +194,17 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 			}, "names"),
 			func(ctx context.Context, g mcp.Grant, _ *Batch, _ collect.Adapter, args json.RawMessage) (string, error) {
 				var in struct{ Names []string }
-				if err := json.Unmarshal(args, &in); err != nil || len(in.Names) == 0 || len(in.Names) > MaxTopics {
-					return "", &mcp.ToolError{Msg: fmt.Sprintf("give from 1 to %d names", MaxTopics)}
+				if err := json.Unmarshal(args, &in); err != nil {
+					return "", &mcp.ToolError{Msg: "invalid arguments"}
 				}
+				// No names is no subjects to look for, not a failure of the run: an
+				// empty answer costs the collector no step (R8). More than five is
+				// cut: the key subjects of a thread are the first ones it named.
+				if len(in.Names) == 0 {
+					empty, _ := json.Marshal(map[string]any{"results": []any{}})
+					return string(empty), nil
+				}
+				in.Names = in.Names[:min(len(in.Names), MaxTopics)]
 				found, err := s.FindTopics(ctx, g.UserID, in.Names)
 				if err != nil {
 					return "", &mcp.ToolError{Msg: "the topics could not be read"}
@@ -226,7 +234,7 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 				}
 				t := b.thread(in.ThreadKey, in.DayKey)
 				if t == nil {
-					return "", denied("the thread " + in.ThreadKey + " is not in the batch of this run")
+					return "", b.threadRefusal(in.ThreadKey, in.DayKey)
 				}
 				// the participants are those the source named: the model cannot add an address
 				allowed := map[string]bool{}
@@ -297,7 +305,7 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 				}
 				t := b.thread(in.ThreadKey, in.DayKey)
 				if t == nil {
-					return "", denied("the thread " + in.ThreadKey + " is not in the batch of this run")
+					return "", b.threadRefusal(in.ThreadKey, in.DayKey)
 				}
 				sc := SaveCommitment{ItemID: b.ItemID, Source: b.Source, ThreadKey: t.Key, DayKey: t.DayKey, Text: in.Text, Direction: in.Direction}
 				for _, p := range t.Participants {
@@ -336,13 +344,11 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 		tool("commitment_close", "Close an open commitment from the batch's list when a new message shows it is done; name the message.",
 			mcp.Schema(map[string]any{
 				"commitmentId":   map[string]any{"type": "string"},
-				"threadKey":      map[string]any{"type": "string", "description": "The thread of the message that shows it is done"},
-				"dayKey":         map[string]any{"type": "string"},
-				"basisMessageId": map[string]any{"type": "string"},
-			}, "commitmentId", "threadKey", "basisMessageId"),
+				"basisMessageId": map[string]any{"type": "string", "description": "The message that shows it is done, from any thread of the batch"},
+			}, "commitmentId", "basisMessageId"),
 			func(ctx context.Context, g mcp.Grant, b *Batch, _ collect.Adapter, args json.RawMessage) (string, error) {
 				var in struct {
-					CommitmentID, ThreadKey, DayKey, BasisMessageID string
+					CommitmentID, BasisMessageID string
 				}
 				if err := json.Unmarshal(args, &in); err != nil {
 					return "", &mcp.ToolError{Msg: "invalid arguments"}
@@ -351,19 +357,13 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 				if err != nil {
 					return "", &mcp.ToolError{Msg: "invalid commitmentId"}
 				}
-				t := b.thread(in.ThreadKey, in.DayKey)
-				if t == nil {
-					return "", denied("the thread " + in.ThreadKey + " is not in the batch of this run")
+				// FTR.NAB.CMN-0003 R12: the basis is a message of this run — any
+				// thread of it, not only the one the collector named: a commitment
+				// is often closed by a letter of another thread.
+				if b.threadOf(in.BasisMessageID) == nil {
+					return "", denied("the message " + in.BasisMessageID + " is not in the batch of this run: pass basisMessageId of a message that shows the commitment is done, from any thread of the batch (" + b.threadHint() + ")")
 				}
-				basis := ""
-				for _, m := range t.Messages {
-					if m.ID == in.BasisMessageID {
-						basis = m.ID
-					}
-				}
-				if basis == "" {
-					return "", denied("the message is not in the thread: a commitment is closed only by a message of the batch")
-				}
+				basis := in.BasisMessageID
 				// only an open commitment with a participant of the batch — what comm_batch listed
 				people := map[string]bool{}
 				for _, th := range b.Threads {
@@ -382,7 +382,7 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 					}
 				}
 				if !listed {
-					return "", denied("the commitment is not among the open commitments of this batch")
+					return "", denied("the commitment is not among the open commitments of this batch: pass commitmentId of an openCommitments item that comm_batch listed for a participant of a thread of this batch")
 				}
 				done := Done
 				c, err := s.UpdateCommitment(ctx, g.UserID, id, CommitmentPatch{State: &done, CloseBasisMessageID: basis}, ByCollector)

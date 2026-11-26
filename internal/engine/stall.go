@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"log/slog"
+	"time"
 
 	"github.com/GreenOnGrey/nabu-core/internal/channels"
+	"github.com/GreenOnGrey/nabu-core/internal/ledger"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/agent"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/metrics"
 )
@@ -14,6 +16,9 @@ import (
 const (
 	stallRepeatedCall = "repeated_call"
 	stallToolErrors   = "tool_errors"
+	// stallNoOutput is the reason of the silence watchdog (R10): the operator
+	// brought no events for TURN_SILENCE_TIMEOUT.
+	stallNoOutput = "no_output"
 )
 
 // stallPrompt is the wrap-up request of a stopped turn (FTR.NAB.CMN-0010 R4).
@@ -60,13 +65,15 @@ func (d *stallDetector) observe(name, args, result string, isError bool) string 
 func (d *stallDetector) reset() { d.repeats, d.errors = 0, 0 }
 
 // watchStall turns the detector on for the turn of a collector; kind is the
-// label of the counter: personal, group, task or service.
+// label of the counter and of the journal: personal, group, task or service.
+// The kind is kept even with the detector off: the silence watchdog (R10)
+// names it too.
 func (e *Engine) watchStall(col *collector, kind string) {
+	col.stallKind = kind
 	if !e.Cfg.StallDetector {
 		return
 	}
 	col.stall = &stallDetector{repeatLimit: e.Cfg.StallRepeatLimit, errorLimit: e.Cfg.StallErrorLimit}
-	col.stallKind = kind
 }
 
 // observeStall feeds the detector with a finished call and stops the turn when
@@ -117,4 +124,103 @@ func stallNote(col *collector, lang string) {
 		col.handle(agent.Event{Type: agent.EventTextDelta, Delta: "\n\n"})
 	}
 	col.handle(agent.Event{Type: agent.EventTextDelta, Delta: channels.T(lang, "answer.stalled")})
+}
+
+// watchSilence ends a turn whose model request brings nothing for longer than
+// TURN_SILENCE_TIMEOUT (FTR.NAB.CMN-0010 R10). Before this, a provider that
+// stopped answering held the turn silently until TURN_TIMEOUT — half an hour
+// of an empty answer that the user had to stop by hand.
+//
+// A running tool is not silence: while a call of the operator is in flight the
+// turn waits for its answer as long as the tool runs (its own limits bound it).
+// The returned function stops the watchdog and waits for its goroutine.
+func (e *Engine) watchSilence(ctx context.Context, col *collector) func() {
+	limit := e.Cfg.TurnSilenceTimeout
+	if limit <= 0 {
+		return func() {}
+	}
+	if col.lastEvent.Load() == 0 { // no event yet: the count starts now, not in 1970
+		col.touch()
+	}
+	tick := min(limit/4, 15*time.Second)
+	tick = max(tick, 100*time.Millisecond)
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(tick)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			quiet, running := col.quiet()
+			if running || quiet < limit {
+				continue
+			}
+			if !col.silent.CompareAndSwap(false, true) {
+				return
+			}
+			slog.WarnContext(ctx, "agent silent", "agent", col.audit.Agent, "kind", col.stallKind,
+				"quiet", quiet.Round(time.Second), "limit", limit)
+			metrics.AgentStalls.WithLabelValues(col.stallKind, stallNoOutput).Inc()
+			col.abortTurn()
+			return
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+// turnAudit builds the row of a turn that ended as no usual answer
+// (FTR.NAB.CMN-0010 R11); ok is false when the turn ended with a usual answer
+// or when its provider error is already a row of the tool "model"
+// (FTR.NAB.CMN-0001 R28). A turn the user stopped gets its row even then: the
+// stop is the fact an administrator looks for.
+func turnAudit(a ledger.Entry, res turnResult, providerFailed bool) (ledger.Entry, bool) {
+	if res.podLost || (providerFailed && !res.stopped) {
+		return a, false
+	}
+	status := res.status()
+	if status == "done" && res.stalled == "" {
+		return a, false
+	}
+	a.Tool, a.Result = "turn", "error"
+	reason := res.errClass
+	switch {
+	case status == "stopped":
+		reason = "stopped"
+	case res.stalled != "":
+		reason = "stalled:" + res.stalled
+		if status == "done" { // the detector stopped an answer that still finished: not a failure
+			a.Result = "ok"
+		}
+	}
+	if reason == "" {
+		reason = status
+	}
+	a.Error = &reason
+	return a, true
+}
+
+// auditTurn writes the row of a turn that did not end as a usual answer.
+func (e *Engine) auditTurn(ctx context.Context, col *collector, res turnResult) {
+	if e.Ledger == nil {
+		return
+	}
+	a, ok := turnAudit(col.audit, res, col.failure != nil)
+	if !ok {
+		return
+	}
+	e.Ledger.Audit(context.WithoutCancel(ctx), a, "", col.secrets)
+	switch res.status() {
+	case "failed":
+		slog.WarnContext(ctx, "turn ended", "agent", a.Agent, "channel", a.Channel, "status", res.status(), "reason", *a.Error)
+	case "stopped":
+		slog.InfoContext(ctx, "turn ended", "agent", a.Agent, "channel", a.Channel, "status", res.status(), "reason", *a.Error)
+	}
 }

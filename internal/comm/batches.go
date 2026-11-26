@@ -3,6 +3,7 @@ package comm
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"slices"
 	"strings"
 	"time"
@@ -29,13 +30,91 @@ type Batch struct {
 	RunID     *uuid.UUID
 }
 
+// thread is the thread of the batch by its key and day (FTR.NAB.CMN-0003 R6).
+// The day may be left out when the batch has one thread with that key: the
+// collector gets the day from comm_batch and sometimes drops it, and a refusal
+// for that costs a model step. Several days of one key need the day.
 func (b *Batch) thread(key, dayKey string) *collect.Thread {
 	for i := range b.Threads {
 		if b.Threads[i].Key == key && b.Threads[i].DayKey == dayKey {
 			return &b.Threads[i]
 		}
 	}
+	if dayKey != "" || key == "" {
+		return nil
+	}
+	var one *collect.Thread
+	for i := range b.Threads {
+		if b.Threads[i].Key != key {
+			continue
+		}
+		if one != nil {
+			return nil // several days of the same thread: the day is required
+		}
+		one = &b.Threads[i]
+	}
+	return one
+}
+
+// threadOf is the thread of the batch that holds the message, or nil.
+func (b *Batch) threadOf(messageID string) *collect.Thread {
+	if messageID == "" {
+		return nil
+	}
+	for i := range b.Threads {
+		for _, m := range b.Threads[i].Messages {
+			if m.ID == messageID {
+				return &b.Threads[i]
+			}
+		}
+	}
 	return nil
+}
+
+// threadHint names the threads of the batch for a refusal: the collector sees
+// the keys it got wrong and calls comm_batch when it needs the rest.
+func (b *Batch) threadHint() string {
+	if len(b.Threads) == 0 {
+		return "the batch has no threads"
+	}
+	const shown = 3
+	var parts []string
+	for i, t := range b.Threads {
+		if i == shown {
+			break
+		}
+		parts = append(parts, threadLabel(t))
+	}
+	if len(b.Threads) <= shown {
+		return "the batch has " + strings.Join(parts, ", ")
+	}
+	return fmt.Sprintf("the batch has %d threads, first: %s; call comm_batch to see all", len(b.Threads), strings.Join(parts, ", "))
+}
+
+// threadLabel names one thread of the batch: the day only when it has one.
+func threadLabel(t collect.Thread) string {
+	if t.DayKey == "" {
+		return fmt.Sprintf("threadKey %q", t.Key)
+	}
+	return fmt.Sprintf("threadKey %q dayKey %q", t.Key, t.DayKey)
+}
+
+// threadRefusal is the answer of a call whose thread is not in the batch: it
+// names the threads of the batch and, for a key with several days, asks for the
+// day (FTR.NAB.CMN-0003 R6).
+func (b *Batch) threadRefusal(key, dayKey string) error {
+	if dayKey == "" {
+		days := 0
+		for i := range b.Threads {
+			if b.Threads[i].Key == key {
+				days++
+			}
+		}
+		if days > 1 {
+			return denied(fmt.Sprintf("the thread %q has %d days in the batch of this run: give dayKey with it; %s", key, days, b.threadHint()))
+		}
+	}
+	return denied("the thread " + key + " (dayKey " + dayKey + ") is not in the batch of this run: " + b.threadHint())
 }
 
 // Cursor is the cursor of a source of the user ("" before the first collection).
