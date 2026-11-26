@@ -87,7 +87,11 @@ type Config struct {
 	AgentServiceToken string
 	AgentIdleTimeout  time.Duration
 	TurnTimeout       time.Duration
-	InboundWorkers    int
+	// TurnSilenceTimeout bounds the silence of the model inside a turn
+	// (FTR.NAB.CMN-0010 R10): no events of the operator for this long ends the
+	// turn as a failure; 0 switches the watchdog off.
+	TurnSilenceTimeout time.Duration
+	InboundWorkers     int
 
 	// FTR.NAB.CMN-0004 tech §7.1: the pods of agents.
 	AgentExecutor        string // k8s | local
@@ -390,7 +394,8 @@ func Load() (*Config, error) {
 
 		AgentAddr: strings.TrimRight(env("AGENT_ADDR", "http://localhost:8090"), "/"), AgentServiceToken: os.Getenv("AGENT_SERVICE_TOKEN"),
 		AgentIdleTimeout: p.dur("AGENT_IDLE_TIMEOUT", "15m"), TurnTimeout: p.dur("TURN_TIMEOUT", "30m"),
-		InboundWorkers: p.int("INBOUND_WORKERS", 4),
+		TurnSilenceTimeout: p.dur("TURN_SILENCE_TIMEOUT", "3m"),
+		InboundWorkers:     p.int("INBOUND_WORKERS", 4),
 
 		AgentExecutor: env("AGENT_EXECUTOR", "local"), AgentNamespace: env("AGENT_NAMESPACE", "nabu-agents"),
 		AgentImage:         os.Getenv("AGENT_IMAGE"),

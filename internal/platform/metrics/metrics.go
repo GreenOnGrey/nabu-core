@@ -39,9 +39,9 @@ var (
 	SubagentRejected = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nabu_subagent_rejected_total", Help: "Refused calls of subagents by reason (turn_limit, call_limit, no_slot, disabled).",
 	}, []string{"reason"})
-	// FTR.NAB.CMN-0010 R9.
+	// FTR.NAB.CMN-0010 R9, R10.
 	AgentStalls = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "nabu_agent_stalls_total", Help: "Turns stopped by the stall detector by session kind and reason (repeated_call, tool_errors).",
+		Name: "nabu_agent_stalls_total", Help: "Turns stopped by the stall detector or the silence watchdog by session kind and reason (repeated_call, tool_errors, no_output).",
 	}, []string{"kind", "reason"})
 	LLMRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nabu_llm_requests_total", Help: "Agent runs (prompts) by connection, model and kind.",

@@ -769,7 +769,8 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 	c.mail.Pending = confirms.PendingSince
 	eng := &engine.Engine{
 		Cfg: engine.Config{InternalURL: cfg.InternalURL, RelayInternalURL: cfg.RelayInternalURL, TurnTimeout: cfg.TurnTimeout,
-			TaskRunTimeout: cfg.TaskRunTimeout, RunChangesTimeout: cfg.RunChangesTimeout, SessionMaxAge: 12 * time.Hour, PiVersion: cfg.PiVersion,
+			TurnSilenceTimeout: cfg.TurnSilenceTimeout,
+			TaskRunTimeout:     cfg.TaskRunTimeout, RunChangesTimeout: cfg.RunChangesTimeout, SessionMaxAge: 12 * time.Hour, PiVersion: cfg.PiVersion,
 			Subagents:     subagentLimits(cfg),
 			StallDetector: cfg.StallDetectorEnabled, StallRepeatLimit: cfg.StallRepeatLimit, StallErrorLimit: cfg.StallErrorLimit,
 			StallWrapupTimeout: cfg.StallWrapupTimeout},

@@ -54,7 +54,11 @@ type Config struct {
 	InternalURL      string // the built-in MCP and the MCP proxy
 	RelayInternalURL string // the agent's calls to workspaces
 	TurnTimeout      time.Duration
-	TaskRunTimeout   time.Duration
+	// TurnSilenceTimeout is how long a turn may go without events of the
+	// operator before the silence watchdog ends it (FTR.NAB.CMN-0010 R10);
+	// 0 switches the watchdog off.
+	TurnSilenceTimeout time.Duration
+	TaskRunTimeout     time.Duration
 	// RunChangesTimeout bounds the collection of the changes of a working
 	// copy (FTR.HMR.CMN-0007 tech §2.6).
 	RunChangesTimeout time.Duration
@@ -368,6 +372,21 @@ type collector struct {
 	stalled, stalledTool string
 	wrapup               bool
 	abort                func()
+	// The silence watchdog (FTR.NAB.CMN-0010 R10): the moment of the last
+	// event of the operator, the tools running now (a running tool is not
+	// silence) and the mark that the watchdog fired.
+	lastEvent    atomic.Int64
+	toolInFlight atomic.Int32
+	silent       atomic.Bool
+}
+
+// touch marks an event of the operator: the silence watchdog counts from it.
+func (c *collector) touch() { c.lastEvent.Store(time.Now().UnixNano()) }
+
+// quiet reports how long the operator has brought no events and whether a tool
+// runs now: the turn waits for a running tool, and that is not silence.
+func (c *collector) quiet() (time.Duration, bool) {
+	return time.Since(time.Unix(0, c.lastEvent.Load())), c.toolInFlight.Load() > 0
 }
 
 func stepTitle(server, tool string) string {
@@ -402,6 +421,15 @@ func (c *collector) save() {
 }
 
 func (c *collector) handle(ev agent.Event) {
+	c.touch() // FTR.NAB.CMN-0010 R10: the silence watchdog counts the events of the operator
+	switch ev.Type {
+	case agent.EventToolCall:
+		c.toolInFlight.Add(1)
+	case agent.EventToolResult:
+		if c.toolInFlight.Add(-1) < 0 {
+			c.toolInFlight.Store(0)
+		}
+	}
 	if ev.Type == agent.EventUsage && c.costUnknown { // FTR.HMR.DEV-0004 R6: zero is not free
 		f := false
 		ev.CostKnown = &f
@@ -481,7 +509,7 @@ func (c *collector) handle(ev agent.Event) {
 			c.handle(agent.Event{Type: agent.EventUsage, Usage: ev.Usage})
 		}
 	case agent.EventError:
-		if c.stalled != "" { // FTR.NAB.CMN-0010 R4: the abort of the detector during a request to the model
+		if c.stalled != "" || c.silent.Load() { // FTR.NAB.CMN-0010 R4, R10: the abort of the detector or of the watchdog during a request to the model
 			return
 		}
 		ev := ev
@@ -946,6 +974,9 @@ type turnResult struct {
 	podLost bool
 	// stopped: the user stopped the answer (FTR.NAB.CHAT-0004 R8).
 	stopped bool
+	// stalled: the reason the stall detector or the silence watchdog ended the
+	// turn (FTR.NAB.CMN-0010 R2, R10); "" — neither did.
+	stalled string
 }
 
 // turnLabel is the result label of nabu_turns_total by the status of the answer.
@@ -1011,11 +1042,17 @@ func requestClass(ctx context.Context, err error) string {
 }
 
 func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked time.Time, u *users.User, conv, msgID uuid.UUID, ch string, clientID *uuid.UUID, text string, images []agent.Image,
-	author *uuid.UUID, seg *segmenter, skill string) turnResult {
+	author *uuid.UUID, seg *segmenter, skill string) (res turnResult) {
 	b, err := e.personalRequest(ctx, u, conv, nil, "conv "+conv.String()[:8])
 	if err != nil {
 		return turnResult{errClass: requestClass(ctx, err), errText: err.Error()}
 	}
+	col := &collector{e: e, ctx: ctx, uid: u.ID, msgID: msgID, conv: conv, stream: true, secrets: b.secrets,
+		audit: ledger.Entry{AgentKind: "personal", Agent: b.persona.Agent.Name, UserID: &u.ID, ClientID: clientID, Channel: ch}}
+	col.touch()
+	// FTR.NAB.CMN-0010 R11: a turn that had its session and still ended as no usual answer
+	// leaves its reason in the audit. A failure of the request itself is not a turn.
+	defer func() { e.auditTurn(ctx, col, res) }()
 	if skill != "" && !hasSkill(b.req.Skills, skill) { // FTR.NAB.CHAT-0001 tech §4: the skill set of the session
 		return turnResult{errClass: "skill_unavailable", errText: "the skill " + skill + " is not available in this session"}
 	}
@@ -1026,8 +1063,6 @@ func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked
 			}
 		}()
 	}
-	col := &collector{e: e, ctx: ctx, uid: u.ID, msgID: msgID, conv: conv, stream: true, secrets: b.secrets,
-		audit: ledger.Entry{AgentKind: "personal", Agent: b.persona.Agent.Name, UserID: &u.ID, ClientID: clientID, Channel: ch}}
 	connID, _ := uuid.Parse(b.model.ConnectionID)
 	col.usage = ledger.UsageRow{UserID: &u.ID, ClientID: clientID, Agent: "", Model: b.model.ModelID, ConnectionID: &connID}
 	if b.group != nil {
@@ -1099,7 +1134,23 @@ func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked
 		stop.session(sess.OpSession)
 		openSession := sess.OpSession
 		col.abort = func() { _ = op.Abort(context.WithoutCancel(ctx), openSession) }
+		// FTR.NAB.CMN-0010 R10: the watchdog covers the request to the model, not
+		// the work of the engine before it (a session of a cold pod is slow, and
+		// that is not the silence of a model).
+		col.touch()
+		silence := e.watchSilence(ctx, col)
 		err = op.Prompt(stop.ctx, sess.OpSession, agent.PromptRequest{Text: prompt, Images: images, Deadline: deadline(ctx)}, col.handle)
+		silence()
+		if col.silent.Load() && col.stalled == "" {
+			// the answer may have come at the same tick as the check: then the turn
+			// is not silent, and the abort is all that happened
+			if quiet, _ := col.quiet(); quiet >= e.Cfg.TurnSilenceTimeout {
+				col.stalled = stallNoOutput // FTR.NAB.CMN-0010 R10: the abort was the watchdog, not the provider
+			}
+		}
+		if col.stalled != "" {
+			break // R4, R10: the detector or the watchdog ended the turn; no second attempt
+		}
 		if errors.Is(err, agent.ErrSessionGone) || errors.Is(err, agent.ErrStreamBroken) {
 			_, _ = e.Pool.Exec(ctx, `UPDATE harness_sessions SET closed_at = now() WHERE id = $1`, sess.ID)
 			if col.text.Len() == 0 && len(col.steps) == 0 {
@@ -1108,7 +1159,7 @@ func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked
 		}
 		break
 	}
-	if col.stalled != "" && err == nil && col.failure == nil && sess != nil && !stop.stopped.Load() { // FTR.NAB.CMN-0010 R4, R5
+	if col.stalled != "" && col.stalled != stallNoOutput && err == nil && col.failure == nil && sess != nil && !stop.stopped.Load() { // FTR.NAB.CMN-0010 R4, R5
 		e.finishStalled(stop.ctx, op, sess.OpSession, col)
 		if !stop.stopped.Load() {
 			stallNote(col, u.Language)
@@ -1125,7 +1176,7 @@ func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked
 		e.recordContext(ctx, u.ID, conv, sess.ID, col.contextTokens, col.contextWindow)
 	}
 	// FTR.NAB.CHAT-0004 tech §3: a stopped turn keeps its part too, also one cancelled after the grace
-	if (err == nil || stop.stopped.Load()) && sess != nil {
+	if (err == nil || stop.stopped.Load() || col.stalled != "") && sess != nil {
 		e.saveSnapshot(context.WithoutCancel(ctx), op, conv, sess.OpSession)
 	}
 	e.Models.RecordResult(ctx, b.model.ConnectionID, func() agent.ErrorClass {
@@ -1134,15 +1185,19 @@ func (e *Engine) personalTurn(ctx context.Context, lease *agentpods.Lease, asked
 		}
 		return ""
 	}())
-	res := turnResult{text: col.text.String(), steps: col.steps, stopped: stop.stopped.Load()}
+	res = turnResult{text: col.text.String(), steps: col.steps, stopped: stop.stopped.Load(), stalled: col.stalled}
 	if res.stopped {
 		return res
 	}
-	res.podLost = col.failure == nil && col.text.Len() == 0 && len(col.steps) == 0 && e.podLost(lease, err)
+	res.podLost = col.failure == nil && col.stalled == "" && col.text.Len() == 0 && len(col.steps) == 0 && e.podLost(lease, err)
 	switch {
 	case col.failure != nil:
 		res.errClass, res.errText = string(col.failure.ErrorClass), col.failure.Message
 		col.auditModelError(res.errClass, res.errText) // R28: what the provider answered, for the administrator
+	case col.stalled == stallNoOutput:
+		// FTR.NAB.CMN-0010 R10: the user gets the usual «the work did not fit its
+		// time» with «Retry», the administrator — the reason and the limit.
+		res.errClass, res.errText = string(agent.ErrTimeout), "no events of the model for "+e.Cfg.TurnSilenceTimeout.String()
 	case err != nil:
 		res.errClass, res.errText = operatorClass(err), operatorText(err)
 	}
@@ -1389,6 +1444,7 @@ var errorTexts = map[string]map[string]string{
 		"bad_request":          "The model rejected the request.",
 		"context_overflow":     "The conversation became too long for the model. Start a new topic on the site.",
 		"agent_crashed":        "The agent stopped unexpectedly. Please try again.",
+		"timeout":              "The work did not fit its time. Please try again later.",
 		"agent_busy":           "The agent is busy. Please try again in a minute.",
 		"queue_busy":           "The agent is busy, I will answer as soon as a place is free.",
 		"agent_not_configured": "The agent is not configured yet: an administrator has to add a model connection.",
@@ -1404,6 +1460,7 @@ var errorTexts = map[string]map[string]string{
 		"bad_request":          "Модель отклонила запрос.",
 		"context_overflow":     "Разговор стал слишком длинным для модели. Начните новую тему на сайте.",
 		"agent_crashed":        "Агент неожиданно остановился. Повторите запрос.",
+		"timeout":              "Работа не уложилась в отведённое время. Повторите позже.",
 		"agent_busy":           "Агент занят. Повторите через минуту.",
 		"queue_busy":           "Агент занят, отвечу, как только освободится место.",
 		"agent_not_configured": "Агент ещё не настроен: администратор должен добавить подключение к моделям.",
