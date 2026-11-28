@@ -99,6 +99,8 @@ func Stream(w http.ResponseWriter, r *http.Request, sub *Subscriber, first []Eve
 		select {
 		case <-r.Context().Done():
 			return
+		case <-sub.Done:
+			return
 		case <-ping.C:
 			fmt.Fprint(w, ": ping\n\n")
 			fl.Flush()

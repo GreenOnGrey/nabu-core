@@ -434,7 +434,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event) => {
 		const note =
 			NOTE ||
-			"The working directory is an isolated workspace. Your read, write, edit, bash, ls, find and grep tools operate there; paths are relative to its root.";
+			"The working directory is an isolated workspace. Your read, write, edit, bash, ls, find and grep tools operate there; paths are relative to its root. " +
+				"File names are exact: list the directory before reading a name that came from the conversation. Keep temporary files under the workspace root (./tmp), not /tmp.";
 		// Pi names its own local directory as the working one: the model must see the workspace's.
 		const prompt = event.systemPrompt.split(localCwd).join(ROOT);
 		return { systemPrompt: `${prompt}\n\n${note} ${OUTPUT_RULE}` };

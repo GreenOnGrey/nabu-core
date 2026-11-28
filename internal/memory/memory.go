@@ -282,7 +282,7 @@ func (s *Service) Tools() []mcp.Tool {
 		{Name: "memory_save", Description: "Save a durable fact or preference of the user to long-term memory. " +
 			"Use it only for information that stays true across conversations (names, roles, preferences, recurring context). The user sees every saved record.",
 			InputSchema: mcp.Schema(map[string]any{
-				"text":   map[string]any{"type": "string", "description": "The fact, one or two sentences."},
+				"text":   map[string]any{"type": "string", "description": "The fact, one or two sentences, at most 2000 characters."},
 				"pinned": map[string]any{"type": "boolean", "description": "Always keep it in the instructions."},
 			}, "text"),
 			Handler: func(ctx context.Context, g mcp.Grant, args json.RawMessage) (string, error) {

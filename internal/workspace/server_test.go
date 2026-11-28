@@ -113,6 +113,26 @@ func TestWorkspaceAbsoluteRoot(t *testing.T) {
 	}
 }
 
+// RLY-15 (FTR.NAB.CMN-0001 tech, decision 28): a missing file names the files
+// of its directory, so the model uses the stored name instead of guessing
+// again; /tmp of the shell is outside the space.
+func TestWorkspaceMissingFileHint(t *testing.T) {
+	_, srv, _ := wsServer(t)
+	if r, b := call(t, srv, "/v1/fs/write", "ws-token", map[string]string{"path": "attachments/Charla Мандат 16.11.26.txt", "content": b64("x")}); r.StatusCode != 204 {
+		t.Fatalf("write %d %s", r.StatusCode, b)
+	}
+	r, b := call(t, srv, "/v1/fs/read", "ws-token", map[string]string{"path": "attachments/Charla Манда 16.11.26.txt"})
+	if r.StatusCode != 404 || !strings.Contains(string(b), "Charla Мандат 16.11.26.txt") {
+		t.Fatalf("missing file: %d %s", r.StatusCode, b)
+	}
+	// the shell wrote the file to /tmp of the sandbox: the answer names the place of temporary files, not
+	// <root>/tmp (FTR.NAB.CMN-0001 tech, decision 28)
+	r, b = call(t, srv, "/v1/fs/read", "ws-token", map[string]string{"path": "/tmp/park18.txt"})
+	if r.StatusCode != 404 || !strings.Contains(string(b), "/work/tmp") {
+		t.Fatalf("tmp: %d %s", r.StatusCode, b)
+	}
+}
+
 func execLines(t *testing.T, srv *httptest.Server, body map[string]any) (string, map[string]any) {
 	t.Helper()
 	bodyJSON, _ := json.Marshal(body)

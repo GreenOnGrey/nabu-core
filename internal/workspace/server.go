@@ -68,7 +68,9 @@ var ErrOutside = errors.New("path_outside_workspace")
 // an absolute path, refusing ".." escapes and symlinks that lead outside —
 // also for files that do not exist yet. An absolute path under the root, as
 // the shell of the workspace shows it (/work/report.md), is the same file
-// (FTR.NAB.CMN-0001 tech, decision 19).
+// (FTR.NAB.CMN-0001 tech, decision 19). Another absolute path is "/"-rooted
+// inside the working copy: /tmp belongs to the sandbox, not to the space, and
+// a missing one is named as such (decision 28).
 func (w *Workspace) Resolve(p string) (string, error) {
 	root, err := filepath.Abs(w.Root)
 	if err != nil {
@@ -227,11 +229,19 @@ func (w *Workspace) resolveReq(r *http.Request) (pathReq, string, error) {
 }
 
 func (w *Workspace) read(rw http.ResponseWriter, r *http.Request) error {
-	_, p, err := w.resolveReq(r)
+	req, p, err := w.resolveReq(r)
 	if err != nil {
 		return err
 	}
 	st, err := os.Stat(p)
+	if errors.Is(err, fs.ErrNotExist) {
+		// the shell of the sandbox has its own /tmp: a file it wrote there is not in the space, and the model must
+		// learn it from the answer, not from a second failure under /work/tmp (decision 28)
+		if slashed := filepath.ToSlash(req.Path); slashed == "/tmp" || strings.HasPrefix(slashed, "/tmp/") {
+			return fmt.Errorf("%w: /tmp is outside the space: the temporary files of the shell are not visible to the file tools, keep them under /work/tmp", fs.ErrNotExist)
+		}
+		return notFoundHint(p)
+	}
 	if err != nil {
 		return err
 	}
@@ -246,6 +256,42 @@ func (w *Workspace) read(rw http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	return wsJSON(rw, map[string]string{"data": base64.StdEncoding.EncodeToString(b)})
+}
+
+// notFoundHint is the error of a missing file with the names of its directory: a name of the space comes from the
+// conversation, memory or the instructions of the agent and may differ from the stored one; the list lets the model
+// use the exact name instead of guessing again (FTR.NAB.CMN-0001 tech, decision 28).
+func notFoundHint(p string) error {
+	dir := filepath.Dir(p)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("%w: %s", fs.ErrNotExist, filepath.Base(p))
+	}
+	base := filepath.Base(p)
+	// the names that share the first part of the wanted one first: the files of a topic usually do
+	prefix := base
+	const namePrefixMin = 4
+	if i := strings.IndexAny(base, " _-"); i >= namePrefixMin {
+		prefix = base[:i]
+	}
+	var names, rest []string
+	for _, e := range entries {
+		if strings.HasPrefix(strings.ToLower(e.Name()), strings.ToLower(prefix)) {
+			names = append(names, e.Name())
+		} else {
+			rest = append(rest, e.Name())
+		}
+	}
+	sort.Strings(names)
+	sort.Strings(rest)
+	names = append(names, rest...)
+	if len(names) > 20 {
+		names = names[:20]
+	}
+	if len(names) == 0 {
+		return fmt.Errorf("%w: %s", fs.ErrNotExist, base)
+	}
+	return fmt.Errorf("%w: no %s in %s; the names there: %s", fs.ErrNotExist, base, filepath.Base(dir), strings.Join(names, ", "))
 }
 
 func (w *Workspace) access(rw http.ResponseWriter, r *http.Request) error {

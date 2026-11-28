@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"regexp"
 	"strings"
 	"time"
 	"unicode"
 
 	"github.com/google/uuid"
 
+	"github.com/GreenOnGrey/nabu-core/internal/apperr"
 	"github.com/GreenOnGrey/nabu-core/internal/catalog"
 	"github.com/GreenOnGrey/nabu-core/internal/collect"
 	"github.com/GreenOnGrey/nabu-core/internal/comm"
@@ -43,6 +45,50 @@ func auditToolError(class agent.ErrorClass) *string {
 		reason = "tool_error"
 	}
 	return &reason
+}
+
+// toolResultError is the error of a failed tool of the collector: the stable code of the refusal ("422
+// invalid_same_as: …" — the text of our own tool, not of the source, so R30 allows it), else the class of the
+// failure, else the kind of a failure that never reached a server ("Connection closed", a timeout) — the text of
+// the source stays out either way (FTR.NAB.CMN-0001 R28, tech decision 30).
+func toolResultError(ev agent.Event) *string {
+	if code := apperr.CodeIn(ev.Summary); code != "" {
+		return &code
+	}
+	if ev.ErrorClass != "" {
+		return auditToolError(ev.ErrorClass)
+	}
+	if reason := toolFailureReason(ev.Summary); reason != "" {
+		return &reason
+	}
+	return auditToolError("")
+}
+
+// mcpErrorCode is the code of an answer of an MCP client ("MCP error -32000: Connection closed").
+var mcpErrorCode = regexp.MustCompile(`(?i)\bMCP error (-?[0-9]+)`)
+
+// toolFailureReason names a failure that carries no code of a refusal and did not reach the server that could
+// give one: a transport failure has no server row, so the audit names its kind instead (decision 30). The text
+// of the failure is never stored (R30); the kind is a fixed label.
+func toolFailureReason(summary string) string {
+	if strings.TrimSpace(summary) == "" {
+		return "tool_transport"
+	}
+	if m := mcpErrorCode.FindStringSubmatch(summary); m != nil {
+		return "mcp_error_" + m[1]
+	}
+	s := strings.ToLower(summary)
+	switch {
+	case strings.Contains(s, "timeout"), strings.Contains(s, "timed out"), strings.Contains(s, "deadline"):
+		return "tool_timeout"
+	case strings.Contains(s, "canceled"), strings.Contains(s, "cancelled"), strings.Contains(s, "aborted"):
+		return "tool_canceled"
+	case strings.Contains(s, "connection"), strings.Contains(s, "closed"), strings.Contains(s, "refused"),
+		strings.Contains(s, "reset"), strings.Contains(s, "broken pipe"), strings.Contains(s, "no such host"),
+		strings.Contains(s, "network"), strings.Contains(s, "eof"):
+		return "tool_transport"
+	}
+	return ""
 }
 
 // collectorArgSummary keeps the identifiers of a call of the collector and drops every other argument (R30, tech
@@ -770,7 +816,14 @@ func (e *Engine) collectTurn(ctx context.Context, u *users.User, b *comm.Batch, 
 			a.Tool, a.Result = tool, "ok"
 			if ev.IsError {
 				a.Result = "error"
-				a.Error = auditToolError(ev.ErrorClass)
+				a.Error = toolResultError(ev)
+				reason := *a.Error
+				metrics.MemoryToolErrors.WithLabelValues(tool, reason).Inc()
+				if reason == "tool_error" || strings.HasPrefix(reason, "tool_") || strings.HasPrefix(reason, "mcp_error_") {
+					// the failures that have no row on the server side: their kind is all an administrator sees, and
+					// the text of the source stays out of the journal (R30, tech decision 30)
+					slog.WarnContext(ctx, "collector tool error", "tool", tool, "reason", reason, "empty", ev.Summary == "")
+				}
 			}
 			if server != "" {
 				a.Server = &server

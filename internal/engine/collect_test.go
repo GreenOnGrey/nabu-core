@@ -22,6 +22,32 @@ func TestAuditToolError(t *testing.T) {
 	}
 }
 
+// AUD-07 (FTR.NAB.CMN-0001 R28): a refusal of a tool of the collector goes to the audit with its stable code; the
+// class of a failure follows, then the kind of a failure that never reached a server, then tool_error.
+func TestToolResultError(t *testing.T) {
+	cases := []struct {
+		ev   agent.Event
+		want string
+	}{
+		{agent.Event{ErrorClass: agent.ErrTimeout, Summary: "422 invalid_same_as: x"}, "invalid_same_as"},
+		{agent.Event{ErrorClass: agent.ErrTimeout, Summary: "the tool failed"}, "timeout"},
+		{agent.Event{Summary: "422 invalid_same_as: x"}, "invalid_same_as"},
+		{agent.Event{Summary: "commitment_basis_not_in_batch: the message 1 is not in the batch"}, "commitment_basis_not_in_batch"},
+		{agent.Event{Summary: "Connection closed"}, "tool_transport"},
+		{agent.Event{Summary: "MCP error -32000: Connection closed"}, "mcp_error_-32000"},
+		{agent.Event{Summary: "context deadline exceeded"}, "tool_timeout"},
+		{agent.Event{Summary: "context canceled"}, "tool_canceled"},
+		{agent.Event{Summary: ""}, "tool_transport"},
+		{agent.Event{Summary: "the tool failed"}, "tool_error"},
+	}
+	for _, tc := range cases {
+		got := toolResultError(tc.ev)
+		if got == nil || *got != tc.want {
+			t.Fatalf("%q: %v, want %q", tc.ev.Summary, got, tc.want)
+		}
+	}
+}
+
 // AUD-08 (FTR.NAB.CMN-0003 R30): the audit of a call of the collector keeps the identifiers of the object and
 // drops the arguments that carry text.
 func TestCollectorArgSummary(t *testing.T) {

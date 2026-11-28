@@ -299,6 +299,14 @@ func toolError(w http.ResponseWriter, id json.RawMessage, text string) {
 }
 
 func (s *Service) proxy(w http.ResponseWriter, r *http.Request, hold Hold) {
+	// the streamable HTTP transport of MCP is POST; a client that probes with GET asks for a stream we do not
+	// serve, and the answer is 405 — not the 403 of the access check of a call it cannot make (FTR.NAB.CMN-0001
+	// tech, decision 11)
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	itemID, err := uuid.Parse(chi.URLParam(r, "item"))
 	if err != nil {
 		http.NotFound(w, r)

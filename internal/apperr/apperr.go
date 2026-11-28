@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 )
 
 // Error is an error that maps to an HTTP response.
@@ -67,4 +68,62 @@ func As(err error) (*Error, bool) {
 		return e, true
 	}
 	return nil, false
+}
+
+// CodeOf is the stable code of an error: the code of *Error, else the code of
+// its first line when it is shaped "422 code: message" or "code: message".
+// An error without a code gives "".
+func CodeOf(err error) string {
+	if err == nil {
+		return ""
+	}
+	if e, ok := As(err); ok {
+		return e.Code
+	}
+	return CodeIn(err.Error())
+}
+
+// CodeIn is the code a tool refusal starts with: the answer of a handler of
+// the built-in MCP reaches an agent as text, so the code is read from the
+// first line — "422 invalid_same_as: …" of *Error or "note_missing: …" of a
+// refusal that carries no status (FTR.NAB.CMN-0001 R28). "" when the text has
+// no code.
+func CodeIn(text string) string {
+	text = strings.TrimSpace(text)
+	if i := strings.IndexByte(text, '\n'); i >= 0 {
+		text = text[:i]
+	}
+	rest := text
+	coded := false
+	if len(text) > 4 && text[3] == ' ' && isDigits(text[:3]) {
+		rest, coded = text[4:], true
+	}
+	code, msg, ok := strings.Cut(rest, ":")
+	if !ok || len(code) < 3 || len(code) > 64 {
+		return ""
+	}
+	// a bare prefix is a code of a refusal only with an underscore: "http:", "open /x:" and the like are ordinary
+	// messages, while the codes of the refusals of the tools are underscored
+	if !coded && !strings.ContainsRune(code, '_') {
+		return ""
+	}
+	for i := 0; i < len(code); i++ {
+		c := code[i]
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '_' {
+			return ""
+		}
+	}
+	if code[0] < 'a' || code[0] > 'z' || msg == "" {
+		return ""
+	}
+	return code
+}
+
+func isDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return s != ""
 }

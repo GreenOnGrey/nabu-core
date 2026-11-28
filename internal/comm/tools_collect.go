@@ -36,18 +36,18 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 	// load finds the running batch of the grant and the adapter of its item.
 	load := func(ctx context.Context, g mcp.Grant) (*Batch, collect.Adapter, error) {
 		if g.RunID == uuid.Nil {
-			return nil, nil, denied("this session is not a run of the collector")
+			return nil, nil, denied("not_collector_run: this session is not a run of the collector")
 		}
 		b, err := s.RunningBatch(ctx, g.UserID, g.RunID)
 		if err != nil {
-			return nil, nil, &mcp.ToolError{Msg: "the batch could not be read"}
+			return nil, nil, &mcp.ToolError{Msg: "batch_unreadable: the batch could not be read"}
 		}
 		if b == nil {
-			return nil, nil, denied("the run is over: its batch is closed")
+			return nil, nil, denied("collector_run_over: the run is over: its batch is closed")
 		}
 		ad, ok := s.AdapterOf(ctx, b.ItemID)
 		if !ok {
-			return nil, nil, &mcp.ToolError{Msg: "the source of the batch is no longer a source of communications"}
+			return nil, nil, &mcp.ToolError{Msg: "source_not_communications: the source of the batch is no longer a source of communications"}
 		}
 		return b, ad, nil
 	}
@@ -152,7 +152,7 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 					return nil
 				})
 				if err != nil {
-					return "", &mcp.ToolError{Msg: "the batch could not be read"}
+					return "", &mcp.ToolError{Msg: "batch_unreadable: the batch could not be read"}
 				}
 				if open, err := s.Commitments(ctx, g.UserID, CommitmentFilter{State: Open, WithNote: true}, 200); err == nil {
 					for _, c := range open {
@@ -207,7 +207,7 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 				in.Names = in.Names[:min(len(in.Names), MaxTopics)]
 				found, err := s.FindTopics(ctx, g.UserID, in.Names)
 				if err != nil {
-					return "", &mcp.ToolError{Msg: "the topics could not be read"}
+					return "", &mcp.ToolError{Msg: "topics_unreadable: the topics could not be read"}
 				}
 				raw, _ := json.Marshal(map[string]any{"results": found})
 				return string(raw), nil
@@ -361,7 +361,7 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 				// thread of it, not only the one the collector named: a commitment
 				// is often closed by a letter of another thread.
 				if b.threadOf(in.BasisMessageID) == nil {
-					return "", denied("the message " + in.BasisMessageID + " is not in the batch of this run: pass basisMessageId of a message that shows the commitment is done, from any thread of the batch (" + b.threadHint() + ")")
+					return "", denied("commitment_basis_not_in_batch: the message " + in.BasisMessageID + " is not in the batch of this run: pass basisMessageId of a message that shows the commitment is done, from any thread of the batch (" + b.threadHint() + ")")
 				}
 				basis := in.BasisMessageID
 				// only an open commitment with a participant of the batch — what comm_batch listed
@@ -373,7 +373,7 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 				}
 				open, err := s.Commitments(ctx, g.UserID, CommitmentFilter{State: Open}, 500)
 				if err != nil {
-					return "", &mcp.ToolError{Msg: "the commitments could not be read"}
+					return "", &mcp.ToolError{Msg: "commitments_unreadable: the commitments could not be read"}
 				}
 				listed := false
 				for _, c := range open {
@@ -382,7 +382,7 @@ func (s *Service) CollectTools(user func(ctx context.Context, uid uuid.UUID) Use
 					}
 				}
 				if !listed {
-					return "", denied("the commitment is not among the open commitments of this batch: pass commitmentId of an openCommitments item that comm_batch listed for a participant of a thread of this batch")
+					return "", denied("commitment_not_open: the commitment is not among the open commitments of this batch: pass commitmentId of an openCommitments item that comm_batch listed for a participant of a thread of this batch")
 				}
 				done := Done
 				c, err := s.UpdateCommitment(ctx, g.UserID, id, CommitmentPatch{State: &done, CloseBasisMessageID: basis}, ByCollector)

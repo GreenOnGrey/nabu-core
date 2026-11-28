@@ -2,9 +2,25 @@ package catalog
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
+
+// CAT-11 (FTR.NAB.CMN-0001 tech, decision 11): an MCP client probes the proxy
+// with GET for a stream it does not serve, and the answer is 405 before any
+// token or access check — not the 403 of a call the client cannot make.
+func TestProxyRefusesNonPost(t *testing.T) {
+	s := &Service{}
+	for _, m := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
+		w := httptest.NewRecorder()
+		s.proxy(w, httptest.NewRequest(m, "/internal/v1/mcp-proxy/x", nil), nil)
+		if w.Code != http.StatusMethodNotAllowed || w.Header().Get("Allow") != http.MethodPost {
+			t.Fatalf("%s: %d %q", m, w.Code, w.Header().Get("Allow"))
+		}
+	}
+}
 
 // RATE-02 (FTR.NAB.CMN-0003 qa; FTR.NAB.ADM-0001 tech §4.3): a source of a company system answers the limit of its budget in the
 // result of a tool, not as HTTP 429 — «Rate limit exceeded for budget "short" (5m0s). Retry in 276 seconds.»

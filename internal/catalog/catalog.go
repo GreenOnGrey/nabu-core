@@ -486,7 +486,14 @@ func (s *Service) Save(ctx context.Context, id *uuid.UUID, in Input) (*Item, err
 			it.Type, it.Name, it.Title, it.Description, src, it.Mode, pa, paSecret, platEnc, it.ReadOnly, it.Exposure, it.Published, false,
 			allowed, fileArgs, it.FileMaxBytes, resultArgs, it.ResultMaxBytes, spaceOnly).Scan(&nid)
 		if postgres.IsUniqueViolation(err) {
-			return nil, apperr.Conflict("name_taken", "an item with this name exists").With("field", "name")
+			e := apperr.Conflict("name_taken", "an item with this name exists").With("field", "name")
+			// the id lets the form of the administration open the item that is already there instead of a retry;
+			// a failed lookup leaves the error without it (the item is still named by the field)
+			var existing uuid.UUID
+			if s.Pool.QueryRow(ctx, `SELECT id FROM catalog_items WHERE name = $1`, it.Name).Scan(&existing) == nil {
+				e.With("id", existing.String())
+			}
+			return nil, e
 		}
 		id = &nid
 	} else {
