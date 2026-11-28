@@ -741,6 +741,8 @@ func (s *Service) EventsRoute(r chi.Router, hub *events.Hub, clientOf func(r *ht
 			select {
 			case <-r.Context().Done():
 				return
+			case <-sub.Done:
+				return
 			case <-ping.C:
 				fmt.Fprint(w, ": ping\n\n")
 				fl.Flush()

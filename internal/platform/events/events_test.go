@@ -2,8 +2,13 @@ package events
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/google/uuid"
 )
 
 // FTR.NAB.CMN-0001 CONV-12: an event too large for NOTIFY keeps the ids of the
@@ -24,5 +29,25 @@ func TestStub(t *testing.T) {
 	}
 	if Stub("text") != nil || Stub(nil) != nil {
 		t.Fatal("a stub of not an object")
+	}
+}
+
+// CONV-14 (FTR.NAB.CMN-0001 tech §3.2): the pod stops — the open streams end,
+// and the graceful shutdown does not wait for a client that never leaves.
+func TestStreamEndsOnHubClose(t *testing.T) {
+	hub := NewHub()
+	sub := hub.Subscribe(uuid.New())
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil)
+	done := make(chan struct{})
+	go func() {
+		Stream(rec, req, sub, nil)
+		close(done)
+	}()
+	hub.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the stream outlived the hub")
 	}
 }

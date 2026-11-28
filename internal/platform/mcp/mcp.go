@@ -15,7 +15,9 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/GreenOnGrey/nabu-core/internal/apperr"
 	"github.com/GreenOnGrey/nabu-core/internal/platform/jwt"
+	"github.com/GreenOnGrey/nabu-core/internal/platform/metrics"
 )
 
 // ProtocolVersion is the MCP revision implemented.
@@ -223,7 +225,13 @@ func (s *Server) dispatch(ctx context.Context, g Grant, req request) (any, *rpcE
 			}
 			out, err := t.Handler(ctx, g, p.Arguments)
 			if err != nil {
-				slog.InfoContext(ctx, "mcp tool refused", "tool", t.Name, "err", err)
+				code := apperr.CodeOf(err)
+				if code == "" {
+					code = "uncoded"
+				}
+				// R28: the code tells an administrator what the agent hit, and the count is what an alert watches
+				slog.WarnContext(ctx, "mcp tool refused", "tool", t.Name, "code", code, "err", err)
+				metrics.MCPToolRefused.WithLabelValues(t.Name, code).Inc()
 				return toolResult(err.Error(), true), nil
 			}
 			return toolResult(out, false), nil

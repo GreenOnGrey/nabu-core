@@ -129,6 +129,8 @@ func Stub(data any) any {
 type Hub struct {
 	mu   sync.RWMutex
 	subs map[*Subscriber]struct{}
+	done chan struct{}
+	once sync.Once
 }
 
 // Subscriber is one SSE connection: of a user or of a run.
@@ -136,19 +138,25 @@ type Subscriber struct {
 	UserID uuid.UUID
 	RunID  uuid.UUID
 	C      chan Event
+	// Done is closed when the hub stops: the pod is shutting down and the stream must end, or the graceful
+	// shutdown of the server waits for a client that never leaves (FTR.NAB.CMN-0001 tech §3.2).
+	Done <-chan struct{}
 }
 
 // NewHub creates a hub.
-func NewHub() *Hub { return &Hub{subs: map[*Subscriber]struct{}{}} }
+func NewHub() *Hub { return &Hub{subs: map[*Subscriber]struct{}{}, done: make(chan struct{})} }
+
+// Close ends every stream of the hub: a subscriber sees Done closed and returns. It is safe to call more than once.
+func (h *Hub) Close() { h.once.Do(func() { close(h.done) }) }
 
 // Subscribe registers a user connection.
 func (h *Hub) Subscribe(userID uuid.UUID) *Subscriber {
-	return h.add(&Subscriber{UserID: userID, C: make(chan Event, 512)})
+	return h.add(&Subscriber{UserID: userID, C: make(chan Event, 512), Done: h.done})
 }
 
 // SubscribeRun registers a connection to the events of one run.
 func (h *Hub) SubscribeRun(runID uuid.UUID) *Subscriber {
-	return h.add(&Subscriber{RunID: runID, C: make(chan Event, 512)})
+	return h.add(&Subscriber{RunID: runID, C: make(chan Event, 512), Done: h.done})
 }
 
 func (h *Hub) add(s *Subscriber) *Subscriber {

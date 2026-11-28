@@ -404,7 +404,8 @@ func serviceServer(addr string, ready func(context.Context) error) *http.Server 
 	return &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 }
 
-// serve runs servers until ctx is done, then shuts them down gracefully.
+// serve runs servers until ctx is done, then shuts them down gracefully: a stream that outlives the grace is a
+// warning, not a failure of the process — the pod leaves anyway (FTR.NAB.CMN-0001 tech §3.2).
 func serve(ctx context.Context, g *errgroup.Group, servers ...*http.Server) {
 	for _, s := range servers {
 		s := s
@@ -419,7 +420,12 @@ func serve(ctx context.Context, g *errgroup.Group, servers ...*http.Server) {
 			<-ctx.Done()
 			sctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
-			return s.Shutdown(sctx)
+			if err := s.Shutdown(sctx); err != nil {
+				// a stream that outlived the grace is not a reason to report the pod as failed: it is leaving
+				// anyway, and a real failure is a listener that could not start (FTR.NAB.CMN-0001 tech §3.2)
+				slog.Warn("shutdown did not finish", "addr", s.Addr, "err", err)
+			}
+			return nil
 		})
 	}
 }
@@ -467,6 +473,12 @@ func RunAPI(ctx context.Context, cfg *config.Config, version string) error {
 	}
 	c.api = true
 	hub := events.NewHub()
+	// the streams of the site end before the server shutdown: an open SSE never becomes idle, and the graceful
+	// shutdown waited its whole grace for it (FTR.NAB.CMN-0001 tech §3.2)
+	go func() {
+		<-ctx.Done()
+		hub.Close()
+	}()
 	go hub.Listen(ctx, c.pool)
 	go c.registry.Listen(ctx, hub)
 	c.seedChannels(ctx)

@@ -177,6 +177,11 @@ const SandboxRule = "Your sandbox has a fixed set of tools (its profile): check 
 	"Packages cannot be installed: pip, npm and apt are unavailable and there is no internet. If a task needs something missing, " +
 	"call sandbox_request_package with the reason, tell the user it cannot be done right now and offer a workaround.\n"
 
+// SpaceNote is what a session with a space must know about its files (FTR.NAB.CMN-0001 tech, decision 28): the
+// names are exact and may differ from the conversation, and a temporary file belongs to the space.
+const SpaceNote = "File names are exact: when a name comes from the conversation, memory or instructions, list the directory first " +
+	"and use the stored name. Keep temporary files under /work/tmp: /tmp is outside the space and is not visible to the file tools."
+
 // DocumentsRule is how an agent makes documents (FTR.NAB.CHAT-0003 R17).
 const DocumentsRule = "For documents use the tools of the service of documents first: render_document (Markdown → DOCX, PDF, PPTX; a Markdown file of the space goes in source, " +
 	"never as $(cat …) in markdown — tools do not run the shell), " +

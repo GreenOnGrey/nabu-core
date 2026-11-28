@@ -111,10 +111,10 @@ func (b *Batch) threadRefusal(key, dayKey string) error {
 			}
 		}
 		if days > 1 {
-			return denied(fmt.Sprintf("the thread %q has %d days in the batch of this run: give dayKey with it; %s", key, days, b.threadHint()))
+			return denied(fmt.Sprintf("batch_thread_missing: the thread %q has %d days in the batch of this run: give dayKey with it; %s", key, days, b.threadHint()))
 		}
 	}
-	return denied("the thread " + key + " (dayKey " + dayKey + ") is not in the batch of this run: " + b.threadHint())
+	return denied("batch_thread_missing: the thread " + key + " (dayKey " + dayKey + ") is not in the batch of this run: " + b.threadHint())
 }
 
 // Cursor is the cursor of a source of the user ("" before the first collection).
@@ -631,14 +631,14 @@ func (s *Service) ProxyGuard(ctx context.Context, uid, run, item uuid.UUID, meth
 	}
 	b, err := s.RunningBatch(ctx, uid, run)
 	if err != nil || b == nil {
-		return refuse("the run of the collector is over")
+		return refuse("collector_run_over: the run of the collector is over")
 	}
 	if b.ItemID != item {
-		return refuse("this server is not the source of the batch")
+		return refuse("source_not_in_batch: this server is not the source of the batch")
 	}
 	ad, ok := s.AdapterOf(ctx, item)
 	if !ok {
-		return refuse("the server is no longer a source of communications")
+		return refuse("source_not_communications: the server is no longer a source of communications")
 	}
 	tools := ad.ReadTools()
 	switch {
@@ -647,18 +647,18 @@ func (s *Service) ProxyGuard(ctx context.Context, uid, run, item uuid.UUID, meth
 		return tools, ""
 	default:
 		// anything else — resources, prompts, a batch of requests — is not what a run needs
-		return refuse("the collector may only list and call the read tools of the source")
+		return refuse("collector_write_tool: the collector may only list and call the read tools of the source")
 	}
 	allowed := false
 	for _, t := range tools {
 		allowed = allowed || t == tool
 	}
 	if !allowed {
-		return refuse("the collector only reads: the tool " + tool + " is not available to it")
+		return refuse("collector_tool_not_allowed: the collector only reads: the tool " + tool + " is not available to it")
 	}
 	key, ok := ad.ThreadOf(tool, args)
 	if !ok {
-		return refuse("the call does not name a thread of the batch")
+		return refuse("batch_thread_missing: the call does not name a thread of the batch")
 	}
 	for _, t := range b.Threads {
 		if t.Key == key || slices.Contains(t.Parts, key) { // FTR.NAB.ADM-0001 arch §6: a discussion of a chat day
@@ -668,7 +668,7 @@ func (s *Service) ProxyGuard(ctx context.Context, uid, run, item uuid.UUID, meth
 			return tools, ""
 		}
 	}
-	return refuse("the thread " + key + " is not in the batch of this run")
+	return refuse("batch_thread_missing: the thread " + key + " is not in the batch of this run")
 }
 
 // hasCursor reports whether a read call starts from a cursor.

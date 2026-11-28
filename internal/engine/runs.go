@@ -365,7 +365,7 @@ func (e *Engine) serviceTurn(ctx context.Context, runID uuid.UUID, ag *services.
 				"Tools: see /nabu/sandbox-profile.json; system packages cannot be installed."
 		}
 		req.Workspace = &agent.Workspace{ID: wsID, URL: e.Cfg.RelayInternalURL + "/internal/v1/workspaces/" + wsID, Token: call,
-			Note: note + " " + space.ProxyNote(rs), Root: space.SandboxRoot}
+			Note: note + " " + SpaceNote + " " + space.ProxyNote(rs), Root: space.SandboxRoot}
 	}
 	resp, err := e.open(ctx, e.Op, req)
 	if err != nil {

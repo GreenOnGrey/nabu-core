@@ -111,8 +111,8 @@ func (c *Client) post(ctx context.Context, path string, data []byte, filename st
 	return raw, nil
 }
 
-// query is the query of /asr: transcription to JSON with ffmpeg decoding and
-// the voice activity filter (silence is not recognized as words).
+// query is the query of /asr: transcription to JSON with decoding of the audio
+// and the voice activity filter (silence is not recognized as words).
 func query(language string) string {
 	q := url.Values{"task": {"transcribe"}, "output": {"json"}, "encode": {"true"}, "vad_filter": {"true"}}
 	if language != "" && len(language) <= 3 {
@@ -121,10 +121,10 @@ func query(language string) string {
 	return q.Encode()
 }
 
-// Ping checks that the recognizer answers (FTR.NAB.CHAT-0001 R22): its page of
-// the API documentation.
+// Ping checks that the recognizer answers (FTR.NAB.CHAT-0001 R22): its health
+// endpoint answers 503 while the model loads, 200 when it is ready.
 func (c *Client) Ping(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url+"/docs", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url+"/health", nil)
 	if err != nil {
 		return err
 	}

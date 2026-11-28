@@ -77,6 +77,11 @@ var (
 	MemoryDeniedTools = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "nabu_memory_denied_tools_total", Help: "Tool calls of collector runs refused by the built-in MCP or the MCP proxy.",
 	})
+	// FTR.NAB.CMN-0001 R28: every failed tool of a collector run by tool and reason (a refusal code, a class, or
+	// the kind of a transport failure).
+	MemoryToolErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_memory_tool_errors_total", Help: "Failed tool calls of collector runs by tool and reason.",
+	}, []string{"tool", "reason"})
 	MemoryCollect = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nabu_memory_collect_runs_total", Help: "Runs of the collection of communications by result.",
 	}, []string{"result"})
@@ -191,7 +196,7 @@ func init() {
 		HTTPRequests, HTTPDuration, KafkaLag, KafkaDropped, AgentSessions, AgentProcessStarts, SubagentRuns, SubagentDuration, SubagentRejected, AgentStalls, LLMRequests, LLMErrors, LLMTokens, LLMCost,
 		Turns, WorkspaceConnections, WorkspaceCalls, Sandboxes, TaskRuns, ServiceRuns, ChannelMessages,
 		ChannelInbound, ChannelOutbound, EmailAuthRejected, IMAPConnected, VKTeamsPollLag, PendingConfirmations, Users, PurgeDeleted,
-		MemoryMaskedSecrets, MemoryDeniedTools, MemoryDigests, MemorySearch, MemoryCollect, MemoryCollectSeconds, MemoryEmbedPending,
+		MemoryMaskedSecrets, MemoryDeniedTools, MemoryToolErrors, MemoryDigests, MemorySearch, MemoryCollect, MemoryCollectSeconds, MemoryEmbedPending,
 		MCPOAuthRegister, MemoryVKTruncated, MemoryVKReadCursorFallback)
 }
 
@@ -206,10 +211,15 @@ var (
 		Name: "nabu_mcp_proxy_call_seconds", Help: "Duration of calls of tools of catalog MCP servers through the proxy.",
 		Buckets: []float64{.1, .25, .5, 1, 2.5, 5, 10, 30, 60, 120, 300},
 	}, []string{"item", "tool"})
+	// FTR.NAB.CMN-0001 R28: refusals of the tools of the built-in MCP. The code is the stable code of the
+	// refusal ("invalid_same_as", …), "uncoded" for a failure that carries no code (FTR.NAB.CMN-0003 R30).
+	MCPToolRefused = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nabu_mcp_tool_refused_total", Help: "Calls of the built-in MCP tools refused by tool and code.",
+	}, []string{"tool", "code"})
 )
 
 func init() {
-	Registry.MustRegister(MCPProxyCalls, MCPProxyCallSeconds)
+	Registry.MustRegister(MCPProxyCalls, MCPProxyCallSeconds, MCPToolRefused)
 }
 
 // FTR.NAB.CHAT-0001 arch §7: the context of conversations, skills, images,

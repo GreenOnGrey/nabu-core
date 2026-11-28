@@ -40,6 +40,17 @@ func TestLanguage(t *testing.T) {
 	}
 }
 
+// VOC-17 (FTR.NAB.CHAT-0001 R22): the recognizer is checked by its health
+// endpoint, which reports the readiness of the model.
+func TestPingHealth(t *testing.T) {
+	var path string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { path = r.URL.Path }))
+	defer srv.Close()
+	if err := New(srv.URL).Ping(context.Background()); err != nil || path != "/health" {
+		t.Fatalf("ping %v %q", err, path)
+	}
+}
+
 // VOC-11: the three states of the recognizer in the settings.
 func TestStatus(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
